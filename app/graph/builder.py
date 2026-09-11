@@ -42,6 +42,11 @@ class FocusSlice:
     # Methods the walk reached but a cap refused to keep. Without this the caps
     # look like they never fired: a dropped method never enters ``methods``.
     methods_dropped: int = 0
+    # Fan-out lookups a cap prevented from happening at all (depth/limit). These
+    # are not "dropped methods" — we never asked — which is exactly why they need
+    # their own counter: otherwise a truncated walk is indistinguishable from a
+    # complete one in the funnel arithmetic.
+    fanouts_skipped: int = 0
 
 
 class CallGraphBuilder:
@@ -80,6 +85,7 @@ class CallGraphBuilder:
                 # requested, so whatever it calls (or is called by) is absent from
                 # the bundle. A prune that only says "the walk stopped here" cannot
                 # answer "what is missing", which is the whole point of recording it.
+                slice_.fanouts_skipped += 1
                 slice_.prunes.append(
                     PruneDecision(
                         rule="max_depth",
@@ -104,8 +110,9 @@ class CallGraphBuilder:
             remaining = self.budget.max_nodes - len(slice_.methods)
             if remaining <= 0:
                 # The cap is already reached, so this node's fan-out is never
-                # explored. Count it: "we would have walked further here".
-                slice_.methods_dropped += 1
+                # explored. Count it separately from a refused node: no method was
+                # dropped here, we simply never looked.
+                slice_.fanouts_skipped += 1
                 slice_.prunes.append(
                     PruneDecision(
                         rule="max_nodes",

@@ -200,6 +200,7 @@ class AssemblyPipeline:
             stats.counts["methods_collected"] = sum(len(s.methods) for s in slices)
             stats.counts["edges_collected"] = sum(len(s.edges) for s in slices)
             stats.counts["methods_dropped_at_expand"] = sum(s.methods_dropped for s in slices)
+            stats.counts["fanouts_skipped"] = sum(s.fanouts_skipped for s in slices)
 
             # ------------------------------------------------------ read
             started = time.perf_counter()

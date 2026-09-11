@@ -109,18 +109,58 @@ def test_funnel_counts_are_traceable_to_the_manifest(
 
 
 def test_funnel_names_the_rule_that_caused_a_loss(tmp_path: Path, workspace: Path) -> None:
-    # One hop is allowed but only one method may be kept besides the sink, so the
-    # same-file callee is recorded as a prune rather than silently missing.
+    """A cap that fires must be visible in the funnel, with the rule that caused it.
+
+    This budget truncates the walk rather than dropping a built method, which is
+    the harder case: nothing is "lost" arithmetically, so the reason has to be
+    carried explicitly or the funnel would read as complete.
+    """
     budget = BudgetConfig(max_depth=1, max_nodes=2, max_contexts=10)
     result, _ = _run(tmp_path, workspace, budget=budget)
     manifest = _manifest(result)
     funnel = {step.key: step for step in views.funnel(manifest)}
 
-    assert manifest.stats.counts["methods_dropped_at_expand"] > 0
-    assert funnel["kept"].lost > 0
+    assert manifest.stats.counts["fanouts_skipped"] > 0
     assert funnel["kept"].loss_reasons
+    assert set(funnel["kept"].loss_reasons) & {
+        "max_nodes",
+        "max_depth",
+        "max_callees_per_node",
+        "max_callers_per_node",
+    }
     assert funnel["kept"].lost_items
     assert all(item["rule"] for item in funnel["kept"].lost_items)
+
+
+def test_a_truncated_walk_cannot_look_complete(tmp_path: Path, workspace: Path) -> None:
+    """The subtle failure mode: a fan-out we never looked up leaves no count.
+
+    With max_depth=0 the focus's callees are never requested, so no method is
+    "dropped" and every delta in the funnel is zero — yet the bundle is missing
+    something. The prune detail and the funnel note must both say so.
+    """
+    result, _ = _run(tmp_path, workspace, budget=BudgetConfig(max_depth=0, max_nodes=10))
+    manifest = _manifest(result)
+    funnel = {step.key: step for step in views.funnel(manifest)}
+
+    assert manifest.stats.counts["fanouts_skipped"] > 0
+    assert manifest.stats.counts["methods_dropped_at_expand"] == 0
+    assert funnel["kept"].count == 1  # only the sink
+    # arithmetic cannot express the loss, so it is stated instead
+    assert funnel["kept"].note and "skipped" in funnel["kept"].note
+    # and the prune names what is missing, not just that the walk stopped
+    depth_prune = next(p for p in manifest.prunes if p.rule == "max_depth")
+    assert "never looked up" in depth_prune.detail
+    assert "absent" in depth_prune.detail
+
+
+def test_prune_detail_names_the_affected_method_and_fanout_direction(
+    tmp_path: Path, workspace: Path
+) -> None:
+    result, _ = _run(tmp_path, workspace, budget=BudgetConfig(max_depth=0, max_nodes=10))
+    details = [p.detail for p in _manifest(result).prunes if p.rule == "max_depth"]
+    assert any("callees of query_user" in d for d in details)
+    assert any("callers of query_user" in d for d in details)
 
 
 def test_funnel_reports_merged_findings_as_deduped_not_lost(
@@ -247,7 +287,6 @@ def test_diff_identifies_what_a_tighter_budget_removed(
     tight, _ = _run(
         tmp_path / "b", workspace, budget=BudgetConfig(max_depth=1, max_nodes=1), name="B-tight"
     )
-
     delta = views.diff(_manifest(loose), _manifest(tight))
 
     assert delta["left"]["bundle_id"] == "B-loose"
@@ -255,7 +294,10 @@ def test_diff_identifies_what_a_tighter_budget_removed(
     assert delta["left"]["methods"] > delta["right"]["methods"]
     assert delta["delta"]["methods"] < 0
     assert delta["methods"]["only_left"], "the tighter run should be missing methods"
-    assert _manifest(tight).stats.counts["methods_dropped_at_expand"] > 0
+    # the tighter run stopped walking, and says so instead of looking complete
+    tight_counts = _manifest(tight).stats.counts
+    assert tight_counts["fanouts_skipped"] > 0
+    assert tight_counts["methods_kept"] < _manifest(loose).stats.counts["methods_kept"]
 
 
 def test_scan_summary_surfaces_the_invocation(tmp_path: Path, workspace: Path) -> None:

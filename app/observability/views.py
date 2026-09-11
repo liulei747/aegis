@@ -244,6 +244,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
     slices = counts.get("slices_expanded", distinct_focus)
     collected = counts.get("methods_collected", len(manifest.methods))
     dropped_at_expand = counts.get("methods_dropped_at_expand", 0)
+    fanouts_skipped = counts.get("fanouts_skipped", 0)
     proposed = counts.get("methods_proposed", collected + dropped_at_expand)
     kept = counts.get("methods_kept", len(manifest.methods))
     read = counts.get("bodies_read", len(manifest.methods))
@@ -318,8 +319,9 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
             first=scanned,
             rules=set(),
             note=(
-                f"{dropped_at_expand} node(s) were reached but their fan-out was refused by a "
-                "cap, so the walk stopped earlier than the graph allowed"
+                f"{dropped_at_expand} reached method(s) were refused by a node cap"
+                if dropped_at_expand
+                else None
             ),
         )
     )
@@ -337,6 +339,15 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
                 "max_callers_per_node",
                 "max_callees_per_node",
             },
+            note=(
+                # The arithmetic above cannot see these: a fan-out we never looked
+                # up contributes no count at all, only a prune. Say it out loud, or
+                # a truncated walk reads as a complete one.
+                f"the walk also skipped {fanouts_skipped} fan-out lookup(s) that a cap"
+                " prevented; those methods are absent without ever being counted"
+                if fanouts_skipped
+                else None
+            ),
         )
     )
     steps.append(

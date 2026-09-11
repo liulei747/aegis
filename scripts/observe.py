@@ -30,13 +30,15 @@ for key, value in vars(views.overview(manifest)).items():
     print(f"  {key:22} {value}")
 
 print("\n== funnel ==")
-print(f"  {'step':46}{'count':>7}{'prev':>8}{'lost':>6}  reasons")
+print(f"  {'step':46}{'count':>7}{'prev':>8}{'lost':>6}  reasons / notes")
 for step in views.funnel(manifest):
     previous = f"{step.of_previous:.0%}" if step.of_previous is not None else "-"
     print(
         f"  {step.label[:44]:46}{step.count:>7}{previous:>8}{step.lost:>6}  "
         f"{', '.join(step.loss_reasons) or '-'}"
     )
+    if step.note:
+        print(f"  {'':46}{'':7}{'':8}{'':6}  {step.note}")
 
 print("\n== timeline ==")
 for stage in views.timeline(manifest):
