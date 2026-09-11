@@ -19,7 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.core.utils import estimate_tokens
+from aegis_core.utils import estimate_tokens
 
 
 def _now() -> datetime:
@@ -217,6 +217,14 @@ class ScanRecord(BaseModel):
     engine_version: str = ""
     sarif_path: str | None = None
     command: list[str] = Field(default_factory=list)
+    location: str = Field(
+        default="in-process",
+        description=(
+            "'in-process' or 'remote'. A remote record's `command` and `sarif_path` are "
+            "real but name paths inside the scan service's filesystem, so whoever reads "
+            "the bundle must not try to open them."
+        ),
+    )
     returncode: int = 0
     configured: bool = False
     zero_findings_is_suspicious: bool = False

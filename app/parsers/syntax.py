@@ -122,12 +122,15 @@ class BaseSyntaxParser:
         Used as a last-resort callee resolution when no language server can answer.
         Cheap because it stops at the first match and the caller pre-filters on a
         substring hit.
+
+        NOTE: the window must span the file. ``methods()`` bounds its scope search
+        with ``[def_line + 1, horizon]``, so passing a small window yields a scope
+        that ends on its own `def` line instead of at the end of the body.
         """
         for line in range(parsed.line_count):
-            text = parsed.line_text(line)
-            if name not in text:
+            if name not in parsed.line_text(line):
                 continue
-            for scope in self.methods(parsed, line, window=0):
+            for scope in self.methods(parsed, line, window=parsed.line_count):
                 if scope.name == name:
                     return scope
         return None

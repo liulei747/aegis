@@ -12,8 +12,8 @@ import asyncio
 import json
 import sys
 
-from app.core.config import BudgetConfig, get_settings
-from app.core.logging import setup_logging
+from aegis_core.config import BudgetConfig, get_settings
+from aegis_core.logging import setup_logging
 from app.pipeline.assemble import AssemblyPipeline, PipelineRequest, ScanOnlyPipeline
 
 

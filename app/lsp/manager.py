@@ -19,11 +19,11 @@ from typing import Any
 
 import yaml
 
-from app.core.logging import get_logger
-from app.core.utils import to_uri
+from aegis_contracts.domain import Degradation
+from aegis_core.logging import get_logger
+from aegis_core.utils import to_uri
 from app.lsp.client import LspClient
 from app.lsp.protocol import ServerExited
-from app.schemas.domain import Degradation
 
 log = get_logger(__name__)
 

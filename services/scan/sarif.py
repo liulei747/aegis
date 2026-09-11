@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.core.logging import get_logger
-from app.core.utils import normalize_snippet, rebase_path, sha1
-from app.schemas.domain import CodeRegion, Finding, Provider, Severity
+from aegis_contracts.domain import CodeRegion, Finding, Provider, Severity
+from aegis_core.logging import get_logger
+from aegis_core.utils import normalize_snippet, rebase_path, sha1
 
 log = get_logger(__name__)
 

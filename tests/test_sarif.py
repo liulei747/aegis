@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from app.core.utils import from_uri, to_uri
-from app.scanner.sarif import SarifParser
+from aegis_core.utils import from_uri, to_uri
+from services.scan.sarif import SarifParser
 from tests.fixtures import write_sarif
 
 

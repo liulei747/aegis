@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from app.core.config import BudgetConfig, Settings
+from aegis_contracts.domain import Severity
+from aegis_core.config import BudgetConfig, Settings
 from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
-from app.schemas.domain import Severity
 from tests.fixtures import write_sarif
 
 
@@ -123,17 +123,38 @@ def test_path_a_finding_without_location_is_skipped_not_fatal(
 def test_path_b_missing_binary_degrades_to_empty_result_not_an_exception(
     tmp_path: Path, workspace: Path
 ) -> None:
-    """No scanner on PATH: the stage must return zero findings with a reason."""
+    """No scanner on PATH is a *degraded result*, not an exception.
+
+    The scan capability returns zero findings with a named failure mode, exactly as
+    it does for any other scan failure. Raising here would have made "no scanner"
+    the only scan outcome the pipeline had to special-case, and the only one that
+    cannot be reported inside the bundle.
+    """
     pipeline = _pipeline(
         tmp_path,
         workspace,
         opengrep_bin="definitely-not-installed-opengrep",
         opengrep_fallback_bin=None,
     )
-    from app.scanner.opengrep import OpengrepNotFound
 
-    with pytest.raises(OpengrepNotFound):
-        pipeline._collect_findings(PipelineRequest(workspace=workspace), "R-b")
+    findings, _, engine, warnings, record = pipeline._collect_findings(
+        PipelineRequest(workspace=workspace), "R-b"
+    )
+    assert findings == []
+    assert engine == "definitely-not-installed-opengrep"
+    assert record.failure_mode is not None
+    assert "could not be started" in record.failure_mode
+    assert record.zero_findings_is_suspicious is True
+    assert warnings and "could not be started" in warnings[0]
+
+
+def test_scan_service_probe_reports_a_missing_engine() -> None:
+    """The scan service's /health depends on this staying non-raising."""
+    from services.scan.runner import probe
+
+    result = probe("definitely-not-installed-opengrep", fallback=None)
+    assert result["available"] is False
+    assert "reason" in result
 
 
 @pytest.mark.parametrize("exit_code", [2, 127])
@@ -141,8 +162,8 @@ def test_path_b_bad_exit_code_yields_a_named_failure_mode(
     tmp_path: Path, workspace: Path, exit_code: int, monkeypatch
 ) -> None:
     """A scanner that exits non-zero must not crash the run, and must be nameable."""
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
 
@@ -176,8 +197,8 @@ def test_path_b_bad_exit_code_yields_a_named_failure_mode(
 def test_path_b_empty_sarif_is_a_failure_mode_not_a_clean_result(
     tmp_path: Path, workspace: Path, monkeypatch
 ) -> None:
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
 
@@ -200,8 +221,8 @@ def test_path_b_empty_sarif_is_a_failure_mode_not_a_clean_result(
 def test_path_b_corrupt_sarif_is_a_failure_mode_not_a_crash(
     tmp_path: Path, workspace: Path, monkeypatch
 ) -> None:
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
 
@@ -224,8 +245,8 @@ def test_path_b_corrupt_sarif_is_a_failure_mode_not_a_crash(
 def test_path_b_missing_sarif_file_is_a_failure_mode(
     tmp_path: Path, workspace: Path, monkeypatch
 ) -> None:
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     missing = tmp_path / "work" / "R-b" / "never-written.sarif"
 
@@ -247,8 +268,8 @@ def test_path_b_zero_findings_without_explicit_rules_is_flagged(
     tmp_path: Path, workspace: Path, monkeypatch
 ) -> None:
     """The dangerous case: a valid, empty, unconfigured scan looks like a clean repo."""
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
     empty = json.dumps({"runs": [{"tool": {"driver": {"rules": []}}, "results": []}]})
@@ -273,8 +294,8 @@ def test_path_b_zero_findings_without_explicit_rules_is_flagged(
 def test_path_b_successful_scan_is_not_suspicious(
     tmp_path: Path, workspace: Path, monkeypatch
 ) -> None:
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
     payload = json.loads(
@@ -313,8 +334,8 @@ def test_failed_scan_still_produces_a_bundle_that_says_why(
 ) -> None:
     import asyncio
 
-    from app.scanner import opengrep as opengrep_module
-    from app.scanner.opengrep import ScanOutcome
+    from services.scan import opengrep as opengrep_module
+    from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
 

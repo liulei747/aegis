@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from app.scanner.opengrep import OpengrepRunner
+from services.scan.opengrep import OpengrepRunner
 
 TARGET = Path("/tmp/aegis-repo")
 SARIF = Path("/tmp/aegis.sarif")

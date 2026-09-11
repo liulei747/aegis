@@ -1,38 +1,133 @@
+# Aegis - local development stack.
+#
+# Three services today, each with one job (see docs/SERVICE_TOPOLOGY.md):
+#
+#   scan      opengrep only              :8101 (internal only)  625 MB, CPU bound
+#   extract   LSP + graph + packaging    :8103 (internal only)  1.9 GB, memory bound
+#   gateway   orchestration + queries    :8100 (published)      thin, stateless
+#
+#   web       the console                :8102 (published)      NOT BUILT YET
+#             planned as its own nginx + static service; the backend views it
+#             needs are already served, see services/web/README.md
+#
+# PORT POLICY - only user-facing services publish a port, and only on loopback.
+#
+# `ports:` publishes to the host, i.e. to the LAN. Service-to-service calls do not
+# need it: compose puts every service on one network and they reach each other by
+# service name (`http://aegis-scan:8101`). Exposing the scanner or the extractor
+# would hand anyone who can reach the host an endpoint that reads a mounted
+# repository and runs a parser over it, for no benefit. So:
+#
+#   * workers use `expose:` (documentation only, nothing published)
+#   * only the two user-facing services use `ports:`
+#
+# If you need to poke a worker for debugging, do it through the network instead of
+# publishing a port permanently:
+#
+#   docker compose -f docker/docker-compose.yml exec extract \
+#       python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8103/health').read())"
+#
+# Shared-volume contract: the gateway and the extractor must see the workspace and
+# the work directory at the *same paths*, because a SARIF path produced by one is
+# handed to the other. A future version passes bytes or uses object storage.
+#
+#   docker compose -f docker/docker-compose.yml up --build
 services:
-  aegis:
+  # ── scan: opengrep, nothing else. Internal only. ──────────────────────────
+  scan:
+    build:
+      context: ..
+      dockerfile: services/scan/Dockerfile
+    image: aegis-scan:0.1.0
+    container_name: aegis-scan
+    expose:
+      - "8101"
+    environment:
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_SCAN_PORT: "8101"
+    volumes:
+      # The code under analysis, read-only by design: Aegis never writes to a repo.
+      - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      # Raw SARIF, shared with the extractor via the same path.
+      - ../var/work:/data/work
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8101/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── extract: the heavy, stateful worker. Internal only. ───────────────────
+  extract:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     image: aegis:0.1.0
-    container_name: aegis
-    ports:
-      # Host port is configurable: 8000 is commonly taken on a dev machine.
-      - "127.0.0.1:${AEGIS_HOST_PORT:-8001}:8000"
+    container_name: aegis-extract
+    depends_on:
+      scan:
+        condition: service_healthy
+    expose:
+      - "8103"
     environment:
       AEGIS_LOG_LEVEL: INFO
       AEGIS_WORKSPACE_ROOT: /workspace
       AEGIS_OUTPUT_DIR: /data/packages
       AEGIS_WORK_DIR: /data/work
       AEGIS_LSP_CONFIG_FILE: /opt/aegis/lsp.yaml
-      # Budget: raise for monorepos, lower for fast triage.
+      # Extraction delegates scanning too, so the scanner runs in the small image
+      # built for it instead of in this one. Without this line extraction silently
+      # scans for itself, so it is not optional here.
+      AEGIS_SCAN_SERVICE_URL: http://scan:8101
       AEGIS_BUDGET__MAX_DEPTH: "2"
       AEGIS_BUDGET__MAX_NODES: "60"
       AEGIS_BUDGET__MAX_CONTEXTS: "20"
-      AEGIS_BUDGET__MAX_TOTAL_CHARS: "600000"
+    entrypoint:
+      ["uvicorn", "services.extraction.app:app", "--host", "0.0.0.0", "--port", "8103", "--no-access-log"]
     volumes:
-      # The code under analysis, read-only by design: Aegis never writes to a repo.
-      - ${AEGIS_SCAN_TARGET:-./demo/repo}:/workspace:ro
-      # Bundles + scanner SARIF artifacts live here, on the host.
-      - ./var/packages:/data/packages
-      - ./var/work:/data/work
-      # Optional local override of the language-server catalog.
-      # Compose creates the file mount only if ./docker/lsp.local.yaml exists.
-      - ./docker/lsp.local.yaml:/opt/aegis/lsp.yaml:ro
+      - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      - ../var/packages:/data/packages
+      - ../var/work:/data/work
+      - ./lsp.local.yaml:/opt/aegis/lsp.yaml:ro
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      test:
+        ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8103/health', timeout=5).status == 200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
     restart: unless-stopped
     shm_size: "512m"
+
+  # ── gateway: the only API the outside world talks to ──────────────────────
+  gateway:
+    image: aegis:0.1.0
+    container_name: aegis-gateway
+    depends_on:
+      scan:
+        condition: service_healthy
+      extract:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${AEGIS_GATEWAY_PORT:-8100}:8000"
+    environment:
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_WORKSPACE_ROOT: /workspace
+      AEGIS_OUTPUT_DIR: /data/packages
+      AEGIS_WORK_DIR: /data/work
+      # Both hops delegated: this container runs no scanner and no extraction.
+      AEGIS_SCAN_SERVICE_URL: http://scan:8101
+      AEGIS_EXTRACTION_SERVICE_URL: http://extract:8103
+    volumes:
+      # Same paths as the workers, because it hands paths between them.
+      - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      - ../var/packages:/data/packages
+      - ../var/work:/data/work
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped

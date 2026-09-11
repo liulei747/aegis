@@ -5,13 +5,13 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from app.core.logging import get_logger
-from app.core.utils import from_uri, rebase_path, sha1, strip_foreign_prefix
+from aegis_contracts.domain import CodeRegion, Degradation, MethodSymbol, Provider, SymbolKind
+from aegis_core.logging import get_logger
+from aegis_core.utils import from_uri, rebase_path, sha1, strip_foreign_prefix
 from app.lsp.manager import LanguageServerManager
 from app.lsp.positions import LineIndex
 from app.lsp.symbols import RawSymbol, parse_document_symbols
 from app.parsers.syntax import ParsedFile, parse, parser_for
-from app.schemas.domain import CodeRegion, Degradation, MethodSymbol, Provider, SymbolKind
 
 log = get_logger(__name__)
 
@@ -179,12 +179,25 @@ class Workspace:
             scope = self.syntax_parser(rel).find_scope_named(parsed, name)
             if scope is None:
                 continue
+            # Match the LSP path's normalisation: stop at the last line holding code.
+            end_line = scope.end_line
+            while end_line > scope.start_line and not parsed.line_text(end_line).strip():
+                end_line -= 1
             region = CodeRegion(
                 path=rel,
                 start_line=scope.start_line,
                 start_char=0,
-                end_line=scope.end_line,
-                end_char=len(parsed.line_text(scope.end_line)),
+                end_line=end_line,
+                end_char=len(parsed.line_text(end_line)),
+                # Byte offsets must be filled in: without them the reader falls back
+                # to a line slice, and a missing upper bound there hands over the
+                # *whole file* as this method's body.
+                start_offset=parsed.line_starts[scope.start_line],
+                end_offset=(
+                    parsed.line_starts[end_line + 1]
+                    if end_line + 1 < len(parsed.line_starts)
+                    else len(parsed.text)
+                ),
             )
             qualified = f"{scope.parent_hint}.{name}" if scope.parent_hint else name
             found = MethodSymbol(
@@ -234,7 +247,11 @@ class Workspace:
             self._files = found
         return found
 
-    def slice_lines(self, rel: str, start_line: int, end_line: int) -> str | None:
+    def slice_lines(self, rel: str, start_line: int, end_line: int | None) -> str | None:
+        """Slice whole lines. ``end_line`` must be given: defaulting it to infinity
+        would silently return the entire file as a single method's body."""
+        if end_line is None:
+            return None
         text = self.read(rel)
         if text is None:
             return None

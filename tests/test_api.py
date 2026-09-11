@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.config import get_settings
+from aegis_core.config import get_settings
 from app.main import create_app
 
 
@@ -88,11 +88,14 @@ def test_bundle_path_traversal_is_rejected(client: TestClient) -> None:
     assert response.status_code in (400, 404)
 
 
-def test_review_ui_is_served(client: TestClient) -> None:
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "Aegis" in response.text
-    assert "/v1/bundles" in response.text
+def test_the_api_is_headless(client: TestClient) -> None:
+    """The console is its own service now (see docs/SERVICE_TOPOLOGY.md).
+
+    The API must not serve a page: that coupling forced a full Python image
+    rebuild for every front-end tweak.
+    """
+    assert client.get("/").status_code == 404
+    assert client.get("/openapi.json").status_code == 200
 
 
 def test_unknown_bundle_is_404(client: TestClient) -> None:

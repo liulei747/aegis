@@ -8,18 +8,38 @@ version = "0.1.0"
 description = "Aegis - static-scan + LSP call-graph analysis bundle assembler"
 readme = "README.md"
 requires-python = ">=3.10"
+# Core is what every service needs: the contract layer plus settings/logging, and
+# the HTTP client a service uses to call another one. A service that needs nothing
+# else (scan) installs just this.
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "httpx>=0.27",
-    "python-multipart>=0.0.9",
     "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
+# service that needs a web server
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+]
+# extraction service: the LSP seam, call graph, assembly, packaging
+extraction = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+# convenience for local development: everything, plus the test tools
+all = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+]
 dev = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
@@ -29,10 +49,11 @@ dev = [
 aegis = "app.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "aegis_contracts*", "aegis_core*", "services*"]
 
 [tool.setuptools.package-data]
 "app.api" = ["static/*.html"]
+"services.web" = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

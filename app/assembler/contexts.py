@@ -17,12 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from app.assembler.reader import BodySet, MethodBody, refs_sorted
-from app.core.config import BudgetConfig
-from app.core.logging import get_logger
-from app.core.utils import estimate_tokens, sha1
-from app.graph.builder import FocusSlice
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     CallEdge,
     Coverage,
     Finding,
@@ -32,6 +27,11 @@ from app.schemas.domain import (
     PruneDecision,
     Severity,
 )
+from aegis_core.config import BudgetConfig
+from aegis_core.logging import get_logger
+from aegis_core.utils import estimate_tokens, sha1
+from app.assembler.reader import BodySet, MethodBody, refs_sorted
+from app.graph.builder import FocusSlice
 
 log = get_logger(__name__)
 
@@ -86,6 +86,21 @@ class AssemblyResult:
     bodies: BodySet = field(default_factory=BodySet)
     coverage: Coverage = field(default_factory=Coverage)
     prunes: list[PruneDecision] = field(default_factory=list)
+    # content_hash -> the method whose body is the one we keep, bundle-wide.
+    canonical_bodies: dict[str, str] = field(default_factory=dict)
+    # method_id -> the method whose body replaces it (dropped from the bundle's
+    # inline set because an identical one is already there).
+    bundle_aliases: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def inlined_bodies(self) -> dict[str, MethodBody]:
+        """The unique bodies to inline into a prompt, deduplicated bundle-wide."""
+        out: dict[str, MethodBody] = {}
+        for context in self.contexts:
+            for method_id, body in context.bodies.items():
+                canonical = self.canonical_bodies.get(body.content_hash, method_id)
+                out.setdefault(canonical, body)
+        return out
 
 
 class ContextAssembler:
@@ -135,6 +150,7 @@ class ContextAssembler:
         result.prunes.extend(bodies.prunes)
         for context in kept:
             result.prunes.extend(context.prunes)
+        _mark_bundle_level_duplicates(result)
         return result
 
     # ------------------------------------------------------------------
@@ -216,6 +232,30 @@ class ContextAssembler:
             "\n".join(b.text for b in inlined.values())
         ) + estimate_tokens("\n".join(e.call_site_snippet for e in context.edges))
         return context
+
+
+def _mark_bundle_level_duplicates(result: AssemblyResult) -> None:
+    """Decide, bundle-wide, which copy of each identical body we keep.
+
+    Context-local dedupe is not enough: the same method can appear in several
+    contexts (a helper reached from two different sinks), and then its source gets
+    inlined once per context *and* once in the method catalog. That contradicts the
+    whole point of dedupe — the model pays for the same text several times.
+
+    Deterministic choice: the earliest method id in sort order wins, and every
+    other copy is recorded as an alias so the reader still sees the symbol.
+    """
+    for context in result.contexts:
+        for method_id, body in context.bodies.items():
+            result.canonical_bodies.setdefault(body.content_hash, method_id)
+
+    for context in result.contexts:
+        for method_id, body in list(context.bodies.items()):
+            canonical = result.canonical_bodies.get(body.content_hash, method_id)
+            if canonical != method_id:
+                result.bundle_aliases[method_id] = canonical
+                context.aliases.setdefault(canonical, []).append(method_id)
+                del context.bodies[method_id]
 
 
 def _group_sort_key(group: list[FocusSlice], findings_by_id: dict[str, Finding]) -> tuple:

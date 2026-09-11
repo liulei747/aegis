@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from app.core.config import BudgetConfig
-from app.core.logging import get_logger
-from app.core.utils import clamp_text, content_hash, estimate_tokens
+from aegis_contracts.domain import MethodRef, MethodSymbol, Provider, PruneDecision
+from aegis_core.config import BudgetConfig
+from aegis_core.logging import get_logger
+from aegis_core.utils import clamp_text, content_hash, estimate_tokens
 from app.graph.builder import FocusSlice
 from app.graph.resolver import Workspace
-from app.schemas.domain import MethodRef, MethodSymbol, Provider, PruneDecision
 
 log = get_logger(__name__)
 
@@ -117,7 +117,12 @@ class MethodReader:
                     method.path, method.region.start_line, method.region.end_line
                 )
                 snippet = fallback or snippet
-        snippet = snippet.rstrip() + ("\n" if snippet and not snippet.endswith("\n") else "")
+        # Canonical form for hashing and for handing over: no trailing whitespace at
+        # all, then exactly one terminating newline. Without the full strip, a range
+        # that happens to end one byte later (say, just past the file's final newline)
+        # yields a different content hash for byte-identical code, and content-based
+        # dedupe silently stops working across providers.
+        snippet = snippet.rstrip("\n").rstrip() + ("\n" if snippet.strip() else "")
         clamped, cut_chars, cut_lines = clamp_text(
             snippet, self.budget.max_chars_per_method, self.budget.max_lines_per_method
         )

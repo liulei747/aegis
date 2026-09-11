@@ -19,6 +19,11 @@ Threat modelling, sub-agent fan-out and provider-side prompt caching are
 deliberately **out of scope here** — but the bundle layout is designed so they
 drop in without touching this stage (see [Design decisions](#design-decisions)).
 
+> **Taking this over? Read [`docs/HANDOVER.md`](docs/HANDOVER.md) first.** It is the
+> handover document: what is done and what is not, how to run each piece, the
+> bundle contract, the port policy, and a list of hard-won invariants that must not
+> be broken (each one corresponds to a silent failure this repository already hit).
+
 ---
 
 ## 1. Why the LSP is the seam
@@ -156,12 +161,22 @@ Two warning signals are computed rather than left for the reader to notice:
 
 ### Review console
 
-`GET /` serves a read-only console for a running service. It is a pure renderer:
-it only consumes the endpoints above, never re-derives a number and never reads
-raw artifact files, so the page and the JSON cannot disagree. It shows the bundle
-list with trust mix, the funnel, timings, providers, the scanner invocation, the
-call chain with provenance per method, the edges with their evidence, all prunes
-and degradations, and a diff against another run.
+The console is **no longer served by the API service**. It is its own deployment
+unit (`services/web`, port `127.0.0.1:8102`), because a static read-only renderer
+and a CPU-bound assembler have nothing to do with each other and should not share
+a blast radius.
+
+It is planned but **not built yet**. The backend side of it is finished: every
+number the console needs is already computed by `app/observability/views.py` and
+served as JSON, so the frontend is a pure renderer — it consumes the endpoints
+above, never re-derives a number and never reads raw artifact files, so the page
+and the JSON cannot disagree. The information architecture and the prototypes are
+in [`docs/VISUAL.md`](docs/VISUAL.md) and [`docs/prototype.html`](docs/prototype.html).
+
+The design it will render: the bundle list with trust mix, the funnel, timings,
+providers, the scanner invocation, the call chain with provenance per method, the
+edges with their evidence, all prunes and degradations, and a diff against another
+run.
 
 Budget (`AEGIS_BUDGET__*`, see `.env.example`):
 
@@ -216,6 +231,13 @@ uvicorn app.main:app --reload
 # docs at http://127.0.0.1:8000/docs
 ```
 
+This runs the **gateway**: orchestration plus the read/query API. By default it
+runs the scanner and the extractor in-process, which is what keeps local
+development a single command. Set `AEGIS_SCAN_SERVICE_URL` and/or
+`AEGIS_EXTRACTION_SERVICE_URL` and those hops become HTTP calls instead — same
+contract, two transports. See [§3 of the handover](docs/HANDOVER.md) and
+[`docs/SERVICE_TOPOLOGY.md`](docs/SERVICE_TOPOLOGY.md).
+
 | method | path | purpose |
 | --- | --- | --- |
 | GET | `/health` | scanner version, LSP flag, effective budget |
@@ -237,6 +259,9 @@ uvicorn app.main:app --reload
 
 ### Docker
 
+Three containers, each with one job — `scan` (opengrep only, 625 MB),
+`extract` (LSP + graph + assembly, 1.9 GB) and `gateway` (thin, stateless):
+
 ```bash
 cp .env.example .env
 cp docker/lsp.yaml docker/lsp.local.yaml     # optional catalog override
@@ -244,22 +269,52 @@ cp docker/lsp.yaml docker/lsp.local.yaml     # optional catalog override
 # scan a repo on the host
 AEGIS_SCAN_TARGET=/path/to/repo docker compose -f docker/docker-compose.yml up --build
 
-# the host port defaults to 8001 (8000 is commonly already taken; set
-# AEGIS_HOST_PORT in .env to change it)
-#   http://127.0.0.1:8001/          bundle list, contexts, prunes, prompt blocks
-#   http://127.0.0.1:8001/docs      OpenAPI
+# the only published port is the gateway, bound to loopback:
+#   http://127.0.0.1:8100/health    health (probes both workers)
+#   http://127.0.0.1:8100/docs      OpenAPI
+# set AEGIS_GATEWAY_PORT in .env to change it
+```
+
+**Port policy:** only `gateway` (and the future `web`) publish a port, always on
+`127.0.0.1`. `scan` and `extract` use `expose:` and are reachable only by service
+name on the compose network. Publishing the extractor would hand anyone who can
+reach the host an endpoint that reads a mounted repository and parses it, for no
+functional benefit.
+
+```bash
+# non-published services are still reachable from inside the network
+docker compose -f docker/docker-compose.yml exec extract \
+    python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8103/health').read())"
 
 # or run the CLI inside the container
-docker compose -f docker/docker-compose.yml run --rm aegis \
+docker compose -f docker/docker-compose.yml run --rm extract \
     assemble --workspace /workspace --rule-config p/default
 ```
 
-Equivalent without compose:
+Equivalent without compose — note the volumes: the gateway and the extractor must
+see the workspace and the work directory at the **same paths**, because a SARIF
+path produced by the scanner is handed across the boundary:
 
 ```bash
-docker run -d --name aegis -p 127.0.0.1:8001:8000 \
-  -v "$PWD/demo/repo:/workspace:ro" \
-  -v "$PWD/var/packages:/data/packages" \
+docker network create aegis-net
+
+docker run -d --name aegis-scan --network aegis-net \
+  -v "$PWD/demo/repo:/workspace:ro" -v "$PWD/var/work:/data/work" \
+  aegis-scan:0.1.0
+
+docker run -d --name aegis-extract --network aegis-net \
+  -e AEGIS_WORKSPACE_ROOT=/workspace -e AEGIS_OUTPUT_DIR=/data/packages \
+  -e AEGIS_WORK_DIR=/data/work -e AEGIS_SCAN_SERVICE_URL=http://aegis-scan:8101 \
+  -v "$PWD/demo/repo:/workspace:ro" -v "$PWD/var/packages:/data/packages" \
+  -v "$PWD/var/work:/data/work" \
+  --entrypoint uvicorn aegis:0.1.0 services.extraction.app:app --host 0.0.0.0 --port 8103
+
+docker run -d --name aegis-gateway --network aegis-net -p 127.0.0.1:8100:8000 \
+  -e AEGIS_WORKSPACE_ROOT=/workspace -e AEGIS_OUTPUT_DIR=/data/packages \
+  -e AEGIS_WORK_DIR=/data/work \
+  -e AEGIS_SCAN_SERVICE_URL=http://aegis-scan:8101 \
+  -e AEGIS_EXTRACTION_SERVICE_URL=http://aegis-extract:8103 \
+  -v "$PWD/demo/repo:/workspace:ro" -v "$PWD/var/packages:/data/packages" \
   -v "$PWD/var/work:/data/work" \
   aegis:0.1.0
 ```
@@ -354,7 +409,9 @@ That image still works end to end: missing language servers become recorded
 ## 6. Tests
 
 ```bash
-python -m pytest -q          # 36 tests, no language server required
+python -m pytest -q          # 118 passed, 1 skipped — no language server required
+python -m pytest -q -m slow  # the one case that spawns a real language server
+python -m ruff check .
 ```
 
 The suite contains `tests/fake_lsp_server.py`: a dependency-free LSP server that
@@ -420,35 +477,61 @@ chain while the model pays for the source once.
 
 ## 8. Next stages (not in this deliverable)
 
-1. **Threat modelling / investigation sub-agents** — `ai/blocks_meta.json` plus
+**Engine work still outstanding** (details and open decisions in the handover):
+
+1. **Task queue** — `POST /v1/assemble` is synchronous today (~11.5 s). Target is
+   `202 {job_id}` + `GET /v1/jobs/{id}`. Technology not yet chosen.
+2. **The console as its own service** — `services/web` (nginx + static assets
+   proxying `/v1` to the gateway, `127.0.0.1:8102`). Backend views are done.
+3. **Move `app/` under `services/extraction/`** — cosmetic; the deployment
+   boundary already works.
+4. **Byte transfer instead of shared volumes** — removes the constraint that the
+   gateway and the extractor must mount the same paths.
+
+Then the AI stage this bundle was built for:
+
+5. **Threat modelling / investigation sub-agents** — `ai/blocks_meta.json` plus
    the per-context blocks are the dispatch unit; the context block is
    self-contained on purpose.
-2. **Prompt-cache-aware fan-out** — send `instructions.*` + `method_catalog` once
+6. **Prompt-cache-aware fan-out** — send `instructions.*` + `method_catalog` once
    as a cacheable prefix, then stream one `context.<id>` per worker.
-3. **Tree-sitter fallback** — replace the regex `syntax_regex` provider with real
+7. **Tree-sitter fallback** — replace the regex `syntax_regex` provider with real
    parsing for languages without a server, keeping the same `Provider` contract.
-4. **Cross-language + multi-repo assembly** — the `Edge.provider` ladder already
+8. **Cross-language + multi-repo assembly** — the `Edge.provider` ladder already
    tolerates mixed-quality evidence.
 
 ## 9. Layout
 
 Deeper design notes — provider ladder, budget invariants, prompt-cache layout,
 concurrency model, and where the next stages plug in — are in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The topology, port policy and the
+remaining service migration are in [`docs/SERVICE_TOPOLOGY.md`](docs/SERVICE_TOPOLOGY.md);
+the handover document is [`docs/HANDOVER.md`](docs/HANDOVER.md).
 
 ```
+aegis_contracts/          shared data shapes, no I/O (the cross-service contract)
+aegis_core/               settings, logging, hashing/token/URI helpers
+services/
+  scan/                   opengrep runner + SARIF parser + HTTP client    (own image)
+  extraction/             the extraction HTTP service                    (own image)
+  web/                    the console (planned, not built)
 app/
-  main.py                 FastAPI factory
+  main.py                 FastAPI factory (the gateway)
   cli.py                  same pipeline, for review
-  api/                    routes + dependency wiring
-  core/                   settings, logging, hashing/token/URI helpers
-  schemas/                domain + API contracts (the pipeline's public surface)
-  scanner/                opengrep runner + SARIF parser
+  api/                    gateway routes + dependency wiring
   lsp/                    JSON-RPC stdio client, position math, symbol extraction, server pool
   parsers/                syntax fallback (indent + brace) and call-site extraction
   graph/                  workspace/index caches, call-graph providers, budgeted BFS
   assembler/              body reader, context assembler, renderer, packager
+  observability/          derived views (funnel, timeline, providers, diff) — pure functions
   pipeline/               the wiring, with per-stage timing
 docker/                   Dockerfile, compose, default LSP catalog
+docs/                     architecture, topology, visual design, handover
+scripts/                  demo.py, observe.py
 tests/                    pytest suite + the fake LSP server
 ```
+
+The business logic under `app/` still lives there rather than under
+`services/extraction/`; the deployment boundary is already real (three containers,
+three responsibilities) and moving the directories is cosmetic. It is listed as
+remaining work in the handover.

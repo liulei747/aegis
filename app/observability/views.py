@@ -2,13 +2,13 @@
 
 This module is the *only* place that turns raw bundle facts into something a
 human reads. It is deliberately pure: it takes an
-:class:`~app.schemas.domain.AnalysisBundleManifest` and returns derived views,
+:class:`~aegis_contracts.domain.AnalysisBundleManifest` and returns derived views,
 never mutating anything and never inventing a number that is not in the manifest.
 
 Two consequences worth keeping:
 
-* the JSON API and the HTML console render the exact same views, so they can
-  never disagree;
+* every consumer (the JSON API, and the separate console service in
+  ``services/web``) renders these exact same views, so they can never disagree;
 * deleting this module (or the console) cannot change a bundle.
 
 The central idea is the **funnel**: a pipeline that silently loses findings is
@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     AnalysisBundleManifest,
     EdgeDirection,
     MethodRef,

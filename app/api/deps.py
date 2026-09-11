@@ -8,10 +8,10 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app.core.config import Settings, get_settings
+from aegis_contracts.domain import AnalysisBundleManifest
+from aegis_core.config import Settings, get_settings
 from app.lsp.manager import LanguageServerManager, load_catalog
 from app.pipeline.assemble import AssemblyPipeline, ScanOnlyPipeline
-from app.schemas.domain import AnalysisBundleManifest
 
 
 def settings_dep() -> Settings:
@@ -90,6 +90,24 @@ def load_manifest(bundle_id: str, settings: Settings) -> AnalysisBundleManifest:
                 status_code=500, detail=f"{name} does not match the manifest schema: {exc}"
             ) from exc
     raise HTTPException(status_code=404, detail=f"bundle has no manifest: {bundle_id}")
+
+
+def load_method_body(bundle_id: str, method_id: str, settings: Settings) -> str:
+    """Read one method body from the package: ``methods/<method_id>.txt``.
+
+    The console renders bodies inline, so it needs them individually. Reading the
+    file avoids shipping a second copy of every body inside bundle.json.
+    """
+    directory = bundle_dir(bundle_id, settings)
+    if not method_id.startswith("M-") or any(
+        ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+        for ch in method_id
+    ):
+        raise HTTPException(status_code=400, detail=f"unsafe method id: {method_id!r}")
+    path = directory / "methods" / f"{method_id}.txt"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"no body stored for {method_id}")
+    return path.read_text(encoding="utf-8")
 
 
 def probe_lsp(workspace: Path) -> tuple[LanguageServerManager, dict, dict]:

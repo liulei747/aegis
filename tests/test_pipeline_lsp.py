@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.config import BudgetConfig, Settings
+from aegis_core.config import BudgetConfig, Settings
 from app.graph.providers import CallGraphResolver
 from app.graph.resolver import SymbolIndex, Workspace
 from app.lsp.manager import load_catalog

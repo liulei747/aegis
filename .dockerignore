@@ -1,3 +1,12 @@
+# Context hygiene: keep the build context small and stable, but do NOT exclude
+# anything a Dockerfile actually COPYs.
+#
+# History: `docker/` was excluded to reduce context size, which silently broke
+# `COPY docker/lsp.yaml` — and it only failed on a cache miss, so it looked fine
+# until someone touched those files. Anything referenced by a COPY/ADD belongs
+# outside this list; that is the rule this file now follows.
+
+# --- VCS / caches ---------------------------------------------------------
 .git
 .gitignore
 .venv
@@ -9,6 +18,7 @@ __pycache__
 .ruff_cache
 .mypy_cache
 
+# --- not needed by any image ---------------------------------------------
 var
 workspace
 demo
@@ -16,9 +26,13 @@ tests
 docs
 scripts
 
+# --- local-only config ---------------------------------------------------
+.env
+# An operator's local LSP catalog overrides; `docker/lsp.yaml` itself is COPYed.
+docker/lsp.local.yaml
+# Compose consumes this on the host; the image does not need it.
+docker/docker-compose.yml
+
+# --- docs -----------------------------------------------------------------
 *.md
 !README.md
-
-.env
-docker/lsp.local.yaml
-docker/docker-compose.yml

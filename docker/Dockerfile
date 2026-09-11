@@ -137,16 +137,28 @@ RUN --mount=type=cache,target=/root/.npm \
 # Net effect on the edit/build loop for this project: 341 s -> ~7 s.
 # ---------------------------------------------------------------------------
 COPY pyproject.toml README.md MANIFEST.in ./
+# `[all]` is required here: since the service split, fastapi/uvicorn live in an
+# extra (the scan service installs `[api]` only, so it does not carry the
+# extraction stack). A bare `pip install .` would ship an image without a web
+# framework — which is exactly how this line broke once.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip && pip install .
+    pip install --upgrade pip && pip install ".[all]"
 
+# The shared layers are copied as sources, like the app: they change as often and
+# rebuilding a wheel for them on every edit is what made the loop slow.
+# `services/` is included because extraction consumes the scan capability from it
+# (in-process by default, over HTTP when AEGIS_SCAN_SERVICE_URL is set).
+COPY aegis_contracts ./aegis_contracts
+COPY aegis_core ./aegis_core
+COPY services ./services
 COPY app ./app
-# The console's static assets live under app/, so a plain copy is complete.
 RUN set -eux; \
     target="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
-    rm -rf "${target}/app"; \
-    cp -r /opt/aegis/app "${target}/app"; \
-    python -c "import app, app.api.routes, app.main, fastapi, uvicorn; print('aegis', app.__version__, 'importable')"
+    for pkg in app aegis_contracts aegis_core services; do \
+        rm -rf "${target}/${pkg}"; \
+        cp -r "/opt/aegis/${pkg}" "${target}/${pkg}"; \
+    done; \
+    python -c "import app, aegis_contracts, aegis_core, services.scan.client, app.api.routes, app.main, fastapi, uvicorn; print('aegis', app.__version__, 'importable')"
 
 COPY docker/lsp.yaml /opt/aegis/lsp.yaml
 COPY docker/logging.json /opt/aegis/docker-logging.json

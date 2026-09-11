@@ -13,12 +13,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from aegis_contracts.domain import AnalysisBundleManifest
+from aegis_core.config import BudgetConfig, Settings, get_settings
 from app.api.deps import clear_pipeline_cache
-from app.core.config import BudgetConfig, Settings, get_settings
 from app.main import create_app
 from app.observability import views
 from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
-from app.schemas.domain import AnalysisBundleManifest
 from tests.fixtures import write_sarif, write_two_hits_sarif
 
 
@@ -416,21 +416,42 @@ def test_list_bundles_surfaces_trust_and_engine(
     assert row["focus_count"] == 1
 
 
-def test_review_console_renders_the_observability_views(
+def test_the_api_no_longer_serves_a_console(
     client: TestClient, tmp_path: Path, workspace: Path
 ) -> None:
-    """The page is a renderer, not a calculator: it must only consume the API."""
-    _assemble(client, workspace, tmp_path, name="B-console")
-    page = client.get("/")
-    assert page.status_code == 200
-    body = page.text
-    # it reads the derived views...
-    for endpoint in ("/observability", "/contexts", "/diff/", "/v1/bundles"):
-        assert endpoint in body
-    # ...and does not reach for raw artifact files or re-derive findings itself
-    for forbidden in ("/manifest", "blocks.jsonl"):
-        assert forbidden not in body
-    assert "Funnel" in body and "Providers" in body and "why each method is here" in body.lower()
+    """The console now lives in its own service; the API must stay a pure API.
+
+    Keeping the page here meant a front-end tweak rebuilt a 2 GB Python image.
+    """
+    _assemble(client, workspace, tmp_path, name="B-no-ui")
+    assert client.get("/").status_code == 404
+    # but every view the console consumes is still published
+    bundle_id = _assemble(client, workspace, tmp_path, name="B-views")
+    for path in (
+        f"/v1/bundles/{bundle_id}/observability",
+        f"/v1/bundles/{bundle_id}/contexts",
+        f"/v1/bundles/{bundle_id}/methods",
+        f"/v1/bundles/{bundle_id}/blocks",
+    ):
+        assert client.get(path).status_code == 200, path
+
+
+def test_method_body_endpoint_serves_one_body(
+    client: TestClient, tmp_path: Path, workspace: Path
+) -> None:
+    """The console renders bodies inline, so one body must be fetchable on its own."""
+    bundle_id = _assemble(client, workspace, tmp_path, name="B-body")
+    manifest = client.get(f"/v1/bundles/{bundle_id}/manifest").json()
+    method_id = manifest["contexts"][0]["focus"]["method_id"]
+
+    response = client.get(f"/v1/bundles/{bundle_id}/methods/{method_id}/body")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert response.text.startswith("def ")
+
+    assert client.get(f"/v1/bundles/{bundle_id}/methods/M-nope/body").status_code == 404
+    # path traversal through the method id must not resolve
+    assert client.get(f"/v1/bundles/{bundle_id}/methods/..%2F..%2Fetc/body").status_code in (400, 404)
 
 
 def test_bundle_endpoints_reject_traversal_and_unknown_ids(client: TestClient) -> None:

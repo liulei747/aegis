@@ -7,14 +7,18 @@ problem here — the agent receives a finished bundle.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from dataclasses import asdict
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
+from aegis_contracts.domain import AnalysisBundleManifest
+from aegis_core.config import Settings
+from aegis_core.logging import get_logger
 from app import __version__
 from app.api.deps import (
     bundle_dir,
@@ -22,14 +26,12 @@ from app.api.deps import (
     get_scan_pipeline,
     get_settings,
     load_manifest,
+    load_method_body,
     probe_lsp,
     resolve_workspace,
 )
-from app.core.config import Settings
-from app.core.logging import get_logger
 from app.observability import views
 from app.pipeline.assemble import AssemblyPipeline, PipelineRequest, ScanOnlyPipeline
-from app.scanner.opengrep import OpengrepRunner
 from app.schemas.api import (
     AssembleRequest,
     AssembleResponse,
@@ -38,21 +40,17 @@ from app.schemas.api import (
     ScanOnlyResponse,
     ScanRequest,
 )
+from services.extraction.client import (
+    ExtractionUnavailable,
+    extraction_is_remote,
+    request_extraction,
+)
+from services.scan.opengrep import OpengrepRunner
 
 log = get_logger(__name__)
 router = APIRouter()
 
 SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
-STATIC_DIR = Path(__file__).parent / "static"
-
-
-@router.get("/", response_class=HTMLResponse, include_in_schema=False)
-def review_ui() -> HTMLResponse:
-    """A read-only bundle review page: no client tooling needed to audit a run."""
-    index = STATIC_DIR / "index.html"
-    if not index.exists():  # pragma: no cover - defensive
-        return HTMLResponse("<h1>Aegis</h1><p>See <a href='/docs'>/docs</a>.</p>")
-    return HTMLResponse(index.read_text(encoding="utf-8"))
 
 
 def _safe_segment(value: str) -> str:
@@ -63,18 +61,50 @@ def _safe_segment(value: str) -> str:
 
 @router.get("/health", response_model=HealthResponse)
 def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
-    runner = OpengrepRunner(settings.opengrep_bin, fallback_binary=settings.opengrep_fallback_bin)
+    """Report the scanner that will actually be used.
+
+    When scanning is delegated, the local binary is irrelevant, so the remote
+    service is probed instead — otherwise this endpoint answers a question nobody
+    asked and hides an unreachable scan service behind a stale local version.
+    """
+    from services.scan.client import scan_service_url
+
+    remote = scan_service_url()
+    engine = _probe_remote_scanner(remote) if remote else _local_scanner(settings)
+
     return HealthResponse(
-        status="ok",
+        status="ok" if not engine.startswith("scan service") else "degraded",
         version=__version__,
-        opengrep=runner.version(),
+        opengrep=engine,
         lsp_enabled=settings.lsp_enabled,
         capabilities={
             "workspace_root": str(settings.workspace_root),
             "output_dir": str(settings.output_dir),
             "budget": settings.budget.model_dump(),
+            "scan_transport": "remote" if remote else "in-process",
+            "scan_service_url": remote,
         },
     )
+
+
+def _local_scanner(settings: Settings) -> str:
+    runner = OpengrepRunner(settings.opengrep_bin, fallback_binary=settings.opengrep_fallback_bin)
+    return runner.version()
+
+
+def _probe_remote_scanner(url: str) -> str:
+    """What the scan service says it can run, or an explicit failure."""
+    try:
+        import httpx
+
+        response = httpx.get(f"{url}/health", timeout=5.0)
+        response.raise_for_status()
+        body = response.json()
+    except Exception as exc:
+        return f"scan service unreachable: {exc}"
+    if not body.get("available"):
+        return f"scan service has no engine ({body.get('reason', 'unknown')})"
+    return f"{body.get('binary')} {body.get('engine_version')} (remote)"
 
 
 @router.post("/v1/scan", response_model=ScanOnlyResponse)
@@ -109,6 +139,12 @@ async def assemble(
     sarif_path = Path(payload.sarif_path) if payload.sarif_path else None
     if sarif_path is not None and not sarif_path.exists():
         raise HTTPException(status_code=400, detail=f"sarif not found: {sarif_path}")
+
+    # Delegated deployment: hand the whole job to the extraction service. The
+    # gateway stays thin, and a language server that dies there cannot kill the API.
+    if extraction_is_remote():
+        return await _assemble_remotely(payload, workspace, sarif_path)
+
     result = await pipeline.run(
         PipelineRequest(
             workspace=workspace,
@@ -130,6 +166,40 @@ async def assemble(
         package_path=str(result.package_path),
         manifest=result.bundle.manifest,
         warnings=result.warnings,
+    )
+
+
+async def _assemble_remotely(
+    payload: AssembleRequest, workspace: Path, sarif_path: Path | None
+) -> AssembleResponse:
+    """Delegate the whole assembly to the extraction service."""
+    body: dict = {
+        "workspace": str(workspace),
+        "sarif_path": str(sarif_path) if sarif_path else None,
+        "rules": payload.rules,
+        "rule_config": payload.rule_config,
+        "include_globs": payload.include_globs,
+        "exclude_globs": payload.exclude_globs,
+        "max_findings": payload.max_findings,
+        "lsp": payload.lsp,
+        "package_name": payload.package_name,
+    }
+    if payload.budget is not None:
+        body["budget"] = payload.budget.model_dump()
+
+    try:
+        result = await asyncio.to_thread(request_extraction, body)
+    except ExtractionUnavailable as exc:
+        # 503, not 500: the request was fine, a *dependency* is down. A caller can
+        # retry, and the message names the service so an operator knows where to look.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return AssembleResponse(
+        bundle_id=result["bundle_id"],
+        run_id=result["run_id"],
+        package_path=result["package_path"],
+        manifest=AnalysisBundleManifest.model_validate(result["manifest"]),
+        warnings=list(result.get("warnings", [])),
     )
 
 
@@ -155,7 +225,7 @@ async def assemble_upload(
 
     budget = None
     if budget_json:
-        from app.core.config import BudgetConfig
+        from aegis_core.config import BudgetConfig
 
         try:
             budget = BudgetConfig(**json.loads(budget_json))
@@ -256,6 +326,16 @@ def bundle_contexts(bundle_id: str, settings: Settings = Depends(get_settings)) 
 def bundle_methods(bundle_id: str, settings: Settings = Depends(get_settings)) -> dict:
     manifest = load_manifest(bundle_id, settings)
     return views.method_index(manifest)
+
+
+@router.get("/v1/bundles/{bundle_id}/methods/{method_id}/body", response_class=PlainTextResponse)
+def method_body(
+    bundle_id: str, method_id: str, settings: Settings = Depends(get_settings)
+) -> PlainTextResponse:
+    """One method's complete source, as stored in the package."""
+    return PlainTextResponse(
+        load_method_body(bundle_id, method_id, settings), media_type="text/plain"
+    )
 
 
 @router.get("/v1/bundles/{bundle_id}/diff/{other_id}")

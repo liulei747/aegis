@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.core.logging import get_logger
-from app.core.utils import to_uri
+from aegis_core.logging import get_logger
+from aegis_core.utils import to_uri
 from app.lsp.protocol import (
     LspError,
     ServerExited,

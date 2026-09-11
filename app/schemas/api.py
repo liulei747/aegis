@@ -6,8 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from app.core.config import BudgetConfig
-from app.schemas.domain import AnalysisBundleManifest
+from aegis_contracts.domain import AnalysisBundleManifest
+from aegis_core.config import BudgetConfig
 
 
 class AssembleRequest(BaseModel):

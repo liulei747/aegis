@@ -8,10 +8,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from aegis_core.config import get_settings
+from aegis_core.logging import get_logger, setup_logging
 from app import __version__
 from app.api.routes import router
-from app.core.config import get_settings
-from app.core.logging import get_logger, setup_logging
 
 log = get_logger(__name__)
 

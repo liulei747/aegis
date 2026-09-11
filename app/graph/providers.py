@@ -18,19 +18,14 @@ can weigh a ``gopls`` edge differently from a regex guess.
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.core.logging import get_logger
-from app.core.utils import from_uri, normalize_snippet, sha1
-from app.graph.resolver import SymbolIndex, Workspace
-from app.lsp.manager import LanguageServerManager
-from app.lsp.protocol import LspRange
-from app.lsp.symbols import RawSymbol, find_enclosing
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     CallEdge,
     CodeRegion,
     EdgeDirection,
@@ -38,6 +33,12 @@ from app.schemas.domain import (
     Provider,
     SymbolKind,
 )
+from aegis_core.logging import get_logger
+from aegis_core.utils import from_uri, normalize_snippet, sha1
+from app.graph.resolver import SymbolIndex, Workspace
+from app.lsp.manager import LanguageServerManager
+from app.lsp.protocol import LspRange
+from app.lsp.symbols import RawSymbol, find_enclosing
 
 log = get_logger(__name__)
 
@@ -127,19 +128,74 @@ class CallGraphResolver:
     # ------------------------------------------------------------------
     def region_of(self, rel: str, rng: LspRange) -> CodeRegion:
         line_index = self.workspace.index(rel)
+        end_line, end_char = self._trim_trailing_blank_lines(
+            rel, rng.end.line, rng.end.character, start_line=rng.start.line
+        )
         offsets: tuple[int | None, int | None] = (None, None)
         if line_index is not None:
-            start, end = line_index.offset_range(rng)
-            offsets = (start, end)
+            offsets = (
+                line_index.offset_of(rng.start.line, rng.start.character),
+                line_index.offset_of(end_line, end_char),
+            )
         return CodeRegion(
             path=rel,
             start_line=rng.start.line,
             start_char=rng.start.character,
-            end_line=rng.end.line,
-            end_char=rng.end.character,
+            end_line=end_line,
+            end_char=end_char,
             start_offset=offsets[0],
             end_offset=offsets[1],
         )
+
+    def _trim_trailing_blank_lines(
+        self, rel: str, end_line: int, end_char: int, *, start_line: int
+    ) -> tuple[int, int]:
+        """Pull the range end back to the last line that is really ours.
+
+        Language servers commonly define a symbol's range as "up to the next
+        sibling symbol", which lands the end on the *next declaration's* first
+        line (and swallows the blank lines between the two). That is not harmless:
+
+        * the slice we hand to the model carries trailing blanks and a stray
+          ``def ...:`` line belonging to the next method;
+        * two providers locating the same function produce different extents, so
+          their content hashes differ and content-based dedupe stops working;
+        * ``method_id`` hashes the extent, so one function gets two ids depending
+          on whether a language server was available.
+
+        Two passes: drop trailing blank lines, then drop a trailing line that
+        *starts another symbol* in this file. Only blanks and a foreign
+        declaration are removed — never real code of ours.
+        """
+        line_index = self.workspace.index(rel)
+        if line_index is None:
+            return end_line, end_char
+
+        last = min(end_line, line_index.line_count - 1)
+
+        def is_blank(line: int) -> bool:
+            return not line_index.line_text(line).strip()
+
+        while last > start_line and is_blank(last):
+            last -= 1
+
+        if last > start_line:
+            # A sibling symbol *starts* on this line (so the range ran one line
+            # too far). Keying on the start line, not containment, is what makes
+            # this correct: the next symbol's range also contains its own first
+            # line, so a containment test would call it "ours".
+            foreign = any(
+                sym.range.start.line == last and sym.range.start.line != start_line
+                for sym in self.index.symbols(rel)
+            )
+            if foreign or _looks_like_declaration(line_index.line_text(last).strip()):
+                last -= 1
+                while last > start_line and is_blank(last):
+                    last -= 1
+
+        if last >= end_line:
+            return end_line, end_char
+        return last, len(line_index.line_text(last))
 
     def symbol_from_raw(
         self,
@@ -203,19 +259,36 @@ class CallGraphResolver:
                 parser = self.workspace.syntax_parser(rel)
                 scope = parser.method_at(parsed, line, char)
                 if scope is not None:
+                    # Same normalisation as the LSP path: stop at the last line
+                    # that actually holds code, so both providers describe the
+                    # same extent and therefore produce the same content hash.
+                    end_line = scope.end_line
+                    while end_line > scope.start_line and not parsed.line_text(end_line).strip():
+                        end_line -= 1
                     region = CodeRegion(
                         path=rel,
                         start_line=scope.start_line,
                         start_char=0,
-                        end_line=scope.end_line,
-                        end_char=len(parsed.line_text(scope.end_line)),
+                        end_line=end_line,
+                        end_char=len(parsed.line_text(end_line)),
+                        # Byte offsets must be filled in: without them the reader
+                        # falls back to a line slice and, with a missing upper
+                        # bound, can hand over the whole file as this method body.
+                        start_offset=parsed.line_starts[scope.start_line],
+                        end_offset=(
+                            parsed.line_starts[end_line + 1]
+                            if end_line + 1 < len(parsed.line_starts)
+                            else len(parsed.text)
+                        ),
                     )
                     qualified = (
                         f"{scope.parent_hint}.{scope.name}" if scope.parent_hint else scope.name
                     )
                     symbol = MethodSymbol(
                         method_id="M-"
-                        + sha1(rel, qualified, str(scope.start_line), str(scope.end_line), length=12),
+                        + sha1(
+                            rel, qualified, str(region.start_line), str(region.end_line), length=12
+                        ),
                         name=scope.name,
                         qualified_name=qualified,
                         kind=SymbolKind.FUNCTION,
@@ -579,6 +652,31 @@ class CallGraphResolver:
         with self._lock:
             if message not in self.degradations:
                 self.degradations.append(message)
+
+
+_DECLARATION = re.compile(
+    r"^(async\s+)?(def|class|function|func|fn|struct|interface|enum|impl|trait)\b"
+)
+
+
+def _looks_like_declaration(text: str) -> bool:
+    """Cheap check: does this line start a new definition in any supported language?"""
+    return bool(_DECLARATION.match(text))
+
+
+def _declares_any(text: str, names: set[str]) -> bool:
+    """True when this declaration line names one of ``names`` (i.e. it could be ours).
+
+    A nested ``def`` inside the symbol we are trimming belongs to the symbol, so
+    it must not be removed.
+    """
+    for name in names:
+        if re.search(rf"\b{re.escape(name)}\s*\(", text) or re.search(
+            rf"\b(def|class|function|func|fn|struct|interface|enum|impl|trait)\s+{re.escape(name)}\b",
+            text,
+        ):
+            return True
+    return False
 
 
 # ----------------------------------------------------------------------

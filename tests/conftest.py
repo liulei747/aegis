@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.core.config import BudgetConfig, Settings  # noqa: E402
-from app.core.logging import setup_logging  # noqa: E402
+from aegis_core.config import BudgetConfig, Settings  # noqa: E402
+from aegis_core.logging import setup_logging  # noqa: E402
 from tests.fixtures import write_fixture  # noqa: E402
 
 setup_logging("WARNING")

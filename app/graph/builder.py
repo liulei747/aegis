@@ -11,11 +11,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from app.core.config import BudgetConfig
-from app.core.logging import get_logger
-from app.graph.providers import CallGraphResolver
-from app.graph.resolver import Workspace
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     CallEdge,
     EdgeDirection,
     Finding,
@@ -25,6 +21,10 @@ from app.schemas.domain import (
     PruneDecision,
     SymbolKind,
 )
+from aegis_core.config import BudgetConfig
+from aegis_core.logging import get_logger
+from app.graph.providers import CallGraphResolver
+from app.graph.resolver import Workspace
 
 log = get_logger(__name__)
 

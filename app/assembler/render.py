@@ -15,15 +15,16 @@ sub-agent, or fan out one ``context.<id>`` per worker.
 
 from __future__ import annotations
 
-from app.assembler.contexts import AssembledContext, AssemblyResult
-from app.core.config import BudgetConfig
-from app.core.utils import estimate_tokens
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     EdgeDirection,
     Finding,
     MethodRef,
+    MethodSymbol,
     PromptBlock,
 )
+from aegis_core.config import BudgetConfig
+from aegis_core.utils import estimate_tokens
+from app.assembler.contexts import AssembledContext, AssemblyResult
 
 PROMPT_VERSION = "2025-01-assemble-v1.1"
 
@@ -108,9 +109,27 @@ def instructions_block() -> PromptBlock:
 class BundleRenderer:
     def __init__(self, budget: BudgetConfig) -> None:
         self.budget = budget
+        self._canonical: dict[str, str] = {}
+        self._method_by_id: dict[str, MethodSymbol] = {}
+
+    def _canonical_for(self, context: AssembledContext, method_id: str) -> str | None:
+        """Which method id owns the body that stands in for ``method_id``?"""
+        canonical = self._canonical.get(method_id)
+        if canonical is None:
+            return None
+        # Only point at it when that body is actually rendered somewhere.
+        rendered = any(canonical in c.bodies for c in self._contexts)
+        return canonical if rendered else None
 
     # ------------------------------------------------------------------
     def render(self, result: AssemblyResult, *, bundle_id: str, workspace_root: str) -> list[PromptBlock]:
+        self._canonical = dict(result.bundle_aliases)
+        self._contexts = result.contexts
+        self._method_by_id = {
+            ref.method.method_id: ref.method
+            for context in result.contexts
+            for ref in context.refs
+        }
         blocks: list[PromptBlock] = [instructions_block(), provider_legend()]
         blocks.append(self._catalog(result))
         for context in result.contexts:
@@ -152,12 +171,14 @@ class BundleRenderer:
         lines = [
             "## Collected method sources",
             "",
-            "Complete bodies of every method in this bundle, deduplicated.",
-            "Method ids are content-stable: the same method keeps its id across runs.",
+            "Complete bodies of every method in this bundle, deduplicated across all",
+            "contexts. Method ids are content-stable: the same method keeps its id",
+            "across runs, and a context that refers to a body rendered here points at",
+            "it rather than repeating it.",
             "",
         ]
         for body in sorted(
-            result.bodies.bodies.values(),
+            result.inlined_bodies.values(),
             key=lambda b: (b.method.path, b.method.region.start_line, b.method.method_id),
         ):
             method = body.method
@@ -172,7 +193,7 @@ class BundleRenderer:
             title="Collected method sources",
             content=content,
             estimated_tokens=estimate_tokens(content),
-            method_ids=sorted(result.bodies.bodies),
+            method_ids=sorted(result.inlined_bodies),
         )
 
     def _context(self, context: AssembledContext) -> PromptBlock:
@@ -246,12 +267,29 @@ class BundleRenderer:
 
         lines.append("### Method sources")
         for ref in context.refs:
-            body = context.bodies.get(ref.method.method_id)
-            lines.append(_method_header(ref.method, body))
+            method_id = ref.method.method_id
+            body = context.bodies.get(method_id)
             if body is None:
-                lines.append("_body not inlined (budget/prune); see `prunes`_")
+                # Byte-identical to a body rendered elsewhere in this bundle: the
+                # text lives in `method_catalog`, so point there instead of paying
+                # for it a second time.
+                canonical = self._canonical_for(context, method_id)
+                lines.append(_method_header(ref.method, None))
+                if canonical is None:
+                    lines.append("_body not inlined (budget/prune); see `prunes`_")
+                else:
+                    owner = self._method_by_id.get(canonical)
+                    name = owner.qualified_name if owner else canonical
+                    location = (
+                        f" ({owner.path}:{owner.region.start_line + 1})" if owner else ""
+                    )
+                    lines.append(
+                        f"_body identical to `{canonical}` {name}{location}; "
+                        "see `method_catalog`_"
+                    )
                 lines.append("")
                 continue
+            lines.append(_method_header(ref.method, body))
             lines.append("```" + _fence_lang(ref.method.language))
             lines.append(body.text.rstrip())
             lines.append("```")

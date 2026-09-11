@@ -6,7 +6,7 @@ import asyncio
 import json
 from pathlib import Path
 
-from app.core.config import BudgetConfig, Settings
+from aegis_core.config import BudgetConfig, Settings
 from app.graph.builder import CallGraphBuilder
 from app.graph.providers import CallGraphResolver
 from app.graph.resolver import SymbolIndex, Workspace
@@ -86,10 +86,10 @@ def test_byte_identical_bodies_are_inlined_once_and_named_as_aliases(
     Constructed directly because the invariant is about the assembler's dedupe,
     not about how a language server would have named the two symbols.
     """
+    from aegis_contracts.domain import CodeRegion, MethodRef, MethodSymbol, Provider, SymbolKind
     from app.assembler.contexts import ContextAssembler
     from app.assembler.reader import BodySet, MethodBody
     from app.graph.builder import FocusSlice
-    from app.schemas.domain import CodeRegion, MethodRef, MethodSymbol, Provider, SymbolKind
 
     shared = "def sink(value):\n    return execute('select ' + value)\n"
 
@@ -155,8 +155,8 @@ def test_context_keeps_one_copy_of_identical_bodies_and_names_the_other(
 
 def test_total_char_budget_never_drops_the_focus_body(tmp_path: Path, budget: BudgetConfig) -> None:
     """The global cap drops the least valuable bodies, never the sink, and says so."""
+    from aegis_contracts.domain import CodeRegion, MethodSymbol, Provider, SymbolKind
     from app.assembler.reader import BodySet, MethodBody, MethodReader
-    from app.schemas.domain import CodeRegion, MethodSymbol, Provider, SymbolKind
 
     def method(name: str) -> MethodSymbol:
         return MethodSymbol(

@@ -19,8 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.core.config import BudgetConfig, Settings  # noqa: E402
-from app.core.logging import setup_logging  # noqa: E402
+from aegis_core.config import BudgetConfig, Settings  # noqa: E402
+from aegis_core.logging import setup_logging  # noqa: E402
 from app.pipeline.assemble import AssemblyPipeline, PipelineRequest  # noqa: E402
 from tests.fixtures import write_fixture, write_sarif  # noqa: E402
 

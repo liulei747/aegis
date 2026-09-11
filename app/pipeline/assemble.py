@@ -21,20 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.assembler.contexts import AssemblyResult, ContextAssembler
-from app.assembler.package import BundlePackager, write_text
-from app.assembler.reader import MethodReader
-from app.assembler.render import BundleRenderer
-from app.core.config import BudgetConfig, Settings
-from app.core.logging import get_logger
-from app.core.utils import sha1
-from app.graph.builder import CallGraphBuilder, FocusSlice
-from app.graph.providers import CallGraphResolver
-from app.graph.resolver import SymbolIndex, Workspace
-from app.lsp.manager import LanguageServerManager, load_catalog
-from app.scanner.opengrep import OpengrepRunner
-from app.scanner.sarif import SarifParser
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     AnalysisBundle,
     AnalysisBundleManifest,
     Degradation,
@@ -45,6 +32,20 @@ from app.schemas.domain import (
     RunStats,
     ScanRecord,
 )
+from aegis_core.config import BudgetConfig, Settings
+from aegis_core.logging import get_logger
+from aegis_core.utils import sha1
+from app.assembler.contexts import AssemblyResult, ContextAssembler
+from app.assembler.package import BundlePackager, write_text
+from app.assembler.reader import MethodReader
+from app.assembler.render import BundleRenderer
+from app.graph.builder import CallGraphBuilder, FocusSlice
+from app.graph.providers import CallGraphResolver
+from app.graph.resolver import SymbolIndex, Workspace
+from app.lsp.manager import LanguageServerManager, load_catalog
+from services.scan.client import run_scan_anywhere
+from services.scan.runner import ScanRequest, parse_sarif
+from services.scan.scanrecord import build_scan_record
 
 log = get_logger(__name__)
 
@@ -123,6 +124,14 @@ class AssemblyPipeline:
         stats.stage_ms["scan"] = _ms(started)
         if not findings:
             log.warning("no findings; producing an empty bundle for auditability")
+        if scan_record.location == "remote" and sarif_path is not None:
+            # The SARIF lives in the scan service's filesystem. We cannot attach it
+            # to the package, so say so instead of writing a path we cannot read.
+            warnings.append(
+                "scan ran in the scan service: its raw SARIF is not in this filesystem "
+                f"({sarif_path}) and is not attached to the bundle"
+            )
+            sarif_path = None
 
         if request.max_findings is not None:
             findings = _prioritize(findings)[: request.max_findings]
@@ -241,13 +250,18 @@ class AssemblyPipeline:
                 lsp=lsp,
                 stats=stats,
                 degradations=degradations,
+                scan_record=scan_record,
+                warnings=warnings,
             )
             bundle = AnalysisBundle(manifest=manifest)
             for context in assembly.contexts:
                 for ref in context.refs:
                     bundle.methods.setdefault(ref.method.method_id, ref.method)
+            # Inline each distinct body exactly once across the whole bundle, not
+            # once per context: the catalog would otherwise repeat identical text.
             bundle.sources = {
-                method_id: body.text for method_id, body in body_set.bodies.items()
+                method_id: body.text
+                for method_id, body in assembly.inlined_bodies.items()
             }
             bundle.recompute_totals()
             bundle.prompts = renderer.render(
@@ -307,102 +321,56 @@ class AssemblyPipeline:
     def _collect_findings(
         self, request: PipelineRequest, run_id: str
     ) -> tuple[list[Finding], Path | None, str, list[str], ScanRecord]:
-        """Run the scanner (or read SARIF) and describe *how* it was run.
+        """Ask the scan capability for findings, or read a SARIF we were handed.
 
-        The description matters as much as the findings: a run that reports zero
-        hits because the scanner was misconfigured looks identical to a clean
-        repository unless the invocation and stderr are recorded.
+        The scan capability lives in its own service (`services.scan.runner`).
+        Extraction calls it in-process here because this deployment has no queue
+        yet; the call boundary is already the right one, so moving it to HTTP later
+        is a one-line change rather than a refactor (see docs/SERVICE_TOPOLOGY.md).
 
         This stage never raises: a scanner that fails, a missing SARIF and an
         unparseable SARIF all return zero findings plus a named failure mode, so
         the run still produces an auditable (empty) bundle with the reason in it.
         """
-        warnings: list[str] = []
         if request.sarif_path is not None:
             sarif_path = Path(request.sarif_path).resolve()
-            parser = SarifParser(workspace_root=request.workspace.resolve())
-            findings = parser.parse_file(sarif_path)
-            return findings, sarif_path, "sarif-input", warnings, _scan_record(
-                engine="sarif-input",
-                engine_version="",
-                sarif_path=sarif_path,
-                command=[],
-                configured=True,
-                stderr="",
-                findings=findings,
-            )
-
-        runner = OpengrepRunner(
-            self.settings.opengrep_bin,
-            fallback_binary=self.settings.opengrep_fallback_bin,
-            timeout_s=self.settings.scan_timeout_s,
-        )
-        out_dir = self.settings.work_dir / run_id
-        outcome = runner.scan(
-            request.workspace,
-            out_dir=out_dir,
-            rule_config=request.rule_config,
-            rules=request.rules,
-            include_globs=request.include_globs,
-            exclude_globs=request.exclude_globs,
-        )
-        configured = bool(request.rule_config or request.rules)
-        if outcome.degraded and outcome.degrade_reason:
-            warnings.append(outcome.degrade_reason)
-
-        def failed(reason: str) -> tuple[list[Finding], Path | None, str, list[str], ScanRecord]:
-            """Return the empty-but-auditable result for a scan that could not yield findings."""
-            warnings.append(reason)
-            log.error("scan stage produced no usable findings: %s", reason)
+            findings = parse_sarif(sarif_path, workspace=request.workspace.resolve())
             return (
+                findings,
+                sarif_path,
+                "sarif-input",
                 [],
-                outcome.sarif_path,
-                outcome.engine,
-                warnings,
-                _scan_record(
-                    engine=outcome.engine,
-                    engine_version=runner.version(),
-                    sarif_path=outcome.sarif_path,
-                    command=outcome.command,
-                    configured=configured,
-                    stderr=outcome.stderr_tail,
-                    findings=[],
-                    returncode=outcome.returncode,
-                    failure_mode=reason,
+                build_scan_record(
+                    engine="sarif-input",
+                    engine_version="",
+                    sarif_path=sarif_path,
+                    command=[],
+                    configured=True,
+                    stderr="",
+                    findings=findings,
                 ),
             )
 
-        if outcome.returncode not in (0, 1):
-            return failed(
-                f"scanner exited with rc={outcome.returncode}"
-                + (f": {outcome.stderr_tail.splitlines()[-1]}" if outcome.stderr_tail else "")
+        outcome = run_scan_anywhere(
+            ScanRequest(
+                workspace=request.workspace,
+                rules=request.rules,
+                rule_config=request.rule_config,
+                include_globs=request.include_globs,
+                exclude_globs=request.exclude_globs,
+                out_dir=self.settings.work_dir / run_id,
+                binary=self.settings.opengrep_bin,
+                fallback_binary=self.settings.opengrep_fallback_bin,
+                timeout_s=self.settings.scan_timeout_s,
             )
-        if not outcome.sarif_path.exists():
-            return failed(f"scanner produced no SARIF output (rc={outcome.returncode})")
-        if outcome.sarif_path.stat().st_size == 0:
-            return failed(f"scanner wrote an empty SARIF file (rc={outcome.returncode})")
-
-        parser = SarifParser(workspace_root=request.workspace.resolve())
-        try:
-            findings = parser.parse_file(outcome.sarif_path)
-        except ValueError as exc:
-            return failed(f"scanner output is not valid SARIF: {exc}")
-
+        )
+        assert outcome.scan_record is not None
         return (
-            findings,
+            outcome.findings,
             outcome.sarif_path,
             outcome.engine,
-            warnings,
-            _scan_record(
-                engine=outcome.engine,
-                engine_version=runner.version(),
-                sarif_path=outcome.sarif_path,
-                command=outcome.command,
-                configured=configured,
-                stderr=outcome.stderr_tail,
-                findings=findings,
-                returncode=outcome.returncode,
-            ),
+            outcome.warnings,
+            outcome.scan_record,
         )
 
     # ------------------------------------------------------------------
@@ -427,7 +395,11 @@ class AssemblyPipeline:
                 prunes.append(
                     PruneDecision(
                         rule="max_contexts",
-                        detail=f"finding not expanded: max_contexts={budget.max_contexts} reached",
+                        detail=(
+                            f"finding not expanded: the context limit ({budget.max_contexts}) "
+                            "was already reached, so this finding never got a method or a "
+                            "context; raise max_contexts to include it"
+                        ),
                         path=finding.path,
                         line=finding.region.start_line,
                         provider=Provider.OPENGREP,
@@ -500,6 +472,8 @@ class AssemblyPipeline:
         lsp: LanguageServerManager | None,
         stats: RunStats,
         degradations: list[Degradation],
+        scan_record: ScanRecord,
+        warnings: list[str],
     ) -> AnalysisBundleManifest:
         all_edges = [edge for context in assembly.contexts for edge in context.edges]
         methods = {
@@ -548,6 +522,11 @@ class AssemblyPipeline:
             "symbol_index": index.provider_summary(),
             "providers_used": sorted(used_providers),
             "edge_providers": sorted({edge.provider.value for edge in all_edges}),
+            "scan_transport": scan_record.location,
+            # Warnings are the run's own caveats (a delegated scan whose SARIF could
+            # not be attached, a scanner fallback, ...). They belong in the contract,
+            # not only in a log line, or a consumer never learns about them.
+            "warnings": list(warnings),
         }
 
         return AnalysisBundleManifest(

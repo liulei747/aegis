@@ -66,15 +66,39 @@ Both are covered by tests in `tests/test_assembler.py`.
 
 ## 4. Dedupe with provenance
 
-Two different things are deduplicated, at two levels:
+Three kinds of redundancy are removed, at three levels. The rule is the same at
+every level: **inline the text once, keep every symbol**.
 
 * **Findings → context.** `AssemblyPipeline._locate` merges findings that resolve
   to the same enclosing method, so five rules hitting one function cost one
-  context. The merge count is recorded in `Coverage.deduped`.
-* **Methods → bodies.** `MethodReader` stores each distinct method once.
-  `ContextAssembler._one` then inlines byte-identical bodies once per context and
-  records the other symbols under `AssembledContext.aliases`, so the reader still
-  sees every symbol on the chain while the model pays for the text once.
+  context. The merge count lands in `Coverage.deduped`.
+* **Methods → bodies (per context).** `ContextAssembler._one` inlines
+  byte-identical bodies once *within* a context and records the others under
+  `AssembledContext.aliases`.
+* **Bodies → bundle (across contexts).** `_mark_bundle_level_duplicates` then
+  dedupes *across* contexts: a helper reached from two different sinks would
+  otherwise be inlined once per context **and** once in `method_catalog`. The
+  earliest method id in sort order wins; every other copy is removed from the
+  inline set and recorded in `AssemblyResult.bundle_aliases`. The renderer prints
+  `_body identical to ... ; see method_catalog_` in its place, so the text is
+  never lost, only paid for once.
+
+That third level was missing at first, and the gap was only visible by measuring:
+with two contexts sharing one helper, the catalog contained the same `def` twice.
+`tests/test_assemble_stage.py` now asserts the prompt contains it exactly once.
+
+### Ranges are normalised before they are hashed
+
+`method_id` and `content_hash` are both content-derived, which only helps if two
+providers compute the same *extent* for the same function. Language servers
+usually define a symbol's range as "up to the next sibling", which includes the
+blank lines in between and lands on the next declaration's first line. So
+`CallGraphResolver._trim_trailing_blank_lines` pulls the end back to the last line
+that is really ours, and `MethodReader` normalises the text to "no trailing
+whitespace, exactly one final newline". Without both, the same function gets two
+ids and two hashes depending on whether a language server was available, and
+dedupe silently stops working. `tests/test_read_stage.py` asserts they agree.
+
 
 ## 5. Why the prompt has a fixed block order
 

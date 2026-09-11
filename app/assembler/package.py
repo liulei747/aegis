@@ -21,10 +21,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
-from app.assembler.contexts import AssemblyResult
-from app.assembler.render import BundleRenderer
-from app.core.logging import get_logger, setup_logging
-from app.schemas.domain import (
+from aegis_contracts.domain import (
     AnalysisBundle,
     CallEdge,
     Degradation,
@@ -32,6 +29,9 @@ from app.schemas.domain import (
     PromptBlock,
     RunStats,
 )
+from aegis_core.logging import get_logger, setup_logging
+from app.assembler.contexts import AssemblyResult
+from app.assembler.render import BundleRenderer
 
 log = get_logger(__name__)
 
@@ -193,7 +193,16 @@ def render_summary(bundle: AnalysisBundle, result: AssemblyResult) -> str:
         f"- unique methods: {len(result.bodies.bodies)}",
         f"- size: {manifest.total_chars:,} chars, ~{manifest.estimated_tokens:,} tokens",
         f"- truncated: {str(any(c.truncated for c in result.contexts)).lower()}",
+        f"- scan ran: {manifest.stats.scan.location if manifest.stats.scan else 'unknown'}",
         "",
+    ]
+    run_warnings = list(manifest.capabilities.get("warnings") or [])
+    if run_warnings:
+        lines += ["## Run warnings", ""]
+        lines += [f"- {w}" for w in run_warnings]
+        lines.append("")
+
+    lines += [
         "## Contexts",
         "",
         "| context | focus | providers | severity | methods | tokens |",
