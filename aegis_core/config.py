@@ -37,6 +37,43 @@ class BudgetConfig(BaseModel):
     read_timeout_s: float = Field(5.0, gt=0)
 
 
+class QueueConfig(BaseModel):
+    """Job queue settings. An absent ``redis_url`` means the queue is off.
+
+    Same convention as ``AEGIS_SCAN_SERVICE_URL`` / ``AEGIS_EXTRACTION_SERVICE_URL``: the
+    presence of a URL is what switches behaviour. With no Redis configured every route
+    stays synchronous and the whole test-suite runs with no broker at all.
+
+    The two grace windows are separate on purpose (see ``docs/QUEUE_PLAN.md`` §6.5):
+    ``cancel_terminate_grace_s`` is how long a cooperative terminate gets before a hard
+    kill, and ``cancel_kill_grace_s`` is how long after that we wait for the process to
+    actually die before moving on and letting the reaper reconcile.
+    """
+
+    redis_url: str | None = Field(
+        default=None,
+        description="e.g. redis://redis:6379/0. Unset -> no queue, routes stay synchronous.",
+    )
+    stream: str = "aegis:q:jobs"
+    group: str = "aegis-workers"
+    block_ms: int = Field(1000, ge=100, le=5000, description="XREADGROUP block window.")
+    max_attempts: int = Field(3, ge=1, le=10)
+    heartbeat_interval_s: int = Field(15, ge=5, description="How often a worker refreshes its claim.")
+    reaper_interval_s: int = Field(30, ge=5)
+    #: How long a claim may go un-heartbeated before it is treated as abandoned. Must be
+    #: comfortably larger than ``heartbeat_interval_s`` or a slow job is stolen mid-run.
+    visibility_timeout_s: int = Field(1800, ge=60)
+    reap_batch: int = Field(32, ge=1, le=256)
+    job_ttl_s: int = Field(604_800, ge=300, description="7 days, applied only in a terminal state.")
+    list_limit: int = Field(100, ge=1, le=500)
+    #: Approximate cap on the stream. If this ever trims an un-ACKed entry, the job record
+    #: still exists and the startup reconcile re-enqueues it -- but check the warning log.
+    stream_maxlen: int = Field(10_000, ge=100)
+    cancel_terminate_grace_s: float = Field(3.0, gt=0)
+    cancel_kill_grace_s: float = Field(2.0, gt=0)
+    cancel_poll_s: float = Field(0.05, gt=0, le=1.0, description="Abort-poll interval while waiting.")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="AEGIS_",
@@ -68,6 +105,9 @@ class Settings(BaseSettings):
 
     # --- budgets -----------------------------------------------------
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+
+    # --- job queue (off when queue.redis_url is unset) ---------------
+    queue: QueueConfig = Field(default_factory=QueueConfig)
 
     def resolve(self) -> Settings:
         """Make relative paths absolute against CWD for predictable container behaviour."""

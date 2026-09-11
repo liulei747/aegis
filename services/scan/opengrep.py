@@ -7,12 +7,16 @@ We probe for the native binary first and fall back to a configured alternative
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from aegis_core.cancel import CanceledAbort
 from aegis_core.logging import get_logger
 
 log = get_logger(__name__)
@@ -27,6 +31,57 @@ class ScanOutcome:
     stderr_tail: str = ""
     degraded: bool = False
     degrade_reason: str | None = None
+    #: True when the process was killed because a cancel was requested. `run_scan`
+    #: converts this into a named ledger entry instead of a failure.
+    canceled: bool = False
+
+
+def _as_text(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def terminate_tree(proc: subprocess.Popen, *, grace_s: float = 1.0) -> None:
+    """Stop a scanner process and anything it spawned. Never raises.
+
+    Windows gives no signal that a child can ignore but also does not reap grandchildren,
+    so ``taskkill /T`` is tried first there; POSIX gets ``terminate`` then ``kill``. We do
+    *not* put the child in a new process group: on Windows that turns ``terminate()`` from
+    ``TerminateProcess`` into a ``CTRL_BREAK_EVENT``, which a child is free to ignore --
+    the opposite of what a cancel needs.
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":  # pragma: no cover - exercised on Windows only
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            log.debug("taskkill failed for pid=%s", proc.pid, exc_info=True)
+    try:
+        proc.terminate()
+    except Exception:
+        log.debug("terminate failed for pid=%s", proc.pid, exc_info=True)
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        log.debug("kill failed for pid=%s", proc.pid, exc_info=True)
+    try:
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the OS is very unhappy
+        log.error("scanner process %s did not die after kill()", proc.pid)
 
 
 class OpengrepNotFound(RuntimeError):
@@ -139,6 +194,10 @@ class OpengrepRunner:
         rules: list[str] | None = None,
         include_globs: list[str] | None = None,
         exclude_globs: list[str] | None = None,
+        abort: Callable[[], bool] | None = None,
+        process_sink: Callable[[subprocess.Popen], None] | None = None,
+        process_done: Callable[[], None] | None = None,
+        cancel_poll_s: float = 0.05,
     ) -> ScanOutcome:
         exe, degraded = self.resolve_binary()
         target = target.resolve()
@@ -161,14 +220,51 @@ class OpengrepRunner:
         log.info("running static scan", extra={"stage": "scan"})
         log.debug("command: %s", " ".join(cmd))
 
-        proc = subprocess.run(
+        # `Popen` rather than `subprocess.run`: the handle is the whole point. Without it
+        # the caller cannot terminate a scan, and the scan stage is the longest one
+        # (AEGIS_SCAN_TIMEOUT_S defaults to 900). Waiting is therefore a poll loop, which
+        # also has to keep the partial output that `TimeoutExpired` carries -- the old
+        # `subprocess.run` path lost it.
+        proc = subprocess.Popen(  # noqa: S603 - argv is built, never shell-interpreted
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=self.timeout_s,
-            check=False,
         )
-        tail = "\n".join((proc.stderr or "").strip().splitlines()[-20:])
+        if process_sink is not None:
+            process_sink(proc)
+
+        err = ""
+        try:
+            deadline = time.monotonic() + self.timeout_s
+            while True:
+                try:
+                    _stdout, err = proc.communicate(timeout=min(cancel_poll_s, 1.0))
+                    break
+                except subprocess.TimeoutExpired as expired:
+                    # Keep whatever the process already wrote: `TimeoutExpired` carries the
+                    # partial streams, and discarding them loses the only clue about why a
+                    # scan was slow. Only stderr is kept -- it is what the ledger records --
+                    # and stdout is dropped deliberately (the SARIF goes to a file).
+                    err = _as_text(expired.stderr)
+                    if abort is not None and abort():
+                        terminate_tree(proc, grace_s=1.0)
+                        raise CanceledAbort(
+                            stage="scan",
+                            resource="scan_process",
+                            detail=f"rc={proc.returncode}",
+                        ) from None
+                    if time.monotonic() >= deadline:
+                        terminate_tree(proc, grace_s=1.0)
+                        err = (err or "") + (
+                            f"\nscanner exceeded {self.timeout_s}s and was terminated"
+                        )
+                        break
+        finally:
+            if process_done is not None:
+                process_done()
+
+        tail = "\n".join((err or "").strip().splitlines()[-20:])
         if proc.returncode not in (0, 1):  # semgrep-family: 1 == findings present
             log.error("static scan failed rc=%s: %s", proc.returncode, tail)
         elif not sarif_path.exists():

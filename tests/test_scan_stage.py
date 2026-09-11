@@ -14,7 +14,7 @@ import pytest
 
 from aegis_contracts.domain import Severity
 from aegis_core.config import BudgetConfig, Settings
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
+from services.extraction.pipeline.assemble import AssemblyPipeline, PipelineRequest
 from tests.fixtures import write_sarif
 
 
@@ -115,6 +115,222 @@ def test_path_a_finding_without_location_is_skipped_not_fatal(
     )
     assert [f.rule_id for f in findings] == ["ok"]
     assert record.rule_counts == {"ok": 1}
+
+
+# ----------------------------------------------------------------------
+# Path C: the scanner is interrupted
+#
+# Real cancellation replaces `subprocess.run` with `Popen`, but that must not change
+# what a scan failure looks like. The distinction that has to survive is *who*
+# stopped the process: a cancel (a control-flow signal, reported as `canceled`) versus
+# everything else (a named failure).
+# ----------------------------------------------------------------------
+def _fake_runner(monkeypatch, *, outcome_factory):
+    """Swap the real engine runner for one that returns a scripted outcome."""
+    from services.scan import runner as scan_runner
+
+    class _FakeRunner:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def version(self) -> str:
+            return "fake-1.0"
+
+        def resolve_binary(self):
+            return ("fake-engine", False)
+
+        def scan(self, *args, **kwargs):
+            return outcome_factory(kwargs)
+
+    monkeypatch.setattr(scan_runner, "OpengrepRunner", _FakeRunner)
+
+
+def test_scan_cancel_returns_a_record_instead_of_raising(
+    tmp_path: Path, workspace: Path, monkeypatch
+) -> None:
+    """`run_scan` may not raise, and a cancel must still be visible. Both hold at once.
+
+    `run_scan`'s never-raise contract is why the abort cannot simply propagate: the caller
+    is told through `canceled=True` plus a ledger entry named `scan_aborted`, and the
+    pipeline turns that into a real `CanceledAbort` one level up.
+    """
+    from aegis_core.cancel import CanceledAbort
+    from services.scan import opengrep as opengrep_module
+    from services.scan import runner as scan_runner
+
+    def raise_abort(kwargs):
+        raise CanceledAbort(stage="scan", resource="scan_process", detail="rc=-15")
+
+    _fake_runner(monkeypatch, outcome_factory=raise_abort)
+
+    outcome = scan_runner.run_scan(
+        scan_runner.ScanRequest(workspace=workspace, abort=lambda: True)
+    )
+    assert outcome.canceled is True, "the caller needs to know this was a cancel"
+    assert outcome.findings == []
+    assert outcome.scan_record is not None
+    assert outcome.scan_record.failure_mode == "scan_aborted"
+    assert outcome.scan_record.returncode == -15
+    assert scan_runner  # the module stayed importable through the swap
+    assert opengrep_module is not None
+
+
+def test_scan_abort_surfaces_as_canceled_through_the_pipeline(
+    tmp_path: Path, workspace: Path, monkeypatch
+) -> None:
+    """The pipeline turns `canceled=True` into the signal, carrying the ledger with it.
+
+    A cancel during the scan stage never reaches packaging, so the exception is the only
+    way the scan record can travel to the worker.
+    """
+    from aegis_core.cancel import CanceledAbort
+    from services.scan import runner as scan_runner
+
+    def canceled_outcome(kwargs):
+        # A killed process with no SARIF, which is what a canceled scan actually looks
+        # like: the abort predicate is what tells this apart from an external kill.
+        return scan_runner.ScanOutcome(
+            engine="fake-engine",
+            engine_version="fake-1.0",
+            sarif_path=None,
+            findings=[],
+            warnings=[],
+            degraded=False,
+            command=["fake-engine", "scan"],
+            stderr_tail="terminated",
+            returncode=-15,
+        )
+
+    _fake_runner(monkeypatch, outcome_factory=canceled_outcome)
+    pipeline = _pipeline(tmp_path, workspace)
+
+    with pytest.raises(CanceledAbort) as caught:
+        pipeline._collect_findings(
+            PipelineRequest(workspace=workspace), "R-c", abort=lambda: True
+        )
+    assert caught.value.stage == "scan"
+    assert caught.value.resource == "scan_process"
+    assert caught.value.scan_record is not None
+    assert caught.value.scan_record.failure_mode == "scan_aborted"
+
+
+def test_scan_outcome_without_cancel_keeps_the_four_failure_modes(
+    tmp_path: Path, workspace: Path, monkeypatch
+) -> None:
+    """The pre-existing failure modes are untouched by the interruptibility work.
+
+    Each of these still comes back as a *named failure* with `canceled=False`, so the
+    new cancel path cannot have quietly absorbed the old ones.
+    """
+    from services.scan import opengrep as opengrep_module
+    from services.scan import runner as scan_runner
+
+    cases = {
+        "rc=2": opengrep_module.ScanOutcome(
+            engine="fake", returncode=2, sarif_path=tmp_path / "absent.sarif",
+            stderr_tail="unknown option '--nope'",
+        ),
+        "rc=127": opengrep_module.ScanOutcome(
+            engine="fake", returncode=127, sarif_path=tmp_path / "absent.sarif",
+            stderr_tail="not found",
+        ),
+    }
+    for label, outcome in cases.items():
+        _fake_runner(monkeypatch, outcome_factory=lambda kwargs, o=outcome: o)
+        result = scan_runner.run_scan(scan_runner.ScanRequest(workspace=workspace))
+        assert result.canceled is False, label
+        assert result.scan_record is not None
+        assert result.scan_record.failure_mode is not None
+        assert result.scan_record.failure_mode.startswith("scanner exited with rc=")
+
+
+def test_opengrep_scan_uses_popen_and_exposes_the_handle(
+    tmp_path: Path, workspace: Path, monkeypatch
+) -> None:
+    """Interruptibility depends on the handle existing. `subprocess.run` hides it."""
+    from services.scan import opengrep as opengrep_module
+
+    seen: dict[str, object] = {}
+
+    class _FakeProc:
+        def __init__(self, cmd, **kwargs) -> None:
+            seen["cmd"] = cmd
+            seen["kwargs"] = kwargs
+            self.returncode = 0
+            self.pid = 4242
+
+        def communicate(self, timeout=None):
+            # Write the SARIF the parser expects, then finish.
+            sarif_path = Path(seen["cmd"][seen["cmd"].index("--output") + 1])
+            sarif_path.write_text('{"version": "2.1.0", "runs": []}', encoding="utf-8")
+            return ("", "")
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(opengrep_module.subprocess, "Popen", _FakeProc)
+    runner = opengrep_module.OpengrepRunner("fake-engine", fallback_binary=None)
+    monkeypatch.setattr(runner, "resolve_binary", lambda: ("fake-engine", False))
+    monkeypatch.setattr(runner, "version", lambda: "fake-1.0")
+
+    sink_calls: list[object] = []
+    done_calls: list[int] = []
+    outcome = runner.scan(
+        workspace,
+        out_dir=tmp_path / "out",
+        process_sink=sink_calls.append,
+        process_done=lambda: done_calls.append(1),
+    )
+
+    assert seen["kwargs"].get("text") is True, "text mode is existing behaviour"
+    assert "capture_output" not in seen["kwargs"], "Popen does not take capture_output"
+    assert len(sink_calls) == 1, "the handle is handed over as soon as it exists"
+    assert len(done_calls) == 1, "and released exactly once, even on the happy path"
+    assert outcome.returncode == 0
+
+
+def test_scanner_argv_is_untouched(monkeypatch, tmp_path: Path) -> None:
+    """This change is about *how we wait*, never *how the command is built*.
+
+    `tests/test_scanner_command.py` owns the full argv contract; this asserts the builder
+    is still the only thing producing it -- the wait loop is handed a finished list.
+    """
+    from services.scan import opengrep as opengrep_module
+
+    captured: dict[str, list[str]] = {}
+
+    class _FakeProc:
+        returncode = 0
+        pid = 1
+
+        def __init__(self, cmd, **kwargs) -> None:
+            captured["cmd"] = list(cmd)
+
+        def communicate(self, timeout=None):
+            Path(captured["cmd"][captured["cmd"].index("--output") + 1]).write_text(
+                '{"version": "2.1.0", "runs": []}', encoding="utf-8"
+            )
+            return ("", "")
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(opengrep_module.subprocess, "Popen", _FakeProc)
+    runner = opengrep_module.OpengrepRunner("opengrep", fallback_binary=None)
+    monkeypatch.setattr(runner, "resolve_binary", lambda: ("opengrep", False))
+    monkeypatch.setattr(runner, "version", lambda: "1.16.0")
+
+    expected = runner.build_command(
+        "opengrep",
+        target=tmp_path,
+        sarif_path=tmp_path / "out" / "opengrep.sarif",
+        rule_config="p/default",
+        rules=[],
+        include_globs=[],
+        exclude_globs=[],
+    )
+    runner.scan(tmp_path, out_dir=tmp_path / "out", rule_config="p/default")
+    assert captured["cmd"] == expected
 
 
 # ----------------------------------------------------------------------
@@ -368,7 +584,7 @@ def test_failed_scan_still_produces_a_bundle_that_says_why(
     assert "unknown option" in scan.stderr_tail
 
     # the reviewer can see it in the derived views, not only in the raw manifest
-    from app.observability import views
+    from aegis_contracts import views
 
     overview = views.overview(manifest)
     assert any("zero findings" in flag for flag in overview.warning_flags)

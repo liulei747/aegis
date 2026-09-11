@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 #
 # Aegis scan service - one job: turn a repository into findings (+ an honest
 # record of how the scan was invoked).
@@ -7,8 +6,19 @@
 # Node, no clangd, no semgrep. Those belong to other services, and keeping them
 # out means this container starts fast and scales on CPU alone.
 #
-# Proxy note: pass --build-arg HTTP_PROXY/HTTPS_PROXY if the build host needs one.
-ARG BASE_IMAGE=python:3.12-slim-bookworm
+# NO `# syntax=docker/dockerfile:1` LINE, deliberately. It is not needed: the only
+# BuildKit feature used here is `--mount=type=cache`, which is native to the bundled
+# frontend. What the directive does do is make BuildKit *fetch* that frontend image from
+# Docker Hub before the build starts, so on a host that cannot reach Docker Hub the build
+# fails at line 1 with a registry timeout and nothing else gets built. Re-adding it buys
+# nothing and costs an offline build.
+#
+# Base image is a parameter so a host that cannot reach Docker Hub can point it at a
+# mirror or a locally loaded image, e.g.
+#   --build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+# The default is `python:3.12-slim` rather than a codename-specific tag because that is the
+# most widely mirrored one; both are Debian-based and every apt/pip step below is identical.
+ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE}
 
 ARG OPENGREP_VERSION=v1.16.0

@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 
 from aegis_core.config import BudgetConfig, Settings
-from app.graph.builder import CallGraphBuilder
-from app.graph.providers import CallGraphResolver
-from app.graph.resolver import SymbolIndex, Workspace
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
+from services.extraction.graph.builder import CallGraphBuilder
+from services.extraction.graph.providers import CallGraphResolver
+from services.extraction.graph.resolver import SymbolIndex, Workspace
+from services.extraction.pipeline.assemble import AssemblyPipeline, PipelineRequest
 from tests.fixtures import write_sarif
 
 TWINS = '''\
@@ -87,9 +87,9 @@ def test_byte_identical_bodies_are_inlined_once_and_named_as_aliases(
     not about how a language server would have named the two symbols.
     """
     from aegis_contracts.domain import CodeRegion, MethodRef, MethodSymbol, Provider, SymbolKind
-    from app.assembler.contexts import ContextAssembler
-    from app.assembler.reader import BodySet, MethodBody
-    from app.graph.builder import FocusSlice
+    from services.extraction.assembler.contexts import ContextAssembler
+    from services.extraction.assembler.reader import BodySet, MethodBody
+    from services.extraction.graph.builder import FocusSlice
 
     shared = "def sink(value):\n    return execute('select ' + value)\n"
 
@@ -146,7 +146,7 @@ def test_context_keeps_one_copy_of_identical_bodies_and_names_the_other(
     assert sink is not None
     slices = [CallGraphBuilder(ws, resolver, budget).build(sink[0], [])]
 
-    from app.assembler.reader import MethodReader, dedupe_index
+    from services.extraction.assembler.reader import MethodReader, dedupe_index
 
     bodies = asyncio.run(MethodReader(ws, budget).read_slices(slices))
     for ids in dedupe_index(bodies).values():
@@ -156,7 +156,7 @@ def test_context_keeps_one_copy_of_identical_bodies_and_names_the_other(
 def test_total_char_budget_never_drops_the_focus_body(tmp_path: Path, budget: BudgetConfig) -> None:
     """The global cap drops the least valuable bodies, never the sink, and says so."""
     from aegis_contracts.domain import CodeRegion, MethodSymbol, Provider, SymbolKind
-    from app.assembler.reader import BodySet, MethodBody, MethodReader
+    from services.extraction.assembler.reader import BodySet, MethodBody, MethodReader
 
     def method(name: str) -> MethodSymbol:
         return MethodSymbol(

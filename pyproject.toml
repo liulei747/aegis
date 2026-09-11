@@ -16,6 +16,10 @@ dependencies = [
     "pydantic-settings>=2.3",
     "httpx>=0.27",
     "pyyaml>=6.0",
+    # The job queue's client. In core rather than a `queue` extra on purpose: it is a
+    # small, pure-Python package, and the failure mode of a forgotten extra is a
+    # container that imports fine and then dies on the first submission.
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -43,10 +47,17 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
+    # A fake Redis for the queue tests. Not a hand-rolled double: what needs testing
+    # *is* Streams semantics (XADD/XREADGROUP/XACK/XAUTOCLAIM and the Lua CAS), so a
+    # fake we wrote ourselves would be a test of our own assumptions.
+    "fakeredis[lua]>=2.23",
 ]
 
 [project.scripts]
 aegis = "app.cli:main"
+# The queue consumer. Same image as the gateway, different entrypoint: the worker is a
+# second caller of the extraction code, not a second implementation of it.
+aegis-worker = "services.queue.worker:main"
 
 [tool.setuptools.packages.find]
 include = ["app*", "aegis_contracts*", "aegis_core*", "services*"]
@@ -66,6 +77,11 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# `demo/repo` is the code under analysis, not our code: it is a small, realistic
+# taint chain checked in so `docker compose up` has something to scan. Linting it
+# would pressure us to "fix" the fixture until it stops looking like real code (an
+# unused import and a deliberately naive SQL concatenation are the point of it).
+extend-exclude = ["demo"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

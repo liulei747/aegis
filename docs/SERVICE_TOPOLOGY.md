@@ -85,7 +85,7 @@ docker compose exec extract python -c \
   "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8103/health').read())"
 ```
 
-**The gateway is called `gateway`, not `api`.** With four services, "api" stopped
+**The gateway is called `gateway`, not `api`.** With five services, "api" stopped
 identifying anything: every service has an HTTP API. `gateway` says what it is —
 the single entry point that orchestrates and serves queries, while the workers do
 the heavy lifting and are unreachable from outside.
@@ -113,12 +113,16 @@ a service boundary costs one serialize/deserialize, not a new model.
 ## Layout
 
 ```
-aegis_contracts/          shared shapes (imported by every service)
-app/                      → becomes services/extraction/
+aegis_contracts/          shared shapes + derived views (imported by every service)
+  domain.py               Finding / MethodSymbol / CallEdge / manifest / budget shapes
+  views.py                pure "manifest -> funnel/timeline/provenance/diff" functions
+aegis_core/               settings, logging, text + path helpers, workspace resolution
+app/                      the gateway shell only: api/ schemas/ main.py cli.py
 services/
   extraction/             LSP + call graph + assembly; reads SARIF, writes bundles
   scan/                   wraps opengrep/semgrep; SARIF in, Finding[] out
-  api/                    gateway: jobs, queue, queries, no heavy lifting
+  queue/                  job records, Redis Streams, worker, reaper (shared by gateway
+                          and worker — a capability package, not a deployed service)
   web/                    the console (own image: nginx + static assets)
 infra/
   docker-compose.dev.yml  api + workers, in-process queue
@@ -130,15 +134,43 @@ infra/
 | # | move | why this order | status |
 | --- | --- | --- | --- |
 | 1 | `aegis_contracts` + `aegis_core` | everything depends on them; do it while there is one consumer | **done** |
-| 2 | split `_collect_findings` into "read SARIF" vs "run the scanner" | removes the only hard coupling, and extraction keeps working | next |
-| 3 | `services/extraction` (moves `graph/ lsp/ parsers/ assembler/ observability/ pipeline/`) | biggest chunk, no behaviour change | |
-| 4 | `services/scan` (moves `scanner/`) | now trivially separable | |
-| 5 | `services/api` (moves `api/`, adds the job layer) | the gateway becomes thin | |
-| 6 | `services/web` (moves the console out of `app/api/static`) | front-end changes stop touching a Python image | scaffolded |
-| 7 | queue: in-process → redis | keeps dev simple while making prod correct | |
+| 2 | split `_collect_findings` into "read SARIF" vs "run the scanner" | removes the only hard coupling, and extraction keeps working | **done** (`sarif_path` given -> `parse_sarif`; otherwise `run_scan_anywhere`) |
+| 3 | `services/extraction` (moved `graph/ lsp/ parsers/ assembler/ pipeline/`) | biggest chunk, no behaviour change | **done** |
+| 4 | `services/scan` (moved `scanner/`) | now trivially separable | **done** |
+| 5 | `services/api` (the gateway; the job layer is `services/queue/`) | the gateway becomes thin | **next** |
+| 6 | `services/web` (the console) | front-end changes stop touching a Python image | **done** (React + TS, own image, `127.0.0.1:8102`) |
+| 7 | queue: in-process → redis | keeps dev simple while making prod correct | **done** (`docs/QUEUE_PLAN.md`) |
 
 Steps 1–2 are pure moves; 3–6 keep every existing test passing by pointing the
 tests at the new module paths; 7 is the only step that adds infrastructure.
+
+### Step 3, as executed — and the cycle it removed
+
+The move was mechanical (the capability subpackages only ever imported their siblings
+plus the shared packages), but it was worth more than tidiness: before it, `app` and
+`services` imported each other. `app -> services` was six calls into the scan/extraction
+clients; `services -> app` was `routes.py` reaching for `app.pipeline.assemble` **and**
+for `app.api.deps::probe_lsp` / `resolve_workspace`.
+
+Two things had to move for the reverse edges to reach zero:
+
+* `probe_lsp` now lives in `services/extraction/lsp/probe.py` — it spawns language
+  servers, so it belongs to the capability that owns them;
+* `resolve_workspace`'s *policy* sank to `aegis_core/workspace.py`. Each service
+  translates `WorkspaceNotFound` into its own protocol error (the gateway into a 400),
+  which is the part that genuinely differs and therefore could not be shared.
+
+`tests/test_contracts.py` asserts `services -> app` is exactly zero edges, and pins the
+known `aegis_contracts -> aegis_core` exception to exactly one import.
+
+### A known exception, recorded rather than hidden
+
+`aegis_contracts/domain.py` imports `estimate_tokens` from `aegis_core.utils`. So the
+line below — "contracts must not import anything from a service" — holds, but the
+stronger claim that contracts sit at the very bottom of the graph does not: they sit on
+`aegis_core`. That is a wording problem, not a layering disaster (the helper is pure),
+and both fixes (duplicating the helper, or inverting the dependency) are separate
+decisions. It is pinned by a test so a second such edge cannot appear unnoticed.
 
 ### Step 1, as executed
 
@@ -167,8 +199,8 @@ Still to do for step 1: nothing. `app/core/` and `app/schemas/domain.py` are gon
 
 ## Costs of doing this (so nobody is surprised)
 
-* **More moving parts.** Four services means four health checks, four logs, a
-  queue to operate, and network failure modes that did not exist in-process.
+* **More moving parts.** Five services means five health checks, five logs, a queue and a
+  broker to operate, and network failure modes that did not exist in-process.
 * **No more in-process shortcuts.** `PipelineRequest(sarif_path=…)` looked like one
   call; it becomes a job that can fail between stages.
 * **Version skew becomes possible.** A worker on an old image can emit a manifest
@@ -176,6 +208,17 @@ Still to do for step 1: nothing. `app/core/` and `app/schemas/domain.py` are gon
   checked at the boundary.
 * **Debugging spans processes.** A failing bundle is now traced across at least the
   gateway and one worker, so `run_id` has to travel in headers and logs.
+
+Two costs are specific to the queue and were accepted with open eyes:
+
+* **A job can be `running` with nobody working on it** if every worker is dead at once; the
+  state moves when one comes back (the startup reconcile), not before. This is the design's
+  one silent window, and the reaper's heartbeat check is what keeps it from being worse --
+  the alternative failure, declaring a *live* slow job dead, is the one that invents results.
+* **Cancelling a *remote* scan stops the wait, not the work.** The worker answers immediately,
+  but the scanner in the `scan` container runs to completion because its handle lives there.
+  Cancelling an extraction is not affected: the worker runs extraction in-process, which is
+  precisely why it does.
 
 These are accepted deliberately: the alternative is a service that cannot be
 scaled, restarted or released independently.

@@ -1,0 +1,30 @@
+# Line-ending rules. Without these, `core.autocrlf=true` (the Windows default) rewrites
+# files on checkout, and the damage is silent and platform-specific:
+#
+#   * a shell script copied into a Linux image gets CRLF, so the shebang becomes
+#     `#!/usr/bin/env bash\r` and the container dies with `env: 'bash\r': No such file or
+#     directory`, exit 127. That is exactly what happened to `docker/entrypoint.sh` on the
+#     first `docker compose up` on Windows, and it looked like a missing binary.
+#   * generally, anything a *container* reads verbatim (shell scripts, Dockerfiles, YAML
+#     read by a strict parser) should be LF regardless of the host that checked it out.
+#
+# Python and Markdown are deliberately not listed: CPython and every Markdown renderer
+# handle CRLF, and forcing LF on them would rewrite most of the repository for no benefit.
+* text=auto eol=lf
+
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.conf text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+
+# Binary assets must never be touched.
+*.png binary
+*.jpg binary
+*.zip binary

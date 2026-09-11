@@ -13,12 +13,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from aegis_contracts import views
 from aegis_contracts.domain import AnalysisBundleManifest
 from aegis_core.config import BudgetConfig, Settings, get_settings
 from app.api.deps import clear_pipeline_cache
 from app.main import create_app
-from app.observability import views
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
+from services.extraction.pipeline.assemble import AssemblyPipeline, PipelineRequest
 from tests.fixtures import write_sarif, write_two_hits_sarif
 
 

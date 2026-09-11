@@ -10,8 +10,10 @@ from fastapi import HTTPException
 
 from aegis_contracts.domain import AnalysisBundleManifest
 from aegis_core.config import Settings, get_settings
-from app.lsp.manager import LanguageServerManager, load_catalog
-from app.pipeline.assemble import AssemblyPipeline, ScanOnlyPipeline
+from aegis_core.workspace import WorkspaceNotFound
+from aegis_core.workspace import resolve_workspace as core_resolve_workspace
+from services.extraction.lsp.probe import probe_lsp  # noqa: F401  (re-exported for routes)
+from services.extraction.pipeline.assemble import AssemblyPipeline, ScanOnlyPipeline
 
 
 def settings_dep() -> Settings:
@@ -44,18 +46,15 @@ def clear_pipeline_cache() -> None:
 
 
 def resolve_workspace(raw: str | None) -> Path:
-    settings = get_settings()
-    if raw is None:
-        return settings.workspace_root
-    path = Path(raw)
-    if not path.is_absolute():
-        path = (settings.workspace_root / path).resolve()
-    path = path.resolve()
-    if not path.exists():
-        raise HTTPException(status_code=400, detail=f"workspace does not exist: {path}")
-    if not path.is_dir():
-        raise HTTPException(status_code=400, detail=f"workspace is not a directory: {path}")
-    return path
+    """The shared resolver, with this service's error shape hung off it.
+
+    The policy lives in `aegis_core.workspace` so the extraction service can ask the
+    same question; turning "not a directory" into a 400 is the gateway's job.
+    """
+    try:
+        return core_resolve_workspace(raw)
+    except WorkspaceNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def bundle_dir(bundle_id: str, settings: Settings) -> Path:
@@ -110,32 +109,58 @@ def load_method_body(bundle_id: str, method_id: str, settings: Settings) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def probe_lsp(workspace: Path) -> tuple[LanguageServerManager, dict, dict]:
+# ----------------------------------------------------------------------
+# job queue
+# ----------------------------------------------------------------------
+_queue_client = None
+
+
+def queue_enabled() -> bool:
+    """Whether this deployment runs jobs asynchronously.
+
+    Same convention as the scan and extraction service URLs: the presence of a configured
+    URL switches behaviour. With no URL the synchronous path is used unchanged, which is
+    what keeps the CLI, the test-suite and local development broker-free.
+    """
+    return get_settings().queue.redis_url is not None
+
+
+def get_queue_client():
+    """A lazily created Redis client, or None when the queue is off.
+
+    Lazy on purpose: a gateway must not fail to start because Redis is down. It starts,
+    serves the read-only bundle endpoints, and answers 503 on the queue endpoints -- a
+    bundle already on disk stays readable with the queue gone.
+    """
+    global _queue_client
+    url = get_settings().queue.redis_url
+    if url is None:
+        return None
+    if _queue_client is None:
+        import redis
+
+        _queue_client = redis.Redis.from_url(url)
+    return _queue_client
+
+
+def set_queue_client(client) -> None:
+    """Inject a client. Used by tests, and by an embedder that owns its connection."""
+    global _queue_client
+    _queue_client = client
+
+
+def get_job_queue():
+    """The store and stream pair the job routes need: one dependency, one connection."""
+    from services.queue.jobs import JobStore
+    from services.queue.keys import QueueKeys
+    from services.queue.streams import JobStream
+
     settings = get_settings()
-    manager = load_catalog(
-        settings.lsp_config_file,
-        root=workspace,
-        timeout_s=settings.lsp_request_timeout_s,
+    client = get_queue_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="queue unavailable: no Redis configured")
+    keys = QueueKeys(settings.queue.stream, settings.queue.group)
+    return (
+        JobStore(client, settings.queue, keys=keys),
+        JobStream(client, settings.queue, keys=keys),
     )
-    available: dict[str, object] = {}
-    missing: dict[str, object] = {}
-    try:
-        for spec in manager.catalog:
-            key = f"{spec.language}:{' '.join(spec.command)}"
-            probe_file = workspace / f"__aegis_probe__{spec.extensions[0] if spec.extensions else '.txt'}"
-            client = manager.client_for(probe_file)
-            if client is None:
-                missing[key] = {"extensions": spec.extensions}
-            else:
-                available[key] = {
-                    "extensions": spec.extensions,
-                    "server": client.server_info.get("name"),
-                    "callHierarchy": client.supports("callHierarchyProvider"),
-                    "documentSymbol": client.supports("documentSymbolProvider"),
-                    "definition": client.supports("definitionProvider"),
-                    "references": client.supports("referencesProvider"),
-                    "implementation": client.supports("implementationProvider"),
-                }
-        return manager, available, missing
-    finally:
-        manager.stop_all()

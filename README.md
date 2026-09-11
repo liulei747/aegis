@@ -44,13 +44,13 @@ Java… for as long as a language server exists for the language.
 
 | stage | module | what it does |
 | --- | --- | --- |
-| scan | `app/scanner/opengrep.py`, `app/scanner/sarif.py` | runs opengrep (falls back to semgrep), parses SARIF into `Finding` |
-| locate | `app/graph/providers.py::locate_method` | innermost enclosing callable via `documentSymbol`, else syntax heuristic |
-| expand | `app/graph/providers.py`, `app/graph/builder.py` | BFS both directions (callers ^ / callees v), capability-gated, budgeted |
-| read | `app/assembler/reader.py` | slices full method bodies from file bytes by LSP offsets, concurrently |
-| assemble | `app/assembler/contexts.py` | dedupes, groups by focus, builds one self-contained context per sink |
-| render | `app/assembler/render.py` | prompt blocks in cache-friendly order, with a provider legend |
-| package | `app/assembler/package.py` | writes a reviewable directory tree + zip |
+| scan | `services/scan/opengrep.py`, `services/scan/sarif.py` | runs opengrep (falls back to semgrep), parses SARIF into `Finding` |
+| locate | `services/extraction/graph/providers.py::locate_method` | innermost enclosing callable via `documentSymbol`, else syntax heuristic |
+| expand | `services/extraction/graph/providers.py`, `services/extraction/graph/builder.py` | BFS both directions (callers ^ / callees v), capability-gated, budgeted |
+| read | `services/extraction/assembler/reader.py` | slices full method bodies from file bytes by LSP offsets, concurrently |
+| assemble | `services/extraction/assembler/contexts.py` | dedupes, groups by focus, builds one self-contained context per sink |
+| render | `services/extraction/assembler/render.py` | prompt blocks in cache-friendly order, with a provider legend |
+| package | `services/extraction/assembler/package.py` | writes a reviewable directory tree + zip |
 
 ### Provider ladder (never lose the provenance)
 
@@ -79,6 +79,7 @@ contexts/<id>.md       one rendered analysis package per sink
 ai/prompt.md           ordered prompt blocks
 ai/blocks.jsonl        one block per line (streaming / caching)
 ai/blocks_meta.json    block order + which blocks are cacheable
+ai/cache_prefix.json   where the reusable prefix starts (not index 0)
 graph/callgraph.dot    the slice as a graph (edge colour = provider)
 summary.md             human review entry point
 scan/original.sarif    raw scanner output, for audit
@@ -167,7 +168,7 @@ and a CPU-bound assembler have nothing to do with each other and should not shar
 a blast radius.
 
 It is planned but **not built yet**. The backend side of it is finished: every
-number the console needs is already computed by `app/observability/views.py` and
+number the console needs is already computed by `aegis_contracts/views.py` and
 served as JSON, so the frontend is a pure renderer — it consumes the endpoints
 above, never re-derives a number and never reads raw artifact files, so the page
 and the JSON cannot disagree. The information architecture and the prototypes are
@@ -259,21 +260,45 @@ contract, two transports. See [§3 of the handover](docs/HANDOVER.md) and
 
 ### Docker
 
-Three containers, each with one job — `scan` (opengrep only, 625 MB),
-`extract` (LSP + graph + assembly, 1.9 GB) and `gateway` (thin, stateless):
+Six containers — `scan` (opengrep only), `extract` (LSP + graph + assembly), `redis`
+(job state), `worker` (consumes the queue), `gateway` (thin, stateless) and `web` (the
+console):
 
 ```bash
 cp .env.example .env
-cp docker/lsp.yaml docker/lsp.local.yaml     # optional catalog override
+cp docker/lsp.yaml docker/lsp.local.yaml     # REQUIRED, see below
 
 # scan a repo on the host
-AEGIS_SCAN_TARGET=/path/to/repo docker compose -f docker/docker-compose.yml up --build
+AEGIS_SCAN_TARGET=/path/to/repo docker compose -f docker/docker-compose.yml up -d --build
 
-# the only published port is the gateway, bound to loopback:
-#   http://127.0.0.1:8100/health    health (probes both workers)
+# two published ports, both bound to loopback:
+#   http://127.0.0.1:8100/health    the API (probes both workers)
 #   http://127.0.0.1:8100/docs      OpenAPI
-# set AEGIS_GATEWAY_PORT in .env to change it
+#   http://127.0.0.1:8102           the console
+# set AEGIS_GATEWAY_PORT / AEGIS_WEB_PORT in .env to change them
 ```
+
+**`cp docker/lsp.yaml docker/lsp.local.yaml` is not optional.** `extract` and `worker`
+bind-mount that file, and Docker's behaviour for a *missing* bind-mount source is to create
+a **directory** — so the container fails with `not a directory: Are you trying to mount a
+directory onto a file`. The symptom is that `extract` and `worker` never start, and
+`gateway` never starts either because it waits for them.
+
+On a host that cannot reach Docker Hub, point the base image at a mirror or a local image
+(the default is a widely mirrored tag for this reason):
+
+```bash
+docker compose -f docker/docker-compose.yml build \
+  --build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+```
+
+Without `AEGIS_SCAN_TARGET` the stack scans `demo/repo`, a four-file taint chain that
+is **checked in** for exactly that reason. It used to be generated on demand and
+git-ignored, which meant a fresh clone mounted a directory that did not exist: Docker
+creates missing bind-mount sources, so the run scanned an empty directory and
+produced a perfectly normal-looking bundle with zero findings and no error.
+`tests/test_demo_fixture.py` keeps the committed copy identical to the fixture it
+comes from.
 
 **Port policy:** only `gateway` (and the future `web`) publish a port, always on
 `127.0.0.1`. `scan` and `extract` use `expose:` and are reachable only by service
@@ -409,10 +434,14 @@ That image still works end to end: missing language servers become recorded
 ## 6. Tests
 
 ```bash
-python -m pytest -q          # 118 passed, 1 skipped — no language server required
-python -m pytest -q -m slow  # the one case that spawns a real language server
+python -m pytest -q          # 286 passed, 2 skipped — no language server required
+python -m pytest -q -m slow  # the 6 cases that go through the LSP code path
 python -m ruff check .
 ```
+
+The two skips are binary probes in `tests/test_scanner_command.py`: one per scanner
+engine (opengrep, semgrep), skipped when the engine is not installed. They are not
+failures; with an engine on `PATH` the run reports 287 or 288 passed.
 
 The suite contains `tests/fake_lsp_server.py`: a dependency-free LSP server that
 implements `documentSymbol`, `definition`, `references`, `implementation` and
@@ -456,7 +485,10 @@ Two container gotchas worth knowing:
 `instructions → method_catalog → contexts` because consumers want a large static
 prefix to prefill/cache and a small volatile suffix per sub-agent. Context ids are
 content-derived, so a re-run reuses prefixes. `ai/blocks_meta.json` marks which
-blocks are cacheable.
+blocks are cacheable, and `ai/cache_prefix.json` says where that run of cacheable
+blocks **starts** — it is not index 0, because `bundle.header` names the bundle and
+therefore changes between any two bundles. Concatenating the cacheable blocks
+without reading `prefix_start` produces a prefix that can never hit.
 
 **One context = one self-contained analysis unit.** The catalogue block is also
 inlined into each context, because a context must survive being handed to a

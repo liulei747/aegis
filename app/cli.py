@@ -14,7 +14,11 @@ import sys
 
 from aegis_core.config import BudgetConfig, get_settings
 from aegis_core.logging import setup_logging
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest, ScanOnlyPipeline
+from services.extraction.pipeline.assemble import (
+    AssemblyPipeline,
+    PipelineRequest,
+    ScanOnlyPipeline,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,11 +47,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = sub.add_parser("probe", help="report LSP servers usable for a workspace")
     _common(probe)
+
+    routes = sub.add_parser(
+        "routes",
+        help="print the HTTP route table as JSON (used by the console's contract tests)",
+    )
+    _common(routes, required=False)
+    routes.add_argument("--paths-only", action="store_true", help="print just the paths")
     return parser
 
 
-def _common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--workspace", required=True, help="repository path to analyse")
+def _common(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
+    parser.add_argument(
+        "--workspace",
+        required=required,
+        default="." if not required else None,
+        help="repository path to analyse",
+    )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
 
 
@@ -138,6 +154,24 @@ def main(argv: list[str] | None = None) -> int:
             "degradations": [d.reason for d in manager.degradations],
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "routes":
+        # The console must call endpoints that exist, and asking the *application* is the only
+        # answer that cannot drift: a hand-maintained list, or a grep of the decorators, would
+        # both keep passing after a route is renamed.
+        #
+        # Via `openapi()` rather than `app.routes`, deliberately: FastAPI 0.115 keeps included
+        # routers behind a lazy wrapper, so walking `app.routes` reports four default routes
+        # and silently misses every route this project defines. The OpenAPI document is also
+        # exactly what the running server publishes, so this is the same answer a client sees.
+        from app.main import create_app
+
+        paths = sorted(create_app().openapi().get("paths", {}))
+        if getattr(args, "paths_only", False):
+            print("\n".join(paths))
+        else:
+            print(json.dumps({"paths": paths}, indent=2))
         return 0
 
     return 2

@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from aegis_contracts.domain import AnalysisBundleManifest
 from aegis_core.config import BudgetConfig, Settings
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
+from services.extraction.pipeline.assemble import AssemblyPipeline, PipelineRequest
 
 router = APIRouter()
 
@@ -121,10 +121,13 @@ def lsp_probe(workspace: str | None = None) -> dict:
     the language-server processes: asking the gateway would answer about a
     different filesystem and a different set of installed servers.
     """
-    from app.api.deps import probe_lsp
-    from app.api.deps import resolve_workspace as _resolve
+    from aegis_core.workspace import WorkspaceNotFound, resolve_workspace
+    from services.extraction.lsp.probe import probe_lsp
 
-    target = _resolve(workspace)
+    try:
+        target = resolve_workspace(workspace)
+    except WorkspaceNotFound as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     manager, available, missing = probe_lsp(target)
     return {
         "workspace": str(target),

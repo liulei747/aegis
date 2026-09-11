@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from aegis_core.config import BudgetConfig, Settings  # noqa: E402
+from aegis_core.config import BudgetConfig, QueueConfig, Settings  # noqa: E402
 from aegis_core.logging import setup_logging  # noqa: E402
 from tests.fixtures import write_fixture  # noqa: E402
 
@@ -50,3 +50,49 @@ def fake_lsp_config(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return config
+
+
+# --- job queue ---------------------------------------------------------
+#
+# fakeredis rather than a hand-written double: the behaviour under test *is* Redis
+# semantics (Streams consumer groups, XAUTOCLAIM, and the Lua compare-and-swap), so a
+# fake of our own would only assert that we agree with ourselves.
+
+
+@pytest.fixture()
+def fake_redis():
+    import fakeredis
+
+    client = fakeredis.FakeStrictRedis()
+    yield client
+    client.flushall()
+
+
+@pytest.fixture()
+def queue_settings() -> QueueConfig:
+    """Small, fast intervals: the tests should not wait 30 s for a reaper tick."""
+    return QueueConfig(
+        redis_url="redis://localhost:6379/0",
+        visibility_timeout_s=60,
+        heartbeat_interval_s=5,
+        reaper_interval_s=5,
+        block_ms=200,
+        stream_maxlen=1000,
+        job_ttl_s=600,
+    )
+
+
+@pytest.fixture()
+def job_store(fake_redis, queue_settings):
+    from services.queue.jobs import JobStore
+
+    return JobStore(fake_redis, queue_settings)
+
+
+@pytest.fixture()
+def job_stream(fake_redis, queue_settings):
+    from services.queue.streams import JobStream
+
+    stream = JobStream(fake_redis, queue_settings)
+    stream.ensure_group()
+    return stream

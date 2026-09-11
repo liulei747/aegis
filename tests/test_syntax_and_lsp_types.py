@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from app.lsp.positions import LineIndex
-from app.lsp.symbols import parse_document_symbols
-from app.parsers.syntax import BraceParser, IndentParser, parse
+from services.extraction.lsp.positions import LineIndex
+from services.extraction.lsp.symbols import parse_document_symbols
+from services.extraction.parsers.syntax import BraceParser, IndentParser, parse
 
 PY = '''\
 class Service:

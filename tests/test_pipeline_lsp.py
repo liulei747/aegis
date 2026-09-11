@@ -6,10 +6,10 @@ from pathlib import Path
 import pytest
 
 from aegis_core.config import BudgetConfig, Settings
-from app.graph.providers import CallGraphResolver
-from app.graph.resolver import SymbolIndex, Workspace
-from app.lsp.manager import load_catalog
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
+from services.extraction.graph.providers import CallGraphResolver
+from services.extraction.graph.resolver import SymbolIndex, Workspace
+from services.extraction.lsp.manager import load_catalog
+from services.extraction.pipeline.assemble import AssemblyPipeline, PipelineRequest
 from tests.fixtures import write_sarif
 
 pytestmark = pytest.mark.slow

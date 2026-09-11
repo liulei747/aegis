@@ -14,10 +14,28 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SHARED = ("aegis_contracts", "aegis_core")
 
 
-def _imports(path: pathlib.Path) -> set[str]:
+def _imports(path: pathlib.Path, *, include_type_only: bool = False) -> set[str]:
+    """Modules imported by ``path``.
+
+    ``include_type_only`` defaults to False because the architecture question this file
+    asks is a *runtime* one: whether importing a package drags another one in. An import
+    guarded by ``TYPE_CHECKING`` does not. The distinction is kept explicit rather than
+    ignored so that a type-only edge can still be inspected deliberately.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    guarded: set[int] = set()
+    if not include_type_only:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                test = node.test
+                name = getattr(test, "id", None) or getattr(test, "attr", None)
+                if name == "TYPE_CHECKING":
+                    guarded.update(id(child) for child in ast.walk(node))
+
     found: set[str] = set()
     for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
@@ -98,3 +116,79 @@ def test_no_module_reads_static_assets_through_the_api_anymore() -> None:
     routing = (ROOT / "app" / "api" / "routes.py").read_text(encoding="utf-8")
     assert "static" not in routing, "the API should no longer serve the console"
     assert not (ROOT / "app" / "api" / "static").exists()
+
+
+# ---------------------------------------------------------------------------
+# The app/ -> services/extraction/ move (see docs/QUEUE_PLAN.md step 0).
+#
+# Before it, `app` imported `services` (six times: the scan and extraction clients)
+# and `services` imported `app` (three times), so the two top-level packages formed a
+# cycle and "the gateway is a thin shell" was only true by convention. These two
+# assertions are what keeps the move from silently un-happening.
+# ---------------------------------------------------------------------------
+
+
+def _top_level_edges() -> dict[tuple[str, str], int]:
+    edges: dict[tuple[str, str], int] = {}
+    for top in ("app", "aegis_contracts", "aegis_core", "services"):
+        for path in (ROOT / top).rglob("*.py"):
+            for module in _imports(path):
+                source = module.split(".")[0]
+                if source in {"app", "aegis_contracts", "aegis_core", "services"} and source != top:
+                    edges[(top, source)] = edges.get((top, source), 0) + 1
+    return edges
+
+
+def test_the_gateway_package_is_not_imported_by_the_services() -> None:
+    """`services -> app` must be zero: the capabilities do not depend on the HTTP face.
+
+    The scan/extraction clients stay in `services` (they belong to the capability they
+    call); what moved out is everything the *services* needed from `app`.
+    """
+    offenders = [
+        f"{top} -> {source} ({count})"
+        for (top, source), count in _top_level_edges().items()
+        if source == "app"
+    ]
+    assert not offenders, (
+        "a service imports the gateway package, which re-creates the app<->services "
+        "cycle the extraction move removed: " + "; ".join(offenders)
+    )
+
+
+def test_derived_views_stay_a_pure_function_of_the_contract() -> None:
+    """`aegis_contracts.views` renders a manifest and nothing else.
+
+    It used to live under the extraction capability, which meant the gateway's query
+    endpoints imported the worker's package to render a bundle that was already on disk.
+    """
+    from aegis_contracts import views  # noqa: F401
+
+    path = ROOT / "aegis_contracts" / "views.py"
+    assert path.is_file(), "the derived views belong with the contracts, not a service"
+    reached = {m.split(".")[0] for m in _imports(path)}
+    assert "app" not in reached and "services" not in reached, (
+        f"views.py must not reach into a service: {sorted(reached)}"
+    )
+
+
+def test_the_contract_layer_reaches_core_exactly_once() -> None:
+    """A known, pinned exception rather than a growing licence.
+
+    `aegis_contracts/domain.py` uses `aegis_core.utils.estimate_tokens`, a pure text
+    helper. That makes `SERVICE_TOPOLOGY.md`'s "contracts are the bottom of the graph"
+    slightly untrue, and the fix (duplicate the helper, or invert the dependency) is a
+    separate decision. Until then the edge is allowed but *counted*, so a second one
+    cannot appear unnoticed. See docs/QUEUE_PLAN.md step 0.
+    """
+    allowed = ("aegis_contracts", "aegis_core")
+    offenders: list[str] = []
+    for package in allowed:
+        for path in (ROOT / package).rglob("*.py"):
+            for module in _imports(path):
+                if module.startswith("aegis_core") and package == "aegis_contracts":
+                    offenders.append(f"{path.relative_to(ROOT)}: {module}")
+    assert len(offenders) == 1, (
+        "expected exactly one contracts -> core import (domain.estimate_tokens), found "
+        f"{len(offenders)}: {offenders}"
+    )

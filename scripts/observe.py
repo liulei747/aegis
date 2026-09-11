@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from aegis_contracts import views  # noqa: E402
 from aegis_contracts.domain import AnalysisBundleManifest  # noqa: E402
-from app.observability import views  # noqa: E402
 
 packages = [p for p in glob.glob(str(ROOT / "var" / "packages" / "B-*")) if Path(p).is_dir()]
 if not packages:

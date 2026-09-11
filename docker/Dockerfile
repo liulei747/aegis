@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 #
 # Aegis container: opengrep (scanner) + language servers (the call-graph seam)
 # + the FastAPI assembly service.
@@ -15,7 +14,19 @@
 #         --build-arg HTTPS_PROXY=http://host.docker.internal:3128 .
 #    If your proxy is only bound to loopback, `host.docker.internal` will not
 #    reach it; bind it to 0.0.0.0 or use a registry mirror instead.
-ARG BASE_IMAGE=python:3.12-slim-bookworm
+# 3. On a host that cannot reach Docker Hub at all, point BASE_IMAGE at a mirror or a
+#    locally loaded image, e.g.
+#       --build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+#    The default is `python:3.12-slim` rather than a codename-specific tag because that is
+#    the most widely mirrored one; both are Debian-based, so every step below is identical.
+#
+# NO `# syntax=docker/dockerfile:1` LINE, deliberately. It is not needed: the only
+# BuildKit feature used here is `--mount=type=cache`, which is native to the bundled
+# frontend. What the directive does do is make BuildKit *fetch* that frontend image from
+# Docker Hub before the build starts, so on a host that cannot reach Docker Hub the build
+# fails at line 1 with a registry timeout. Re-adding it buys nothing and costs an offline
+# build.
+ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE}
 
 ARG OPENGREP_VERSION=v1.16.0
@@ -146,8 +157,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # The shared layers are copied as sources, like the app: they change as often and
 # rebuilding a wheel for them on every edit is what made the loop slow.
-# `services/` is included because extraction consumes the scan capability from it
-# (in-process by default, over HTTP when AEGIS_SCAN_SERVICE_URL is set).
+# After the extraction move, `app/` is only the gateway shell (FastAPI routes, HTTP
+# schemas, CLI) while `services/extraction/` holds the LSP + graph + assembly
+# capability, so the import assertion below names one module from each side: an import
+# that still points at the old `app.pipeline` path fails the build, not the runtime.
 COPY aegis_contracts ./aegis_contracts
 COPY aegis_core ./aegis_core
 COPY services ./services
@@ -158,7 +171,7 @@ RUN set -eux; \
         rm -rf "${target}/${pkg}"; \
         cp -r "/opt/aegis/${pkg}" "${target}/${pkg}"; \
     done; \
-    python -c "import app, aegis_contracts, aegis_core, services.scan.client, app.api.routes, app.main, fastapi, uvicorn; print('aegis', app.__version__, 'importable')"
+    python -c "import app, aegis_contracts, aegis_core, aegis_contracts.views, services.scan.client, services.extraction.app, services.extraction.lsp.probe, services.extraction.pipeline.assemble, app.api.routes, app.main, fastapi, uvicorn; print('aegis', app.__version__, 'importable')"
 
 COPY docker/lsp.yaml /opt/aegis/lsp.yaml
 COPY docker/logging.json /opt/aegis/docker-logging.json

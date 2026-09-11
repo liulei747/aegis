@@ -1,14 +1,26 @@
 # Aegis - local development stack.
 #
-# Three services today, each with one job (see docs/SERVICE_TOPOLOGY.md):
+# Five services today, each with one job (see docs/SERVICE_TOPOLOGY.md):
 #
 #   scan      opengrep only              :8101 (internal only)  625 MB, CPU bound
 #   extract   LSP + graph + packaging    :8103 (internal only)  1.9 GB, memory bound
+#   worker    consumes the job queue     :8104 (internal only)  same image as gateway
+#   redis     job state + streams        :6379 (internal only)  no persistence
 #   gateway   orchestration + queries    :8100 (published)      thin, stateless
 #
 #   web       the console                :8102 (published)      NOT BUILT YET
 #             planned as its own nginx + static service; the backend views it
 #             needs are already served, see services/web/README.md
+#
+# WHY THE WORKER RUNS EXTRACTION IN-PROCESS, AND WHY IT HAS NO EXTRACTION URL:
+# it would be simpler to have the worker POST to `extract`, and it is wrong, for three
+# independent reasons. (1) `request_extraction()` is one blocking HTTP call with a
+# 30-minute timeout, so the worker could not heartbeat while it waited -- and a reaper
+# that cannot see a heartbeat declares healthy jobs dead. (2) The extraction service
+# exposes no progress or cancel channel, so a queued job would report two coarse stages
+# and could not be cancelled at all. (3) The handles to the language servers would live in
+# another container, which is exactly what a cancel needs to reach. `extract` stays as the
+# entry point for *synchronous* callers; the worker is a second caller of the same code.
 #
 # PORT POLICY - only user-facing services publish a port, and only on loopback.
 #
@@ -27,12 +39,35 @@
 #   docker compose -f docker/docker-compose.yml exec extract \
 #       python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8103/health').read())"
 #
-# Shared-volume contract: the gateway and the extractor must see the workspace and
-# the work directory at the *same paths*, because a SARIF path produced by one is
-# handed to the other. A future version passes bytes or uses object storage.
+# Shared-volume contract: the gateway, the worker and the extractor must see the workspace
+# and the work directory at the *same paths*, because a SARIF path produced by one is
+# handed to another. A future version passes bytes or uses object storage.
 #
 #   docker compose -f docker/docker-compose.yml up --build
 services:
+  # ── redis: job state and the work stream. Internal only, no persistence. ────────
+  #
+  # `--appendonly no --save ""` is deliberate: the authoritative record of a finished job
+  # is the bundle on disk, and durable job state would only invite the question of which of
+  # the two is right. `maxmemory-policy noeviction` matters more: an LRU policy would
+  # silently delete job records under memory pressure, which is "progress disappears" --
+  # far worse than the OOM error you get instead.
+  redis:
+    image: redis:7-alpine
+    container_name: aegis-redis
+    command:
+      ["redis-server", "--save", "", "--appendonly", "no",
+       "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
   # ── scan: opengrep, nothing else. Internal only. ──────────────────────────
   scan:
     build:
@@ -100,6 +135,52 @@ services:
     restart: unless-stopped
     shm_size: "512m"
 
+  # ── worker: consumes the job queue. Internal only. ─────────────────────────
+  #
+  # Same image as the gateway, different entrypoint. It needs the full toolchain (pyright,
+  # clangd, Node, the LSP catalog) because it runs extraction in-process, and it needs the
+  # scan URL because scanning stays delegated to the small CPU-bound image.
+  #
+  # It is deliberately NOT a dependency of the gateway: a gateway that cannot start until a
+  # worker is healthy would refuse to serve read-only bundle queries during a worker
+  # restart, and those queries need nothing but the filesystem.
+  worker:
+    image: aegis:0.1.0
+    container_name: aegis-worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      scan:
+        condition: service_healthy
+    environment:
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_WORKSPACE_ROOT: /workspace
+      AEGIS_OUTPUT_DIR: /data/packages
+      AEGIS_WORK_DIR: /data/work
+      AEGIS_LSP_CONFIG_FILE: /opt/aegis/lsp.yaml
+      AEGIS_QUEUE__REDIS_URL: redis://redis:6379/0
+      # Scanning stays delegated (small image, CPU bound).
+      AEGIS_SCAN_SERVICE_URL: http://scan:8101
+      # Extraction deliberately NOT delegated: see the file header. An empty value here is
+      # the assertion that nobody re-added it by habit.
+      AEGIS_EXTRACTION_SERVICE_URL: ""
+    entrypoint: ["aegis-worker"]
+    volumes:
+      - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      - ../var/packages:/data/packages
+      - ../var/work:/data/work
+      - ./lsp.local.yaml:/opt/aegis/lsp.yaml:ro
+    healthcheck:
+      # No HTTP surface: what a worker's health means is "Redis is reachable and my loop is
+      # turning over", which is the same signal the reaper uses to tell slow from dead.
+      test: ["CMD", "python", "-m", "services.queue.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    shm_size: "512m"
+
   # ── gateway: the only API the outside world talks to ──────────────────────
   gateway:
     image: aegis:0.1.0
@@ -108,6 +189,8 @@ services:
       scan:
         condition: service_healthy
       extract:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "127.0.0.1:${AEGIS_GATEWAY_PORT:-8100}:8000"
@@ -119,6 +202,9 @@ services:
       # Both hops delegated: this container runs no scanner and no extraction.
       AEGIS_SCAN_SERVICE_URL: http://scan:8101
       AEGIS_EXTRACTION_SERVICE_URL: http://extract:8103
+      # The queue is what turns /v1/assemble into a 202 + job id. Unset it and the old
+      # synchronous path is used, which is the supported way to run without a broker.
+      AEGIS_QUEUE__REDIS_URL: redis://redis:6379/0
     volumes:
       # Same paths as the workers, because it hands paths between them.
       - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
@@ -130,4 +216,29 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  # ── web: the review console. Published, static, and a pure renderer. ──────
+  #
+  # Its own image on purpose: editing a component must not rebuild the 2 GB Python image, and
+  # a route change must not rebuild this one. It proxies `/v1` to the gateway so the browser
+  # only ever talks to one origin -- no CORS, and no API host baked into the bundle.
+  #
+  # It deliberately does *not* depend on the gateway being healthy: nginx starts, serves the
+  # page, and the page reports the API being unreachable. Refusing to start would hide an
+  # outage behind a blank browser error.
+  web:
+    build:
+      context: ..
+      dockerfile: services/web/Dockerfile
+    image: aegis-web:0.1.0
+    container_name: aegis-web
+    ports:
+      - "127.0.0.1:${AEGIS_WEB_PORT:-8102}:8102"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8102/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped

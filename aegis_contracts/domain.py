@@ -279,6 +279,17 @@ class PromptBlock(BaseModel):
     content: str
     estimated_tokens: int = 0
     method_ids: list[str] = Field(default_factory=list)
+    cacheable: bool = Field(
+        default=False,
+        description=(
+            "True when this block's bytes hold still across the bundles a fan-out "
+            "runs over, so a consumer may include it in a provider-side cached "
+            "prefix. Declared by the renderer (the block's owner) rather than "
+            "inferred from the block id by the packager. The cacheable blocks are "
+            "contiguous and start at ai/cache_prefix.json::prefix_start; anything "
+            "before that index is volatile."
+        ),
+    )
 
 
 class AnalysisBundle(BaseModel):

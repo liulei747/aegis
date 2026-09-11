@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aegis · pipeline observability</title>
+    <!--
+      The console is a renderer. Every number it shows comes from the gateway's derived
+      views, so there is nothing to compute here and nothing to configure: `/v1` is
+      same-origin, proxied by nginx in production and by the Vite dev server locally.
+    -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>Aegis needs JavaScript: it renders the API's views rather than serving HTML.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

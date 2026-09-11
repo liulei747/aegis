@@ -10,7 +10,7 @@ callable, a `range` covering its **entire body** and a `selectionRange` covering
 just its **name**. Therefore:
 
 * "which method does this scanner hit belong to?" is range containment —
-  `app/lsp/symbols.py::find_enclosing`, deepest match wins;
+  `services/extraction/lsp/symbols.py::find_enclosing`, deepest match wins;
 * "give me the whole method" is a byte slice of the file using
   `LineIndex.offset_range` — no re-request, no re-parse;
 * "who calls this / what does it call?" is `callHierarchy/*`, and when the server
@@ -23,7 +23,7 @@ every language that has a server.
 
 LSP positions are `(line, character)` with `character` counted in UTF-16 code
 units (the default encoding). Python strings are UCS-4. Every conversion goes
-through `app/lsp/positions.py::LineIndex`, and `test_line_index_handles_utf16_surrogate_pairs`
+through `services/extraction/lsp/positions.py::LineIndex`, and `test_line_index_handles_utf16_surrogate_pairs`
 guards the emoji case. Getting this wrong silently corrupts every method range,
 which is why it has its own module instead of living inline in the client.
 
@@ -118,8 +118,19 @@ Rationale: consumers of this bundle want (a) a large static prefix that can be
 prefilled / cached provider-side, and (b) a small per-unit suffix. Context ids are
 content-derived (`sha1(focus, method set, finding ids)`), so a re-run of the same
 scan produces the same ids and reuses the same prefixes.
-`ai/blocks_meta.json` marks each block `cacheable: true|false` so a caller does
-not have to know the convention.
+`ai/blocks_meta.json` marks each block `cacheable: true|false`, **declared by the
+renderer** rather than re-derived from block ids by the packager, and
+`ai/cache_prefix.json` publishes where the cacheable run starts. It does not start at
+index 0: `bundle.header` carries the bundle id and is volatile by design, so a caller
+that prefixed every `cacheable` block would build a prefix that never matches.
+`tests/test_prompt_prefix.py` asserts both halves of that claim — the run is
+contiguous, and its bytes are identical between two bundles differing only in their
+volatile parts.
+
+Two different stabilities are in play, and only the second one is what a fan-out
+reuses: `instructions.*` is stable across *every* bundle of a prompt version, while
+`instructions.* + method_catalog` is stable across bundles assembled from the same
+workspace and rule set.
 
 `method_catalog` overlaps with the "Method sources" section inside each
 `context.<id>`. That duplication is deliberate: a context block must be
@@ -167,7 +178,7 @@ changed the outcome, so a Python-only run does not report "gopls missing".
 
 ## 9. Observability is a view layer, not a second source of truth
 
-`app/observability/views.py` is the only place that turns bundle facts into
+`aegis_contracts/views.py` is the only place that turns bundle facts into
 something a human reads. It is pure: it takes an
 `AnalysisBundleManifest` and returns derived views, never mutating it and never
 inventing a number. That is asserted (`test_views_do_not_mutate_the_manifest`).
@@ -225,19 +236,19 @@ can answer "why is this method here?" with a literal chain
 | `app/schemas/domain.py` | the pipeline's public data contract | `Finding`, `MethodSymbol`, `CallEdge`, `MethodContext`, `AnalysisBundleManifest` |
 | `app/scanner/opengrep.py` | spawn opengrep/semgrep | `OpengrepRunner`, `ScanOutcome` |
 | `app/scanner/sarif.py` | SARIF 2.1.0 → `Finding` | `SarifParser` |
-| `app/lsp/protocol.py` | framing + wire types | `encode_message`, `try_decode_message`, `LspRange` |
-| `app/lsp/client.py` | one server process | `LspClient` |
-| `app/lsp/manager.py` | pool + capability gating | `LanguageServerManager`, `LanguageServerSpec` |
-| `app/lsp/positions.py` | UTF-16 ↔ offset conversion | `LineIndex` |
-| `app/lsp/symbols.py` | documentSymbol → scopes | `RawSymbol`, `find_enclosing`, `identifier_at` |
-| `app/parsers/syntax.py` | serverless fallback | `IndentParser`, `BraceParser`, `CallSite` |
-| `app/graph/resolver.py` | file/symbol caches | `Workspace`, `SymbolIndex` |
-| `app/graph/providers.py` | the provider ladder | `CallGraphResolver` |
-| `app/graph/builder.py` | budgeted bidirectional BFS | `CallGraphBuilder`, `FocusSlice` |
-| `app/assembler/reader.py` | full-body reads + global cap | `MethodReader`, `BodySet`, `MethodBody` |
-| `app/assembler/contexts.py` | dedupe + one context per sink | `ContextAssembler`, `AssembledContext` |
-| `app/assembler/render.py` | prompt layout + legend | `BundleRenderer`, `SYSTEM_INSTRUCTIONS` |
-| `app/assembler/package.py` | on-disk tree + zip + DOT | `BundlePackager` |
-| `app/pipeline/assemble.py` | wiring, timing, degradation filtering | `AssemblyPipeline`, `PipelineRequest` |
-| `app/observability/views.py` | pure derived views: funnel, timeline, providers, provenance, diff | `overview`, `funnel`, `context_views`, `method_index`, `diff` |
+| `services/extraction/lsp/protocol.py` | framing + wire types | `encode_message`, `try_decode_message`, `LspRange` |
+| `services/extraction/lsp/client.py` | one server process | `LspClient` |
+| `services/extraction/lsp/manager.py` | pool + capability gating | `LanguageServerManager`, `LanguageServerSpec` |
+| `services/extraction/lsp/positions.py` | UTF-16 ↔ offset conversion | `LineIndex` |
+| `services/extraction/lsp/symbols.py` | documentSymbol → scopes | `RawSymbol`, `find_enclosing`, `identifier_at` |
+| `services/extraction/parsers/syntax.py` | serverless fallback | `IndentParser`, `BraceParser`, `CallSite` |
+| `services/extraction/graph/resolver.py` | file/symbol caches | `Workspace`, `SymbolIndex` |
+| `services/extraction/graph/providers.py` | the provider ladder | `CallGraphResolver` |
+| `services/extraction/graph/builder.py` | budgeted bidirectional BFS | `CallGraphBuilder`, `FocusSlice` |
+| `services/extraction/assembler/reader.py` | full-body reads + global cap | `MethodReader`, `BodySet`, `MethodBody` |
+| `services/extraction/assembler/contexts.py` | dedupe + one context per sink | `ContextAssembler`, `AssembledContext` |
+| `services/extraction/assembler/render.py` | prompt layout + legend | `BundleRenderer`, `SYSTEM_INSTRUCTIONS` |
+| `services/extraction/assembler/package.py` | on-disk tree + zip + DOT | `BundlePackager` |
+| `services/extraction/pipeline/assemble.py` | wiring, timing, degradation filtering | `AssemblyPipeline`, `PipelineRequest` |
+| `aegis_contracts/views.py` | pure derived views: funnel, timeline, providers, provenance, diff | `overview`, `funnel`, `context_views`, `method_index`, `diff` |
 | `app/api/*` | HTTP surface + review console | `routes.py`, `static/index.html` |

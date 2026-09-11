@@ -13,25 +13,28 @@ import shutil
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
+from aegis_contracts import views
 from aegis_contracts.domain import AnalysisBundleManifest
+from aegis_contracts.jobs import JobKind
 from aegis_core.config import Settings
 from aegis_core.logging import get_logger
 from app import __version__
 from app.api.deps import (
     bundle_dir,
+    get_job_queue,
     get_pipeline,
     get_scan_pipeline,
     get_settings,
     load_manifest,
     load_method_body,
     probe_lsp,
+    queue_enabled,
     resolve_workspace,
 )
-from app.observability import views
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest, ScanOnlyPipeline
+from app.api.jobs import submit
 from app.schemas.api import (
     AssembleRequest,
     AssembleResponse,
@@ -44,6 +47,11 @@ from services.extraction.client import (
     ExtractionUnavailable,
     extraction_is_remote,
     request_extraction,
+)
+from services.extraction.pipeline.assemble import (
+    AssemblyPipeline,
+    PipelineRequest,
+    ScanOnlyPipeline,
 )
 from services.scan.opengrep import OpengrepRunner
 
@@ -130,11 +138,59 @@ def scan(
     )
 
 
+@router.post("/v1/scan/jobs", status_code=202, response_model=None)
+def scan_job(
+    payload: ScanRequest,
+    response: Response,
+    force: bool = Query(False),
+    queue: tuple = Depends(get_job_queue),
+    settings: Settings = Depends(get_settings),
+):
+    """The asynchronous form of `/v1/scan`. The synchronous route is unchanged.
+
+    A separate path rather than a change to `/v1/scan`: that response is a documented
+    contract (`run_id`/`findings`/`sarif_path`/`engine`) with existing consumers, and
+    quietly turning it into "202 and an id" would be a breaking change disguised as a
+    feature.
+    """
+    store, stream = queue
+    return submit(
+        payload=payload,
+        kind=JobKind.SCAN,
+        force=force,
+        store=store,
+        stream=stream,
+        settings=settings,
+        response=response,
+    )
+
+
 @router.post("/v1/assemble", response_model=AssembleResponse)
 async def assemble(
     payload: AssembleRequest,
+    response: Response,
+    force: bool = Query(False, description="Re-run even if a previous attempt failed"),
     pipeline: AssemblyPipeline = Depends(get_pipeline),
-) -> AssembleResponse:
+):
+    """Assemble a bundle: synchronously, or as a queued job when a queue is configured.
+
+    The synchronous path is unchanged -- same request model, same response, same status --
+    which is what keeps the CLI, the tests and a broker-free local setup working. With
+    `AEGIS_QUEUE__REDIS_URL` set this returns 202 and an id instead, and the work happens in
+    a worker that can report progress and be cancelled.
+    """
+    if queue_enabled():
+        store, stream = get_job_queue()
+        return submit(
+            payload=payload,
+            kind=JobKind.ASSEMBLE,
+            force=force,
+            store=store,
+            stream=stream,
+            settings=get_settings(),
+            response=response,
+        )
+
     workspace = resolve_workspace(payload.workspace)
     sarif_path = Path(payload.sarif_path) if payload.sarif_path else None
     if sarif_path is not None and not sarif_path.exists():
@@ -260,6 +316,11 @@ def list_bundles(settings: Settings = Depends(get_settings)) -> dict:
     bundles = []
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
+            continue
+        if entry.name.startswith("."):
+            # A staging directory is a bundle being written, not a bundle. Listing it would
+            # offer a half-finished tree as a finished one; the worker renames it into place
+            # only once it is complete.
             continue
         manifest = entry / "manifest.json"
         summary = {"bundle_id": entry.name, "path": str(entry)}

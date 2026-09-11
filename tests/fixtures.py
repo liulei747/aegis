@@ -73,12 +73,27 @@ def safe_escape(value):
 '''
 
 
+FILES: dict[str, str] = {
+    "handler.py": HANDLER,
+    "service.py": SERVICE,
+    "repo.py": REPO,
+    "util.py": UTIL,
+}
+
+
 def write_fixture(root: Path) -> Path:
+    """Materialise the fixture repo, touching only the files that differ.
+
+    Idempotent on purpose: `demo/repo` is checked into the repository (compose mounts
+    it by default), so `scripts/demo.py` re-running over it must not rewrite
+    identical files -- that churns mtimes and makes `git status` noisy for no reason.
+    """
     root.mkdir(parents=True, exist_ok=True)
-    (root / "handler.py").write_text(HANDLER, encoding="utf-8")
-    (root / "service.py").write_text(SERVICE, encoding="utf-8")
-    (root / "repo.py").write_text(REPO, encoding="utf-8")
-    (root / "util.py").write_text(UTIL, encoding="utf-8")
+    for name, text in FILES.items():
+        target = root / name
+        if target.exists() and target.read_text(encoding="utf-8") == text:
+            continue
+        target.write_text(text, encoding="utf-8")
     return root
 
 

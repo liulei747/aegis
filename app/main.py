@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from aegis_core.config import get_settings
 from aegis_core.logging import get_logger, setup_logging
 from app import __version__
+from app.api.jobs import router as jobs_router
 from app.api.routes import router
 
 log = get_logger(__name__)
@@ -47,6 +48,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(router)
+    # Job routes are separate because they are a different contract: these answer 202 and
+    # hand back an id, while everything in `router` is a synchronous request/response.
+    app.include_router(jobs_router)
     return app
 
 

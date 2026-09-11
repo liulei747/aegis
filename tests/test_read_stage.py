@@ -14,11 +14,11 @@ from pathlib import Path
 import pytest
 
 from aegis_core.config import BudgetConfig, Settings
-from app.assembler.reader import MethodReader
-from app.graph.builder import CallGraphBuilder
-from app.graph.providers import CallGraphResolver
-from app.graph.resolver import SymbolIndex, Workspace
-from app.lsp.manager import LanguageServerManager, LanguageServerSpec
+from services.extraction.assembler.reader import MethodReader
+from services.extraction.graph.builder import CallGraphBuilder
+from services.extraction.graph.providers import CallGraphResolver
+from services.extraction.graph.resolver import SymbolIndex, Workspace
+from services.extraction.lsp.manager import LanguageServerManager, LanguageServerSpec
 
 ROOT = Path(__file__).resolve().parents[1]
 

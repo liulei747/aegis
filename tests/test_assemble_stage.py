@@ -12,8 +12,8 @@ import json
 from pathlib import Path
 
 from aegis_core.config import BudgetConfig, Settings
-from app.assembler.render import BundleRenderer
-from app.pipeline.assemble import AssemblyPipeline, PipelineRequest
+from services.extraction.assembler.render import BundleRenderer
+from services.extraction.pipeline.assemble import AssemblyPipeline, PipelineRequest
 from tests.fixtures import write_sarif
 
 IDENTICAL = "def validate(value):\n    return value.strip()[:100]\n"
