@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aegis 前端原型 · pipeline flow</title>
+<style>
+  :root{
+    --bg:#0b0e13; --panel:#12161d; --panel2:#181d26; --line:#242b36; --fg:#e6eaf2;
+    --muted:#7d879b; --accent:#6ea8fe; --fact:#7ee787; --strong:#79c0ff; --weak:#ffd866;
+    --guess:#ffa657; --bad:#ff7b72; --warn:#e3b341; --ok:#7ee787;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:13.5px/1.6 ui-sans-serif,system-ui,"Segoe UI","Microsoft YaHei",sans-serif}
+  .mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  header{display:flex;align-items:center;gap:14px;padding:12px 20px;
+    border-bottom:1px solid var(--line);flex-wrap:wrap;position:sticky;top:0;
+    background:var(--bg);z-index:9}
+  h1{font-size:15px;margin:0;font-weight:600}
+  .proto-tag{font-size:11px;color:var(--warn);border:1px solid #4a3a1c;
+    background:#241f12;border-radius:999px;padding:1px 9px}
+  .tabs{display:flex;gap:6px;margin-left:auto}
+  .tabs button{background:var(--panel2);color:var(--muted);border:1px solid var(--line);
+    border-radius:7px;padding:5px 12px;cursor:pointer;font-size:12.5px}
+  .tabs button.on{color:var(--accent);border-color:var(--accent);background:#16202e}
+  main{padding:18px 20px;max-width:1180px;margin:0 auto}
+  section{display:none}
+  section.on{display:block}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;
+    border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .pill.fact{color:var(--fact);border-color:#1f4030;background:#0f1a13}
+  .pill.strong{color:var(--strong);border-color:#1d3a55;background:#101a26}
+  .pill.weak{color:var(--weak);border-color:#4a4022;background:#1b1810}
+  .pill.guess{color:var(--guess);border-color:#4a3520;background:#1c1610}
+  .pill.bad{color:var(--bad);border-color:#4a2626;background:#1d1213}
+  .pill.warn{color:var(--warn);border-color:#4a3a1c;background:#1c1810}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:13px 16px;margin-bottom:11px}
+  .card h3{margin:0 0 7px;font-size:13.5px;font-weight:600}
+  .card .meta{color:var(--muted);font-size:12px}
+  .card.clickable{cursor:pointer;transition:border-color .12s}
+  .card.clickable:hover{border-color:var(--accent)}
+  .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+  .kpi{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+    padding:7px 13px}
+  .kpi b{display:block;font-size:16px;font-weight:600}
+  .kpi span{color:var(--muted);font-size:11px}
+  .sec-title{font-size:12px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.8px;margin:22px 0 9px;padding-bottom:5px;border-bottom:1px solid var(--line)}
+  .funnel-row{display:grid;grid-template-columns:250px 1fr 60px 78px;gap:10px;
+    align-items:center;margin:5px 0;font-size:12.5px}
+  .bar{background:var(--panel2);border-radius:3px;height:17px;position:relative;overflow:hidden}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,#2b5fb0,#6ea8fe)}
+  .bar.loss i{background:linear-gradient(90deg,#7a3b36,#ff7b72)}
+  .bar > span{position:absolute;right:7px;top:0;font-size:11px;color:#cfd6e4}
+  .stage-row{display:grid;grid-template-columns:250px 1fr 80px 62px;gap:10px;
+    align-items:center;margin:5px 0;font-size:12.5px}
+  /* 调用链树 */
+  .chain{margin:6px 0 6px 2px}
+  .node{display:grid;grid-template-columns:1fr 300px;gap:14px;
+    padding:9px 0;border-bottom:1px dashed var(--line)}
+  .node:last-child{border-bottom:none}
+  .node .head{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+  .arrow{font-size:15px;width:14px;display:inline-block}
+  .arrow.up{color:var(--strong)} .arrow.down{color:var(--guess)} .arrow.focus{color:var(--fact)}
+  .mname{font-size:13.5px;font-weight:600;color:#dfe6f2}
+  .mname.focus{color:var(--accent)}
+  .loc{color:var(--muted);font-size:12px}
+  .trace{color:var(--muted);font-size:11.5px;padding-left:23px;margin-top:2px}
+  .evidence{background:var(--panel2);border:1px solid var(--line);border-radius:7px;
+    padding:7px 10px;font-size:11.5px}
+  .evidence .snip{color:#cfd6e4;margin-top:4px;word-break:break-all}
+  .truncated{border-color:#4a3a1c !important;background:#1c1810}
+  .cut{color:var(--warn);font-size:11px;margin-top:4px}
+  pre.code{background:#0d1116;border:1px solid var(--line);border-radius:8px;
+    padding:11px 13px;overflow:auto;font-size:12.5px;margin:8px 0 0;line-height:1.5}
+  pre.code .hit{background:#3a2419;border-left:3px solid var(--warn);
+    display:block;margin:0 -13px;padding:0 10px}
+  details.body{border:1px solid var(--line);border-radius:8px;margin:7px 0;
+    background:var(--panel)}
+  details.body > summary{cursor:pointer;padding:9px 13px;font-size:12.5px;
+    display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  details.body[open] > summary{border-bottom:1px solid var(--line)}
+  details.body .inner{padding:0 13px 11px}
+  .flowbox{display:flex;gap:0;flex-wrap:wrap;align-items:stretch;margin:10px 0}
+  .step{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    padding:9px 12px;min-width:132px;flex:1}
+  .step .t{font-size:12px;color:var(--accent);margin-bottom:3px}
+  .step .n{font-size:16px;font-weight:600}
+  .step .s{font-size:11px;color:var(--muted)}
+  .arrowx{align-self:center;color:var(--muted);padding:0 7px;font-size:15px}
+  .note{border:1px solid #4a3a1c;background:#1c1810;border-radius:8px;
+    padding:9px 13px;margin:11px 0;font-size:12.5px}
+  .note.ok{border-color:#1f4030;background:#0f1a13}
+  .cmp{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th,td{text-align:left;padding:5px 9px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500}
+  .float{position:fixed;right:16px;bottom:16px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;padding:7px 11px;font-size:11.5px;
+    color:var(--muted);max-width:300px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Aegis · pipeline observability</h1>
+  <span class="proto-tag">静态原型 · 数据为真实一次运行</span>
+  <div class="tabs">
+    <button data-tab="list" class="on">① 包列表</button>
+    <button data-tab="funnel">② 漏斗 + 台账</button>
+    <button data-tab="context">③ 上下文详情</button>
+    <button data-tab="diff">④ 对比</button>
+  </div>
+</header>
+<main>
+
+<!-- ══════════════ ① 包列表 ══════════════ -->
+<section id="list" class="on">
+  <div class="kpis">
+    <div class="kpi"><b>3</b><span>包总数</span></div>
+    <div class="kpi"><b>1</b><span>本周运行</span></div>
+    <div class="kpi"><b>opengrep 1.16.0</b><span>扫描器</span></div>
+    <div class="kpi"><b>pyright</b><span>语言服务器</span></div>
+  </div>
+
+  <div class="sec-title">筛选</div>
+  <div style="margin-bottom:12px">
+    <span class="pill fact">全部 3</span>
+    <span class="pill">有降级 0</span>
+    <span class="pill guess">被裁剪 2</span>
+    <span class="pill bad">可疑扫描 1</span>
+    <span class="pill">按时间 ▾</span>
+  </div>
+
+  <div class="card clickable" data-goto="context">
+    <h3 class="mono">B-c7f830954f</h3>
+    <div class="meta">2026-09-11 08:24 · 1 上下文 · 4 方法 · 1/1 命中 · ~1779 tokens · 740 ms</div>
+    <div style="margin-top:6px">
+      <span class="pill fact">fact ×4</span>
+      <span class="pill fact">lsp_call_hierarchy</span>
+      <span class="pill">裁剪 1</span>
+    </div>
+  </div>
+
+  <div class="card clickable">
+    <h3 class="mono">B-console-demo</h3>
+    <div class="meta">2026-09-11 03:47 · 1 上下文 · 4 方法 · 1/1 命中 · ~1865 tokens · 1103 ms</div>
+    <div style="margin-top:6px">
+      <span class="pill fact">fact ×4</span>
+      <span class="pill fact">lsp_call_hierarchy</span>
+    </div>
+  </div>
+
+  <div class="card clickable" style="border-color:#4a2626">
+    <h3 class="mono">B-failed-scan</h3>
+    <div class="meta">2026-09-11 03:40 · 0 上下文 · 0 方法 · 0/0 命中 · ~990 tokens · 32 ms</div>
+    <div style="margin-top:6px">
+      <span class="pill guess">guess ×0</span>
+      <span class="pill bad">扫描器失败 · rc=2</span>
+    </div>
+  </div>
+
+  <div class="note ok">
+    <b>这个列表回答的问题：</b>哪个包值得看？绿色 <span class="pill fact">fact</span> 表示
+    调用链来自语言服务器的真实解析；橙色 <span class="pill guess">guess</span> 表示全是启发式猜测。
+    红色徽章表示这次扫描本身就没成功——零命中不是"代码干净"。
+  </div>
+</section>
+
+<!-- ══════════════ ② 漏斗 + 台账 ══════════════ -->
+<section id="funnel">
+  <div class="sec-title">阶段流转（真实记录，每步与上一步同单位）</div>
+
+  <div class="funnel-row"><span>扫描器命中</span>
+    <div class="bar"><i style="width:25%"></i><span>1</span></div><span class="mono">—</span><span class="mono">1 ms</span></div>
+  <div class="funnel-row"><span>定位到所属方法</span>
+    <div class="bar"><i style="width:25%"></i><span>1</span></div><span class="mono">100%</span><span class="mono">306 ms</span></div>
+  <div class="funnel-row"><span>承载命中的不同方法</span>
+    <div class="bar"><i style="width:25%"></i><span>1</span></div><span class="mono">100%</span><span class="mono">—</span></div>
+  <div class="funnel-row"><span>构建的上下文</span>
+    <div class="bar"><i style="width:25%"></i><span>1</span></div><span class="mono">100%</span><span class="mono">—</span></div>
+  <div class="funnel-row"><span>展开的调用链切片</span>
+    <div class="bar"><i style="width:25%"></i><span>1</span></div><span class="mono">100%</span><span class="mono">429 ms</span></div>
+  <div class="funnel-row"><span>走图提出的方法（毛）</span>
+    <div class="bar"><i style="width:100%"></i><span>4</span></div><span class="mono">—</span><span class="mono">—</span></div>
+  <div class="funnel-row"><span>保留在包里的方法（净）</span>
+    <div class="bar"><i style="width:100%"></i><span>4</span></div><span class="mono">100%</span><span class="mono">—</span></div>
+  <div class="funnel-row"><span>读取到的方法正文</span>
+    <div class="bar"><i style="width:100%"></i><span>4</span></div><span class="mono">100%</span><span class="mono">2 ms</span></div>
+  <div class="funnel-row"><span>真正内联进上下文的</span>
+    <div class="bar"><i style="width:100%"></i><span>4</span></div><span class="mono">100%</span><span class="mono">—</span></div>
+
+  <div class="note">
+    <b>丢失为 0，但尽头有剪枝：</b>
+    <span class="pill warn">max_depth</span>
+    调用链在深度 2 停止（上限 2）· <span class="mono">handler.py:9</span>
+    <div class="meta" style="margin-top:5px">
+      也就是说：这 4 个方法是完整链条，但 handler_request 之上还有没有调用者，这次没有继续走。
+    </div>
+  </div>
+
+  <div class="sec-title">阶段耗时占比</div>
+  <div class="stage-row"><span>expand · 调用图展开</span>
+    <div class="bar"><i style="width:58.1%"></i><span>429 ms</span></div><span class="mono">58.1%</span><span></span></div>
+  <div class="stage-row"><span>locate · 定位方法</span>
+    <div class="bar"><i style="width:41.4%"></i><span>306 ms</span></div><span class="mono">41.4%</span><span></span></div>
+  <div class="stage-row"><span>read · 读取正文</span>
+    <div class="bar"><i style="width:1%"></i><span>2 ms</span></div><span class="mono">0.3%</span><span></span></div>
+  <div class="stage-row"><span>scan · 静态扫描</span>
+    <div class="bar"><i style="width:1%"></i><span>1 ms</span></div><span class="mono">0.1%</span><span></span></div>
+
+  <div class="sec-title">扫描器台账（回答"为什么是这些命中"）</div>
+  <div class="card">
+    <table>
+      <tr><th>引擎</th><td class="mono">sarif-input（用了现成 SARIF）</td></tr>
+      <tr><th>返回码</th><td class="mono">0</td></tr>
+      <tr><th>规则</th><td>explicit 显式指定</td></tr>
+      <tr><th>失败模式</th><td class="mono">null（扫描正常）</td></tr>
+      <tr><th>零命中可疑</th><td class="mono">false</td></tr>
+      <tr><th>规则命中</th><td><span class="pill">python.lang.security.sql-injection ×1</span></td></tr>
+      <tr><th>严重度</th><td><span class="pill bad">error ×1</span></td></tr>
+      <tr><th>热点文件</th><td class="mono">repo.py ×1</td></tr>
+    </table>
+  </div>
+
+  <div class="sec-title">降级（缺失的能力）</div>
+  <div class="note ok">无降级：所有能力都可用。</div>
+</section>
+
+<!-- ══════════════ ③ 上下文详情（核心屏） ══════════════ -->
+<section id="context">
+  <div style="display:flex;align-items:baseline;gap:11px;flex-wrap:wrap">
+    <h2 class="mono" style="margin:0;font-size:15px">C-7c970898538a</h2>
+    <span class="pill">focus query_user</span>
+    <span class="pill fact">lsp_document_symbol</span>
+    <span class="pill bad">severity error</span>
+    <span class="pill">repo.py:4-11</span>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><b>4</b><span>方法</span></div>
+    <div class="kpi"><b>3</b><span>调用边</span></div>
+    <div class="kpi"><b>~119</b><span>tokens</span></div>
+    <div class="kpi"><b>否</b><span>被截断</span></div>
+  </div>
+
+  <div class="sec-title">静态扫描命中</div>
+  <div class="card" style="border-color:#4a2626">
+    <div style="display:flex;gap:11px;align-items:baseline;flex-wrap:wrap">
+      <span class="mono muted">F-8385d9903e16</span>
+      <span class="mono">python.lang.security.sql-injection</span>
+      <span class="pill bad">error</span>
+      <span class="mono loc">repo.py:5</span>
+    </div>
+    <div class="meta" style="margin-top:5px">User input concatenated into a SQL statement</div>
+    <div class="evidence" style="margin-top:7px">
+      <span class="snip mono">sql = "SELECT * FROM users WHERE id = '" + user_id + "'"</span>
+    </div>
+  </div>
+
+  <div class="sec-title">调用链 — 每个方法为什么在这里</div>
+  <div class="chain">
+
+    <div class="node">
+      <div>
+        <div class="head">
+          <span class="arrow focus">◆</span>
+          <span class="mname focus">query_user</span>
+          <span class="loc mono">repo.py:4-11</span>
+          <span class="pill fact">fact</span>
+          <span class="pill">FOCUS 命中所在</span>
+        </div>
+        <div class="trace">来源：静态扫描命中的位置</div>
+      </div>
+      <div class="evidence">
+        由 documentSymbol 定位
+        <div class="snip mono">范围 repo.py:4-11（LSP 给的区间）</div>
+      </div>
+    </div>
+
+    <div class="node">
+      <div>
+        <div class="head">
+          <span class="arrow down">↓</span>
+          <span class="mname">connect</span>
+          <span class="loc mono">repo.py:11-15</span>
+          <span class="pill fact">fact</span>
+          <span class="pill">d1 被调用</span>
+        </div>
+        <div class="trace mono">来源：query_user → connect</div>
+      </div>
+      <div class="evidence">
+        <span class="pill fact">lsp_call_hierarchy</span> conf 1.00
+        <div class="snip mono">cursor = connect()</div>
+      </div>
+    </div>
+
+    <div class="node">
+      <div>
+        <div class="head">
+          <span class="arrow up">↑</span>
+          <span class="mname">load_user</span>
+          <span class="loc mono">service.py:6-10</span>
+          <span class="pill fact">fact</span>
+          <span class="pill">d1 调用者</span>
+        </div>
+        <div class="trace mono">来源：query_user → load_user</div>
+      </div>
+      <div class="evidence">
+        <span class="pill fact">lsp_call_hierarchy</span> conf 1.00
+        <div class="snip mono">return query_user(user_id)</div>
+      </div>
+    </div>
+
+    <div class="node">
+      <div>
+        <div class="head">
+          <span class="arrow up">↑</span>
+          <span class="mname">handle_request</span>
+          <span class="loc mono">handler.py:9-15</span>
+          <span class="pill fact">fact</span>
+          <span class="pill">d2 调用者</span>
+        </div>
+        <div class="trace mono">来源：query_user → load_user → handle_request</div>
+      </div>
+      <div class="evidence truncated">
+        <span class="pill fact">lsp_call_hierarchy</span> conf 1.00
+        <div class="snip mono">return load_user(name)</div>
+        <div class="cut">⚠ 调用链到此被 <b>max_depth=2</b> 截断：更上层调用者未继续查找</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="sec-title">方法正文 <span style="text-transform:none;letter-spacing:0">（去重后每个方法一份）</span></div>
+
+  <details class="body" open>
+    <summary>
+      <span class="mono">M-568641cc8bfb</span>
+      <b>query_user</b>
+      <span class="loc mono">repo.py:4-11</span>
+      <span class="pill">15 行</span>
+      <span class="pill">★ FOCUS</span>
+    </summary>
+    <div class="inner">
+      <pre class="code"><span>def query_user(user_id):</span>
+<span>    cursor = connect()</span>
+<span class="hit">    sql = "SELECT * FROM users WHERE id = '" + user_id + "'"</span>
+<span>    cursor.execute(sql)</span>
+<span>    return cursor</span></pre>
+      <div class="meta" style="margin-top:6px">高亮行 = 静态扫描命中位置（repo.py:5）</div>
+    </div>
+  </details>
+
+  <details class="body">
+    <summary>
+      <span class="mono">M-61de505c2db2</span> <b>connect</b>
+      <span class="loc mono">repo.py:11-15</span> <span class="pill">5 行</span>
+    </summary>
+    <div class="inner">
+      <pre class="code">def connect():
+    import sqlite3
+
+    return sqlite3.connect("app.db")</pre>
+    </div>
+  </details>
+
+  <details class="body">
+    <summary>
+      <span class="mono">M-d7bc9ab449d6</span> <b>load_user</b>
+      <span class="loc mono">service.py:6-10</span> <span class="pill">5 行</span>
+    </summary>
+    <div class="inner">
+      <pre class="code">def load_user(user_id):
+    return query_user(user_id)</pre>
+    </div>
+  </details>
+
+  <details class="body">
+    <summary>
+      <span class="mono">M-37ded04827c0</span> <b>handle_request</b>
+      <span class="loc mono">handler.py:9-15</span> <span class="pill">7 行</span>
+    </summary>
+    <div class="inner">
+      <pre class="code">def handle_request(request):
+    user_id = request.args.get("id")
+    name = safe_escape(user_id)
+    return load_user(name)</pre>
+    </div>
+  </details>
+
+  <div class="sec-title">本单元覆盖限制</div>
+  <div class="note">
+    <table>
+      <tr><th style="width:170px">规则</th><th>说明</th><th>位置</th></tr>
+      <tr>
+        <td><span class="pill warn">max_depth</span></td>
+        <td>调用链在深度 2 停止（上限 2）</td>
+        <td class="mono loc">handler.py:9</td>
+      </tr>
+    </table>
+  </div>
+</section>
+
+<!-- ══════════════ ④ 对比 ══════════════ -->
+<section id="diff">
+  <div class="sec-title">对比 <span class="mono">B-loose</span> ⟷ <span class="mono">B-tight</span></div>
+  <div class="cmp">
+    <div class="card">
+      <h3>指标差值（右 − 左）</h3>
+      <table>
+        <tr><th>指标</th><th style="text-align:right">差值</th></tr>
+        <tr><td>上下文</td><td class="mono" style="text-align:right;color:var(--muted)">0</td></tr>
+        <tr><td>方法</td><td class="mono" style="text-align:right;color:var(--bad)">−1</td></tr>
+        <tr><td>命中</td><td class="mono" style="text-align:right;color:var(--muted)">0</td></tr>
+        <tr><td>调用边</td><td class="mono" style="text-align:right;color:var(--bad)">−1</td></tr>
+        <tr><td>裁剪记录</td><td class="mono" style="text-align:right;color:var(--ok)">+1</td></tr>
+        <tr><td>tokens</td><td class="mono" style="text-align:right;color:var(--bad)">−420</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>只在一侧出现</h3>
+      <table>
+        <tr><th>项目</th><th style="text-align:right">数量</th></tr>
+        <tr><td>只在左侧的方法</td><td class="mono" style="text-align:right">1（handle_request）</td></tr>
+        <tr><td>只在右侧的方法</td><td class="mono" style="text-align:right">0</td></tr>
+        <tr><td>共有方法</td><td class="mono" style="text-align:right">2</td></tr>
+        <tr><td>只在右侧的命中</td><td class="mono" style="text-align:right">0</td></tr>
+      </table>
+      <div class="meta" style="margin-top:8px">
+        右跑用了 max_depth=1：少了一个方法，但多了一条"为什么少"的记录。
+      </div>
+    </div>
+  </div>
+  <div class="note">
+    <b>这一屏回答的问题：</b>改了预算/规则之后，结果到底变了什么？是变少了，还是只是变不同了？
+  </div>
+</section>
+
+</main>
+<div class="float">
+  静态原型：数据取自一次真实运行（B-c7f830954f，opengrep + pyright）。
+  没有后端，点击只在本地切屏。
+</div>
+<script>
+  const tabs = document.querySelectorAll(".tabs button");
+  const show = (name) => {
+    document.querySelectorAll("section").forEach(s => s.classList.toggle("on", s.id === name));
+    tabs.forEach(b => b.classList.toggle("on", b.dataset.tab === name));
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  tabs.forEach(b => b.addEventListener("click", () => show(b.dataset.tab)));
+  document.querySelectorAll("[data-goto]").forEach(c =>
+    c.addEventListener("click", () => show(c.dataset.goto)));
+</script>
+</body>
+</html>

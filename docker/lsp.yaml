@@ -1,0 +1,53 @@
+# Default language-server catalog shipped in the container.
+#
+# Each entry is tried lazily, per language, only when a file of that type is
+# actually analysed. Servers that are not installed are reported as a
+# degradation in the bundle manifest (never as a hard failure).
+#
+# `{root}` is replaced with the workspace root at load time.
+servers:
+  - language: python
+    command: ['pyright-langserver', '--stdio']
+    extensions: ['.py', '.pyi']
+    init_options:
+      python:
+        analysis:
+          autoSearchPaths: true
+          useLibraryCodeForTypes: true
+          diagnosticMode: openFilesOnly
+
+  # Lightweight alternative if pyright is unavailable.
+  - language: python
+    command: ['jedi-language-server']
+    extensions: ['.py', '.pyi']
+
+  - language: typescript
+    command: ['typescript-language-server', '--stdio']
+    extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']
+    # typescript-language-server needs to resolve a `typescript` installation.
+    # Image builds install TypeScript globally, so point tsserver at it; a project
+    # that vendors its own TypeScript will override this via its own config.
+    init_options:
+      typescript:
+        tsdk: /usr/lib/node_modules/typescript/lib
+    settings:
+      typescript:
+        tsdk: /usr/lib/node_modules/typescript/lib
+
+  - language: go
+    command: ['gopls']
+    extensions: ['.go']
+
+  - language: c
+    command: ['clangd', '--log=error', '--background-index']
+    extensions: ['.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh']
+
+  - language: rust
+    command: ['rust-analyzer']
+    extensions: ['.rs']
+    enabled: false
+
+  - language: java
+    command: ['jdtls']
+    extensions: ['.java']
+    enabled: false

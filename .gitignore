@@ -1,0 +1,25 @@
+# --- python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- local runtime state -------------------------------------------------
+var/
+workspace/
+demo/
+.env
+docker/lsp.local.yaml
+
+# --- editor / os ---------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

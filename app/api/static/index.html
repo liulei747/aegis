@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aegis · pipeline observability</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b2129; --fg:#e7eaf0; --muted:#8b93a7;
+    --line:#252c37; --accent:#6ea8fe; --fact:#7ee787; --strong:#79c0ff; --weak:#ffd866;
+    --guess:#ffa657; --bad:#ff7b72; --warn:#e3b341;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:13.5px/1.55 ui-sans-serif,system-ui,"Segoe UI",sans-serif}
+  a{color:var(--accent);text-decoration:none}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+    padding:14px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;
+    background:linear-gradient(var(--bg),var(--bg) 70%,transparent);z-index:5}
+  h1{font-size:16px;margin:0;letter-spacing:.2px}
+  main{display:grid;grid-template-columns:290px 1fr;min-height:calc(100vh - 56px)}
+  aside{border-right:1px solid var(--line);overflow:auto;max-height:calc(100vh - 56px)}
+  #detail{padding:18px 22px;overflow:auto;max-height:calc(100vh - 56px)}
+  .item{padding:10px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+  .item:hover{background:var(--panel)}
+  .item.active{background:var(--panel2);border-left:3px solid var(--accent)}
+  .item .id{font-family:ui-monospace,monospace;font-size:12px;color:var(--accent)}
+  .item .meta{color:var(--muted);font-size:11.5px}
+  .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
+    border:1px solid var(--line);color:var(--muted);margin-right:4px;white-space:nowrap}
+  .pill.fact{color:var(--fact);border-color:#1f4030}
+  .pill.strong{color:var(--strong);border-color:#1d3a55}
+  .pill.weak{color:var(--weak);border-color:#4a4022}
+  .pill.guess{color:var(--guess);border-color:#4a3520}
+  .pill.bad{color:var(--bad);border-color:#4a2626}
+  .pill.ok{color:var(--fact);border-color:#1f4030}
+  h2{font-size:14px;margin:24px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+  h2:first-child{margin-top:0}
+  h3{font-size:12px;color:var(--muted);margin:16px 0 6px;text-transform:uppercase;letter-spacing:.7px}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;margin:6px 0 4px}
+  th,td{text-align:left;padding:5px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:500}
+  .bar{position:relative;background:var(--panel2);border-radius:3px;height:16px;min-width:60px}
+  .bar > i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+  .bar > span{position:absolute;right:6px;top:0;font-size:11px;color:var(--fg)}
+  .step-row td:first-child{width:38%}
+  .chain{border-left:2px solid var(--line);margin:8px 0 8px 6px;padding-left:12px}
+  .chain .node{padding:5px 0}
+  .chain .node .lbl{font-family:ui-monospace,monospace}
+  .lost{color:var(--bad)}
+  .ok{color:var(--fact)}
+  .muted{color:var(--muted)}
+  details{margin:8px 0}
+  summary{cursor:pointer;color:var(--muted);font-size:12px}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    padding:10px 12px;overflow:auto;max-height:420px;font-size:12px}
+  .warnbox{border:1px solid #4a3a1c;background:#241f12;border-radius:6px;padding:10px 12px;margin:10px 0}
+  .warnbox li{margin:3px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .tabs{display:flex;gap:6px;margin:10px 0 2px;flex-wrap:wrap}
+  .tabs button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px}
+  .tabs button.on{border-color:var(--accent);color:var(--accent)}
+  .empty{color:var(--muted);padding:30px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Aegis <span class="muted">pipeline observability</span></h1>
+  <span class="muted mono" id="health">…</span>
+  <span style="flex:1"></span>
+  <label class="muted" style="font-size:12px">compare with
+    <select id="cmp" style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 6px">
+      <option value="">—</option>
+    </select>
+  </label>
+</header>
+<main>
+  <aside id="list"><div class="empty">loading…</div></aside>
+  <section id="detail"><div class="empty">Select a bundle.</div></section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;" }[c]));
+const api = async (p) => {
+  const r = await fetch(p);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+};
+const pct = (v) => (v == null ? "—" : (v * 100).toFixed(v >= 1 ? 0 : 1) + "%");
+const trustPill = (t) => `<span class="pill ${esc(t)}">${esc(t)}</span>`;
+let current = null, bundles = [];
+
+async function loadHealth() {
+  try {
+    const h = await api("/health");
+    $("health").textContent = `v${h.version} · ${h.opengrep} · lsp ${h.lsp_enabled ? "on" : "off"}`;
+  } catch { $("health").textContent = "health unavailable"; }
+}
+
+async function loadList() {
+  const { bundles: list } = await api("/v1/bundles");
+  bundles = list;
+  const el = $("list");
+  if (!list.length) { el.innerHTML = '<div class="empty">No bundles. POST /v1/assemble first.</div>'; return; }
+  el.innerHTML = list.map(b => `
+    <div class="item" data-id="${esc(b.bundle_id)}">
+      <div class="id">${esc(b.bundle_id)}</div>
+      <div class="meta">${esc((b.created_at || "").slice(0,19).replace("T"," "))}</div>
+      <div class="meta">
+        ${b.focus_count ?? "?"} contexts · ${(b.coverage && b.coverage.bundled) ?? "?"}/${(b.coverage && b.coverage.discoverable) ?? "?"} findings
+      </div>
+      <div style="margin-top:4px">
+        ${(b.providers || []).map(p => `<span class="pill ${p === "syntax_regex" ? "guess" : "fact"}">${esc(p)}</span>`).join("")}
+        ${b.zero_findings_suspicious ? '<span class="pill bad">suspicious scan</span>' : ""}
+        ${b.prune_count ? `<span class="pill">${b.prune_count} prunes</span>` : ""}
+      </div>
+    </div>`).join("");
+  el.querySelectorAll(".item").forEach(n => n.addEventListener("click", () => open(n.dataset.id)));
+
+  const sel = $("cmp");
+  sel.innerHTML = '<option value="">—</option>' +
+    list.map(b => `<option value="${esc(b.bundle_id)}">${esc(b.bundle_id)}</option>`).join("");
+  sel.onchange = () => { if (current && sel.value) showDiff(current, sel.value); };
+}
+
+function bar(share, text) {
+  return `<div class="bar"><i style="width:${Math.max(2, share*100).toFixed(1)}%"></i><span>${esc(text)}</span></div>`;
+}
+
+async function open(id) {
+  current = id;
+  $("cmp").value = "";
+  document.querySelectorAll(".item").forEach(n => n.classList.toggle("active", n.dataset.id === id));
+  const d = $("detail");
+  d.innerHTML = '<div class="empty">loading…</div>';
+  const [obs, ctx] = await Promise.all([
+    api(`/v1/bundles/${id}/observability`),
+    api(`/v1/bundles/${id}/contexts`),
+  ]);
+  const o = obs.overview;
+
+  const flags = o.warning_flags.length
+    ? `<div class="warnbox"><b>Read this before trusting the bundle</b><ul>${o.warning_flags.map(f => `<li>${esc(f)}</li>`).join("")}</ul></div>`
+    : `<div class="warnbox" style="border-color:#1f4030;background:#111c15"><span class="ok">No warnings:</span> the scanner produced findings, every finding reached a method, and nothing was truncated.</div>`;
+
+  const funnelRows = obs.funnel.map(s => `
+    <tr class="step-row">
+      <td>${esc(s.label)}${s.note ? `<div class="muted" style="font-size:11.5px">${esc(s.note)}</div>` : ""}</td>
+      <td style="width:120px">${bar(s.of_previous == null ? 1 : Math.min(1, s.of_previous), s.count)}</td>
+      <td class="mono" style="width:70px;text-align:right">${s.count}</td>
+      <td class="mono" style="width:70px;text-align:right">${pct(s.of_previous)}</td>
+      <td style="width:190px">${s.lost ? `<span class="lost">−${s.lost}</span> <span class="muted mono">${esc(s.loss_reasons.join(", "))}</span>` : '<span class="ok">no loss</span>'}</td>
+    </tr>
+    ${s.lost && s.lost_items.length ? `<tr><td colspan="5"><details><summary>${s.lost_items.length} pruned item(s)</summary><table><tbody>${
+      s.lost_items.map(i => `<tr><td class="mono">${esc(i.rule)}</td><td>${esc(i.detail)}</td><td class="mono muted">${esc(i.method_id || "")} ${esc(i.location || "")}</td></tr>`).join("")
+    }</tbody></table></details></td></tr>` : ""}`).join("");
+
+  const timelineRows = obs.timeline.map(t => `
+    <tr><td>${esc(t.label)}</td><td style="width:190px">${bar(t.share, t.ms + " ms")}</td>
+    <td class="mono" style="width:60px;text-align:right">${pct(t.share)}</td></tr>`).join("");
+
+  const providerRows = obs.providers.map(p => `
+    <tr>
+      <td class="mono">${esc(p.provider)}</td>
+      <td>${trustPill(p.trust)}</td>
+      <td class="mono" style="text-align:right">${p.confidence.toFixed(2)}</td>
+      <td class="mono" style="text-align:right">${p.methods}</td>
+      <td class="mono" style="text-align:right">${p.edges}</td>
+      <td class="muted">${esc(p.note)}</td>
+    </tr>`).join("");
+
+  const scan = obs.scan ? `
+    <h2>Scanner invocation</h2>
+    ${obs.scan.failure_mode ? `<div class="warnbox"><b>The scan itself failed — zero findings is not a clean result</b><div class="mono" style="margin-top:4px">${esc(obs.scan.failure_mode)}</div></div>` : ""}
+    <table>
+      <tr><th>engine</th><td class="mono">${esc(obs.scan.engine)} ${esc(obs.scan.engine_version || "")}</td></tr>
+      <tr><th>exit code</th><td class="mono ${obs.scan.returncode === 0 || obs.scan.returncode === 1 ? "" : "lost"}">${esc(obs.scan.returncode)}${obs.scan.returncode === 1 ? " (findings present)" : ""}</td></tr>
+      <tr><th>rules</th><td>${obs.scan.configured ? '<span class="pill ok">explicit</span>' : '<span class="pill guess">unconfigured default</span>'}</td></tr>
+      ${obs.scan.command_line ? `<tr><th>command</th><td class="mono" style="word-break:break-all">${esc(obs.scan.command_line)}</td></tr>` : ""}
+      <tr><th>rule hits</th><td>${Object.entries(obs.scan.rule_counts).map(([r,n]) => `<span class="pill">${esc(r)} ×${n}</span>`).join("") || "—"}</td></tr>
+      <tr><th>severity</th><td>${Object.entries(obs.scan.severity_counts).map(([s,n]) => `<span class="pill">${esc(s)} ×${n}</span>`).join("") || "—"}</td></tr>
+      <tr><th>hot files</th><td class="mono">${obs.scan.top_paths.map(([p,n]) => `${esc(p)} ×${n}`).join(", ") || "—"}</td></tr>
+      ${obs.scan.stderr_tail ? `<tr><th>stderr tail</th><td class="mono" style="color:var(--warn)">${esc(obs.scan.stderr_tail)}</td></tr>` : ""}
+    </table>` : "";
+
+  const degr = obs.degradations.length ? `
+    <h2>Degradations (capabilities that were missing)</h2>
+    <table><thead><tr><th>capability</th><th>reason</th><th>impact</th></tr></thead><tbody>
+    ${obs.degradations.map(g => `<tr><td class="mono">${esc(g.capability)}</td><td>${esc(g.reason)}</td><td class="muted">${esc(g.impact)}</td></tr>`).join("")}
+    </tbody></table>` : "";
+
+  const ctxHtml = ctx.contexts.map(c => `
+    <h2>Context <span class="mono">${esc(c.context_id)}</span></h2>
+    <div style="margin-bottom:6px">
+      <span class="pill">focus ${esc(c.focus_name)}</span>
+      <span class="pill ${esc(c.focus_provider === "syntax_regex" ? "guess" : "fact")}">${esc(c.focus_provider)}</span>
+      <span class="pill">${esc(c.focus_location)}</span>
+      <span class="pill">severity ${esc(c.worst_severity)}</span>
+      <span class="pill">${c.methods.length} methods / ${c.edges.length} edges</span>
+      <span class="pill">~${c.estimated_tokens} tokens</span>
+      ${c.truncated ? '<span class="pill bad">truncated</span>' : ""}
+      <span class="pill">depths ${esc(JSON.stringify(c.depth_histogram))}</span>
+    </div>
+
+    <h3>Findings</h3>
+    <table><thead><tr><th>id</th><th>rule</th><th>severity</th><th>location</th><th>message</th></tr></thead><tbody>
+    ${c.findings.map(f => `<tr><td class="mono">${esc(f.finding_id)}</td><td class="mono">${esc(f.rule_id)}</td>
+      <td><span class="pill ${f.severity === "error" ? "bad" : "weak"}">${esc(f.severity)}</span></td>
+      <td class="mono">${esc(f.location)}</td><td>${esc(f.message)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">none</td></tr>'}
+    </tbody></table>
+
+    <h3>Call chain — why each method is here</h3>
+    <div class="chain">
+    ${c.methods.map(m => `
+      <div class="node">
+        <span class="mono">${m.depth === 0 ? "◆" : (m.direction === "caller" ? "↑" : "↓")} d${m.depth}</span>
+        <span class="mono" style="color:var(--accent)">${esc(m.qualified_name)}</span>
+        <span class="muted mono">${esc(m.location)}</span>
+        ${trustPill(m.trust)}
+        ${m.is_focus ? '<span class="pill ok">SINK</span>' : ""}
+        ${m.via ? `<div class="muted mono" style="padding-left:18px">via ${esc(m.via)}</div>` : ""}
+        <div class="muted mono" style="padding-left:18px;font-size:11.5px">
+          origin: ${m.origin_chain.length > 1 ? m.origin_chain.map(esc).join(" → ") : "(the sink itself)"}
+        </div>
+      </div>`).join("")}
+    </div>
+
+    <h3>Edges — the evidence</h3>
+    <table><thead><tr><th>caller</th><th>callee</th><th>provider</th><th>conf</th><th>call site</th><th>snippet</th></tr></thead><tbody>
+    ${c.edges.map(e => `<tr>
+      <td class="mono">${esc(e.caller_name)}</td><td class="mono">${esc(e.callee_name)}</td>
+      <td>${trustPill(e.trust)}</td><td class="mono">${e.confidence.toFixed(2)}</td>
+      <td class="mono muted">${esc(e.call_site || "—")}</td>
+      <td class="mono muted">${esc(e.snippet || "—")}</td></tr>`).join("") || '<tr><td colspan="6" class="muted">no edges</td></tr>'}
+    </tbody></table>
+
+    ${c.prunes && c.prunes.length ? `<h3>Coverage limits for this context</h3>
+      <table><tbody>${c.prunes.map(p => `<tr><td class="mono">${esc(p.rule)}</td><td>${esc(p.detail)}</td><td class="mono muted">${esc(p.location || "")}</td></tr>`).join("")}</tbody></table>` : ""}
+  `).join("");
+
+  d.innerHTML = `
+    ${flags}
+    <div style="margin:8px 0">
+      <span class="pill">run ${esc(o.run_id)}</span>
+      <span class="pill">${esc(o.created_at.slice(0,19).replace("T"," "))}</span>
+      <span class="pill">worst trust: ${esc(o.worst_trust)}</span>
+      <span class="pill">${o.duration_ms} ms total</span>
+      <span class="pill">${o.total_chars} chars</span>
+      <span class="pill">~${o.estimated_tokens} tokens</span>
+      <span class="pill">${o.prune_count} prunes / ${o.degradation_count} degradations</span>
+      <a href="/v1/bundles/${esc(id)}/archive"><button style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 9px;cursor:pointer">download .zip</button></a>
+      <a href="/v1/bundles/${esc(id)}/graph"><button style="background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:3px 9px;cursor:pointer">graph.dot</button></a>
+    </div>
+    <div class="muted mono" style="font-size:11.5px">${esc(o.workspace_root)}</div>
+
+    <h2>Funnel — what the pipeline did and what it dropped</h2>
+    <table><thead><tr><th>step</th><th>share of previous</th><th style="text-align:right">count</th><th style="text-align:right">of prev</th><th>loss</th></tr></thead>
+    <tbody>${funnelRows}</tbody></table>
+
+    <div class="grid2">
+      <div>
+        <h2>Stage timings</h2>
+        <table><tbody>${timelineRows}</tbody></table>
+      </div>
+      <div>
+        <h2>Providers — how each fact was obtained</h2>
+        <table><thead><tr><th>provider</th><th>trust</th><th style="text-align:right">conf</th><th style="text-align:right">methods</th><th style="text-align:right">edges</th><th>note</th></tr></thead>
+        <tbody>${providerRows}</tbody></table>
+      </div>
+    </div>
+
+    ${scan}
+    ${degr}
+    <div id="diffbox"></div>
+    ${ctxHtml}
+
+    <h2>Raw</h2>
+    <details><summary>manifest keys and stage counts</summary>
+      <pre>${esc(JSON.stringify({ counts: obs.counts, stage_ms: obs.timeline.map(t => [t.key, t.ms]) }, null, 2))}</pre>
+    </details>
+    <details><summary>all prunes (${obs.prunes.length})</summary>
+      <table><tbody>${obs.prunes.map(p => `<tr><td class="mono">${esc(p.rule)}</td><td>${esc(p.detail)}</td><td class="mono muted">${esc(p.path || "")}${p.line != null ? ":" + (p.line + 1) : ""}</td></tr>`).join("") || '<tr><td class="muted">none</td></tr>'}</tbody></table>
+    </details>
+  `;
+}
+
+async function showDiff(a, b) {
+  const box = $("diffbox");
+  if (!box) return;
+  try {
+    const d = await api(`/v1/bundles/${a}/diff/${b}`);
+    const rows = Object.entries(d.delta).map(([k, v]) =>
+      `<tr><td>${esc(k)}</td><td class="mono" style="text-align:right;color:${v === 0 ? "var(--muted)" : (v < 0 ? "var(--bad)" : "var(--ok)")}">${v > 0 ? "+" : ""}${v}</td></tr>`).join("");
+    box.innerHTML = `
+      <h2>Diff against <span class="mono">${esc(b)}</span></h2>
+      <div class="grid2">
+        <table><thead><tr><th>metric</th><th style="text-align:right">Δ (right − left)</th></tr></thead><tbody>${rows}</tbody></table>
+        <div>
+          <table><tbody>
+            <tr><th>methods only in ${esc(a)}</th><td class="mono">${d.methods.only_left.length}</td></tr>
+            <tr><th>methods only in ${esc(b)}</th><td class="mono">${d.methods.only_right.length}</td></tr>
+            <tr><th>shared methods</th><td class="mono">${d.methods.shared}</td></tr>
+            <tr><th>findings only in ${esc(b)}</th><td class="mono">${d.findings.only_right.length}</td></tr>
+          </tbody></table>
+          <details><summary>stage time delta</summary><pre>${esc(JSON.stringify(d.stage_delta_ms, null, 2))}</pre></details>
+        </div>
+      </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="warnbox">diff failed: ${esc(e.message)}</div>`;
+  }
+}
+
+loadHealth();
+loadList();
+</script>
+</body>
+</html>

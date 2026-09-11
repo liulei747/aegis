@@ -1,0 +1,38 @@
+services:
+  aegis:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: aegis:0.1.0
+    container_name: aegis
+    ports:
+      # Host port is configurable: 8000 is commonly taken on a dev machine.
+      - "127.0.0.1:${AEGIS_HOST_PORT:-8001}:8000"
+    environment:
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_WORKSPACE_ROOT: /workspace
+      AEGIS_OUTPUT_DIR: /data/packages
+      AEGIS_WORK_DIR: /data/work
+      AEGIS_LSP_CONFIG_FILE: /opt/aegis/lsp.yaml
+      # Budget: raise for monorepos, lower for fast triage.
+      AEGIS_BUDGET__MAX_DEPTH: "2"
+      AEGIS_BUDGET__MAX_NODES: "60"
+      AEGIS_BUDGET__MAX_CONTEXTS: "20"
+      AEGIS_BUDGET__MAX_TOTAL_CHARS: "600000"
+    volumes:
+      # The code under analysis, read-only by design: Aegis never writes to a repo.
+      - ${AEGIS_SCAN_TARGET:-./demo/repo}:/workspace:ro
+      # Bundles + scanner SARIF artifacts live here, on the host.
+      - ./var/packages:/data/packages
+      - ./var/work:/data/work
+      # Optional local override of the language-server catalog.
+      # Compose creates the file mount only if ./docker/lsp.local.yaml exists.
+      - ./docker/lsp.local.yaml:/opt/aegis/lsp.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    shm_size: "512m"

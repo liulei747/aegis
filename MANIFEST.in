@@ -1,0 +1,4 @@
+include README.md
+include pyproject.toml
+include docker/lsp.yaml
+recursive-include app/api/static *.html *.css *.js
