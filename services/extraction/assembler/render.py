@@ -39,7 +39,7 @@ from aegis_core.config import BudgetConfig
 from aegis_core.utils import estimate_tokens
 from services.extraction.assembler.contexts import AssembledContext, AssemblyResult
 
-PROMPT_VERSION = "2025-01-assemble-v1.1"
+PROMPT_VERSION = "2025-01-assemble-v1.2"
 
 SYSTEM_INSTRUCTIONS = f"""\
 You are a security analysis agent working on an evidence bundle assembled by Aegis
@@ -75,16 +75,31 @@ Weigh them accordingly, and never present a low-confidence edge as fact:
    point is a different severity than one on an HTTP handler path.
 5. Report uncertainty as a calibrated range, not a vibe.
 
-## Required output (per analysis context)
-- `verdict`: true_positive | false_positive | needs_more_context
-- `severity`: critical | high | medium | low | informational
-- `confidence`: 0.0-1.0
-- `reachability`: is the sink reachable from an untrusted entry point? Say how.
-- `chain`: the concrete call path you believe exists, as `path:line (M-...)` steps
-- `data_flow`: untrusted source -> transformations -> sink, or why it is safe
-- `evidence`: the specific lines that support the verdict
-- `missing`: what would raise confidence
-- `fix`: the minimal remediation, anchored to a specific method
+## Required output
+Answer with **one JSON object and nothing else** — no prose before it, no prose after it, no
+Markdown fence. The first character of your answer must be `{{` and the last must be `}}`.
+Exactly these keys, with these types:
+
+```json
+{{
+  "verdict": "true_positive" | "false_positive" | "needs_more_context",
+  "severity": "critical" | "high" | "medium" | "low" | "informational",
+  "confidence": 0.0,
+  "reachability": "string",
+  "chain": ["string"],
+  "data_flow": "string",
+  "evidence": ["string"],
+  "missing": ["string"],
+  "fix": "string"
+}}
+```
+
+- `confidence` is a number between 0.0 and 1.0, not a sentence.
+- `chain`, `evidence` and `missing` are arrays of strings, not prose paragraphs.
+- The conditional reasoning that shapes a value belongs inside that value's string. If your
+  severity depends on something unproven, say so in `severity` itself and list it in `missing`
+  -- do not move the reasoning outside the JSON.
+- An empty array is a real answer; omit no key. If a key does not apply, use `[]` or `""`.
 """
 
 
@@ -93,6 +108,7 @@ def provider_legend() -> PromptBlock:
         "## Provider legend",
         "| provider | meaning |",
         "| --- | --- |",
+        "| joern_dataflow | a real inter-procedural dataflow trace of the value across files |",
         "| lsp_call_hierarchy | true caller/callee from the language server |",
         "| lsp_definition | callee resolved from a call site |",
         "| lsp_implementation | dispatch target of an abstract/interface method |",
@@ -147,19 +163,35 @@ class BundleRenderer:
         }
         blocks: list[PromptBlock] = [instructions_block(), provider_legend()]
         blocks.append(self._catalog(result))
+        context_blocks: dict[str, int] = {}
         for context in result.contexts:
-            blocks.append(self._context(context))
+            block = self._context(context)
+            context_blocks[context.context_id] = block.estimated_tokens
+            blocks.append(block)
         blocks.append(self._run_notes(result))
-        total = sum(b.estimated_tokens for b in blocks)
+        plan = self._chunking_plan(result, context_blocks)
         blocks.append(
             PromptBlock(
-                block_id="instructions.chunking",
-                title="Chunking plan",
-                content=self._chunking_plan(result),
-                estimated_tokens=estimate_tokens(self._chunking_plan(result)),
-                cacheable=True,
+                # NOT `instructions.*`. That prefix is a promise -- "byte-identical across
+                # every bundle of this prompt version" -- and this block carries a table of
+                # *this* bundle's contexts, so it cannot keep that promise. It used to be
+                # called `instructions.chunking` and was flagged cacheable, which put a
+                # per-bundle table inside the declared stable prefix and made the prefix a lie
+                # for any two bundles with different context sets. The name now says what it
+                # is: a dispatch plan for this bundle, not an instruction.
+                block_id="fanout.plan",
+                title="Fan-out plan for this bundle",
+                content=plan,
+                estimated_tokens=estimate_tokens(plan),
+                cacheable=False,
             )
         )
+        # Sum the blocks, do not re-estimate the bodies. `manifest.estimated_tokens` and
+        # `blocks_meta.json` are both defined as this sum, and the header is the third place
+        # the same number appears -- it used to be computed from the source text instead, so a
+        # prompt read "approx tokens (whole bundle): 1703" while the metadata next to it said
+        # 1883. Two answers to one question inside one deliverable is worse than either.
+        content_total = sum(block.estimated_tokens for block in blocks)
         # Keep the reusable blocks first: they are the identical prefix of every
         # request. The header is prepended below and is *volatile* (it carries the
         # bundle id and the bundle-level token count), so the cacheable run does not
@@ -168,11 +200,15 @@ class BundleRenderer:
         for block in blocks:
             if not block.estimated_tokens:
                 block.estimated_tokens = estimate_tokens(block.content)
+        # The header states the size of what a caller would actually send. It excludes itself
+        # on purpose: a label whose value depends on its own length cannot be stated, and the
+        # previous version included itself -- so the number changed whenever its own wording
+        # did, and disagreed with the metadata beside it by exactly its own token count.
         header = (
             f"# Aegis analysis bundle {bundle_id}\n"
             f"workspace: {workspace_root}\n"
             f"contexts: {len(result.contexts)}\n"
-            f"approx tokens (whole bundle): {total}\n"
+            f"approx tokens (content blocks, excluding this header): {content_total}\n"
         )
         blocks.insert(
             0,
@@ -360,36 +396,51 @@ class BundleRenderer:
             estimated_tokens=estimate_tokens(content),
         )
 
-    def _chunking_plan(self, result: AssemblyResult) -> str:
+    def _chunking_plan(self, result: AssemblyResult, context_blocks: dict[str, int]) -> str:
         lines = [
             "## Chunking plan for fan-out",
             "",
-            "These instructions and `method_catalog` are byte-identical between bundles",
-            "assembled from the same workspace and rule set. Send them once as a cached",
-            "prefix, then dispatch one `context.<id>` per sub-agent. The bundle header",
-            "above them is not part of that prefix: it names this bundle. Contexts are",
-            "independent: no context needs another to be analysed.",
+            "The instructions above are byte-identical across every bundle of this prompt",
+            "version, and `method_catalog` is byte-identical across bundles assembled from",
+            "the same workspace and rule set. Send them once as a cached prefix, then",
+            "dispatch one `context.<id>` per sub-agent. The bundle header above them is not",
+            "part of that prefix: it names this bundle. Contexts are independent: no context",
+            "needs another to be analysed.",
             "",
-            "| context | focus | worst severity | methods | approx tokens |",
+            "| context | focus | worst severity | methods | block tokens |",
             "| --- | --- | --- | --- | --- |",
         ]
         for context in result.contexts:
+            # The rendered block, not `context.estimated_tokens`. That field counts only the
+            # inlined bodies and call-site snippets, so it read 120 next to a context block
+            # that really costs 576 -- 4.8x under, which is exactly the number a caller would
+            # size sub-agent budgets from. This column must describe what is actually sent.
+            tokens = context_blocks.get(context.context_id, context.estimated_tokens)
             lines.append(
                 f"| `{context.context_id}` | {context.focus.method.qualified_name} |"
                 f" {context.worst_severity.value} | {len(context.refs)} |"
-                f" {context.estimated_tokens} |"
+                f" {tokens} |"
             )
         return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------
 def _block_order(block: PromptBlock) -> tuple[int, str]:
+    """Document order.
+
+    The reusable run comes first and stops before anything per-bundle: the instruction blocks,
+    then the catalog, then *this bundle's* fan-out plan, then the contexts, then the notes.
+
+    Note that `instructions.*` is reserved for blocks that are byte-identical across every
+    bundle -- the prefix is what it claims to be because the naming rule and the stability
+    rule agree. The per-bundle table lives under `fanout.plan` for exactly that reason.
+    """
     prefix_rank = {
         "bundle.header": 0,
         "instructions.system": 1,
         "instructions.legend": 2,
-        "instructions.chunking": 3,
-        "method_catalog": 4,
+        "method_catalog": 3,
+        "fanout.plan": 4,
         "run.notes": 8,
     }
     if block.block_id in prefix_rank:

@@ -7,9 +7,17 @@ never mutating anything and never inventing a number that is not in the manifest
 
 Two consequences worth keeping:
 
-* every consumer (the JSON API, and the separate console service in
-  ``services/web``) renders these exact same views, so they can never disagree;
-* deleting this module (or the console) cannot change a bundle.
+* the JSON API publishes these views, and anything that reads them renders the same
+  numbers, so a page and its JSON cannot disagree about a bundle;
+* deleting this module (or any reader of it) cannot change a bundle.
+
+**What this module does not do is decide how to present.** It was once the only place
+allowed to compute anything, on the theory that a front-end which computes will compute
+differently from the API. The front-end is now a separate deployment that computes its own
+counts, shares and totals (`frontend/src/format.ts`), so the rule is narrower and stated
+where it belongs: this module derives what a *bundle* is, and the front-end derives what a
+*screen* shows. `verdicts_view` used to sit on the wrong side of that line -- it aggregated
+an AI report into display counts -- and was removed for it.
 
 The central idea is the **funnel**: a pipeline that silently loses findings is
 worse than one that fails, so every step from "scanner output" to "method inlined
@@ -38,71 +46,71 @@ from aegis_contracts.domain import (
 # ----------------------------------------------------------------------
 PROVIDER_NOTES: dict[str, dict[str, Any]] = {
     Provider.LSP_CALL_HIERARCHY.value: {
-        "label": "LSP call hierarchy",
+        "label": "LSP 调用层级",
         "trust": "fact",
         "confidence": 1.0,
-        "note": "the language server resolved this caller/callee directly",
+        "note": "语言服务器直接解析出了这个调用方/被调用方",
     },
     Provider.LSP_DEFINITION.value: {
-        "label": "LSP definition",
+        "label": "LSP 定义",
         "trust": "strong",
         "confidence": 0.9,
-        "note": "callee resolved from a lexical call site via textDocument/definition",
+        "note": "被调用方由词法调用点经 textDocument/definition 解析得到",
     },
     Provider.LSP_IMPLEMENTATION.value: {
-        "label": "LSP implementation",
+        "label": "LSP 实现",
         "trust": "strong",
         "confidence": 0.8,
-        "note": "dispatch target of an abstract/interface method",
+        "note": "抽象/接口方法的派发目标",
     },
     Provider.LSP_REFERENCES.value: {
-        "label": "LSP references",
+        "label": "LSP 引用",
         "trust": "weak",
         "confidence": 0.6,
-        "note": "a reference exists, but that it is a call is unproven",
+        "note": "引用确实存在，但无法证明它是一次调用",
     },
     Provider.LSP_DOCUMENT_SYMBOL.value: {
-        "label": "LSP documentSymbol",
+        "label": "LSP 文档符号",
         "trust": "fact",
         "confidence": 1.0,
-        "note": "method boundaries taken from the server's symbol ranges",
+        "note": "方法边界取自服务器返回的符号范围",
     },
     Provider.SYNTAX_REGEX.value: {
-        "label": "syntax heuristic",
+        "label": "语法启发式",
         "trust": "guess",
         "confidence": 0.4,
-        "note": "no language server: scopes and call sites are lexical approximations",
+        "note": "没有语言服务器：作用域与调用点都是词法近似",
     },
     Provider.OPENGREP.value: {
-        "label": "static scanner",
+        "label": "静态扫描器",
         "trust": "fact",
         "confidence": 1.0,
-        "note": "the original opengrep/SARIF hit",
+        "note": "opengrep/SARIF 的原始命中",
     },
     Provider.FILE_RANGE.value: {
-        "label": "file range fallback",
+        "label": "文件范围兜底",
         "trust": "guess",
         "confidence": 0.2,
-        "note": "last-resort range, treat the boundaries as approximate",
+        "note": "最后兜底的范围，边界只能视为近似",
     },
     Provider.NONE.value: {
-        "label": "none",
+        "label": "无",
         "trust": "unknown",
         "confidence": 0.0,
-        "note": "no provider recorded",
+        "note": "没有记录任何来源",
     },
 }
 
 TRUST_ORDER = {"fact": 0, "strong": 1, "weak": 2, "guess": 3, "unknown": 4}
 
 STAGE_LABELS: dict[str, str] = {
-    "scan": "static scan (opengrep/SARIF)",
-    "setup": "workspace + language servers",
-    "locate": "locate enclosing method",
-    "expand": "expand call graph",
-    "read": "read full method bodies",
-    "assemble": "dedupe + assemble contexts",
-    "package": "write package",
+    "scan": "静态扫描（opengrep/SARIF）",
+    "setup": "工作区 + 语言服务器",
+    "locate": "定位所属方法",
+    "expand": "扩展调用图",
+    "read": "读取完整方法体",
+    "assemble": "去重 + 组装上下文",
+    "package": "写入分析包",
 }
 
 
@@ -195,17 +203,17 @@ def overview(manifest: AnalysisBundleManifest) -> BundleOverview:
     flags: list[str] = []
     scan = manifest.stats.scan
     if scan is not None and scan.zero_findings_is_suspicious:
-        flags.append("scanner returned zero findings from a scan that was not configured")
+        flags.append("扫描器在一次未配置规则的扫描中返回了零命中")
     if not manifest.findings:
-        flags.append("no findings at all: nothing was analysed")
+        flags.append("完全没有命中：没有任何内容被分析")
     if manifest.coverage.rejected:
-        flags.append(f"{manifest.coverage.rejected} finding(s) never reached a bundle")
+        flags.append(f"{manifest.coverage.rejected} 个命中从未进入任何分析包")
     if any(c.truncated for c in manifest.contexts):
-        flags.append("at least one context was truncated")
+        flags.append("至少有一个上下文被截断")
     if any(d.capability == "lsp" for d in manifest.degradations):
-        flags.append("no language server contributed: every edge is a heuristic")
+        flags.append("没有任何语言服务器参与：每条边都是启发式的")
     if scan is not None and scan.stderr_tail and not manifest.findings:
-        flags.append("scanner wrote to stderr and produced no findings")
+        flags.append("扫描器向 stderr 写了输出，且没有产生任何命中")
 
     return BundleOverview(
         bundle_id=manifest.bundle_id,
@@ -253,7 +261,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
     steps: list[FunnelStep] = [
         FunnelStep(
             key="discovered",
-            label="findings from the scanner",
+            label="扫描器产出的命中",
             count=scanned,
             of_previous=None,
             of_first=1.0,
@@ -265,7 +273,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="located",
-            label="findings resolved to an enclosing method",
+            label="命中定位到所属方法",
             count=located,
             previous=scanned,
             first=scanned,
@@ -276,14 +284,14 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="focus_methods",
-            label="distinct methods carrying findings",
+            label="带命中的去重方法",
             count=distinct_focus,
             previous=located,
             first=scanned,
             rules=set(),
             note=(
-                f"{counts.get('findings_merged_into_existing_method', 0)} finding(s) shared a "
-                "method with another finding, so fewer methods than findings is normal"
+                f"有 {counts.get('findings_merged_into_existing_method', 0)} 个命中与另一个命中"
+                "落在同一个方法上，因此方法数少于命中数是正常的"
             ),
         )
     )
@@ -291,7 +299,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="contexts",
-            label="contexts built (one per focus method)",
+            label="构建的上下文（每个焦点方法一个）",
             count=contexts_built,
             previous=distinct_focus,
             first=scanned,
@@ -302,7 +310,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="slices",
-            label="call-graph slices expanded",
+            label="扩展出的调用图切片",
             count=slices,
             previous=contexts_built,
             first=scanned,
@@ -313,13 +321,13 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="proposed",
-            label="methods proposed by walking the graph (gross)",
+            label="沿调用图遍历提出的方法（毛数）",
             count=proposed,
             previous=kept,  # same unit: methods
             first=scanned,
             rules=set(),
             note=(
-                f"{dropped_at_expand} reached method(s) were refused by a node cap"
+                f"{dropped_at_expand} 个已到达的方法被节点上限拒绝"
                 if dropped_at_expand
                 else None
             ),
@@ -329,7 +337,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="kept",
-            label="methods kept in the bundle (net, after every cap)",
+            label="最终保留在分析包中的方法（净数，已套用全部上限）",
             count=kept,
             previous=proposed,
             first=scanned,
@@ -343,8 +351,8 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
                 # The arithmetic above cannot see these: a fan-out we never looked
                 # up contributes no count at all, only a prune. Say it out loud, or
                 # a truncated walk reads as a complete one.
-                f"the walk also skipped {fanouts_skipped} fan-out lookup(s) that a cap"
-                " prevented; those methods are absent without ever being counted"
+                f"遍历还跳过了 {fanouts_skipped} 次被上限拦下的扇出查找，"
+                "这些方法从未被计数，就已经缺席"
                 if fanouts_skipped
                 else None
             ),
@@ -354,7 +362,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="read",
-            label="method bodies read from disk",
+            label="从磁盘读取的方法正文",
             count=read,
             previous=kept,
             first=scanned,
@@ -365,7 +373,7 @@ def funnel(manifest: AnalysisBundleManifest) -> list[FunnelStep]:
         _step(
             manifest,
             key="inlined",
-            label="method bodies actually inlined into a context",
+            label="真正内联进上下文的方法正文",
             count=inlined,
             previous=read,
             first=scanned,
@@ -675,7 +683,7 @@ def _step(
         if prune.rule not in reasons:
             reasons.append(prune.rule)
     if lost and not reasons:
-        reasons.append("not attributable to a recorded prune (see run notes)")
+        reasons.append("无法归因于任何已记录的裁剪（见运行说明）")
     return FunnelStep(
         key=key,
         label=label,
@@ -700,10 +708,10 @@ def _step(
 def _scan_note(scan: ScanRecord | None) -> str | None:
     if scan is None:
         return None
-    parts = [f"engine={scan.engine}"]
+    parts = [f"引擎={scan.engine}"]
     if scan.engine_version:
-        parts.append(f"version={scan.engine_version}")
-    parts.append("rules=explicit" if scan.configured else "rules=unconfigured")
+        parts.append(f"版本={scan.engine_version}")
+    parts.append("规则=显式" if scan.configured else "规则=未配置")
     return ", ".join(parts)
 
 
@@ -719,4 +727,4 @@ def _worst_severity(severities: list[str]) -> str:
 
 
 def edge_direction_label(direction: EdgeDirection) -> str:
-    return "caller (entry side)" if direction is EdgeDirection.CALLER else "callee (sink side)"
+    return "调用方（入口侧）" if direction is EdgeDirection.CALLER else "被调用方（汇聚侧）"

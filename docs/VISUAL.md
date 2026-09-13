@@ -1,5 +1,10 @@
 # Aegis 数据流与前端原型图
 
+> 这份文档是**设计提案**，写于前端只有四屏设想的时候。实际交付的 `frontend/` 保留了这里的
+> 四屏，另外多了 AI 研判、项目管理、流量日志、参数设置四个菜单，并在 2026-09-12 重做为
+> **独立部署**（不反代 API，地址运行期注入，展示数字前端自算）。菜单与理由见
+> `frontend/README.md` 与 `docs/HANDOVER.md` §11.3；下面第二节的四屏 IA 仍然是核心屏的设计依据。
+
 ## 一、数据流（Mermaid —— GitHub / VS Code / Typora 的 Markdown 预览可直接渲染）
 
 ```mermaid
@@ -101,6 +106,7 @@ flowchart LR
         F2["阶段耗时条"]
         F3["扫描器台账<br/>命令 · 返回码 · 规则分布 · stderr"]
         F4["降级清单"]
+        F5["模型研判<br/>verdict · severity · 证据 · 未证实项"]
     end
 
     subgraph P3["③ 上下文详情 (核心屏)"]

@@ -61,10 +61,10 @@ def bundle_dir(bundle_id: str, settings: Settings) -> Path:
     """Resolve a bundle directory from a user-supplied id, refusing traversal."""
     safe = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
     if not bundle_id or any(ch not in safe for ch in bundle_id) or ".." in bundle_id:
-        raise HTTPException(status_code=400, detail=f"unsafe bundle id: {bundle_id!r}")
+        raise HTTPException(status_code=400, detail=f"不安全的分析包 ID：{bundle_id!r}")
     directory = settings.output_dir / bundle_id
     if not directory.is_dir():
-        raise HTTPException(status_code=404, detail=f"bundle not found: {bundle_id}")
+        raise HTTPException(status_code=404, detail=f"未找到分析包：{bundle_id}")
     return directory
 
 
@@ -79,16 +79,16 @@ def load_manifest(bundle_id: str, settings: Settings) -> AnalysisBundleManifest:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise HTTPException(
-                status_code=500, detail=f"{name} is not valid JSON: {exc}"
+                status_code=500, detail=f"{name} 不是有效的 JSON：{exc}"
             ) from exc
         payload = doc.get("manifest", doc) if isinstance(doc, dict) else doc
         try:
             return AnalysisBundleManifest.model_validate(payload)
         except Exception as exc:
             raise HTTPException(
-                status_code=500, detail=f"{name} does not match the manifest schema: {exc}"
+                status_code=500, detail=f"{name} 与清单 schema 不匹配：{exc}"
             ) from exc
-    raise HTTPException(status_code=404, detail=f"bundle has no manifest: {bundle_id}")
+    raise HTTPException(status_code=404, detail=f"分析包没有清单：{bundle_id}")
 
 
 def load_method_body(bundle_id: str, method_id: str, settings: Settings) -> str:
@@ -102,10 +102,10 @@ def load_method_body(bundle_id: str, method_id: str, settings: Settings) -> str:
         ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
         for ch in method_id
     ):
-        raise HTTPException(status_code=400, detail=f"unsafe method id: {method_id!r}")
+        raise HTTPException(status_code=400, detail=f"不安全的方法 ID：{method_id!r}")
     path = directory / "methods" / f"{method_id}.txt"
     if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"no body stored for {method_id}")
+        raise HTTPException(status_code=404, detail=f"没有为 {method_id} 存储方法体")
     return path.read_text(encoding="utf-8")
 
 
@@ -158,7 +158,7 @@ def get_job_queue():
     settings = get_settings()
     client = get_queue_client()
     if client is None:
-        raise HTTPException(status_code=503, detail="queue unavailable: no Redis configured")
+        raise HTTPException(status_code=503, detail="队列不可用：未配置 Redis")
     keys = QueueKeys(settings.queue.stream, settings.queue.group)
     return (
         JobStore(client, settings.queue, keys=keys),

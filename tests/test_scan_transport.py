@@ -105,31 +105,64 @@ def test_remote_scan_parses_the_service_response(
 
     import httpx
 
+    captured: dict = {}
+
     class FakeResponse:
-        status_code = 200
+        def __init__(self, body: dict, status_code: int = 200) -> None:
+            self._body = body
+            self.status_code = status_code
 
         def raise_for_status(self) -> None:
             return None
 
         def json(self) -> dict:
-            return body
+            return self._body
 
-    captured: dict = {}
+    class FakeClient:
+        """The job protocol: accept, poll until terminal, hand back the result."""
 
-    def fake_post(url: str, json: dict, timeout: float):  # noqa: A002 - mirrors httpx
-        captured["url"] = url
-        captured["payload"] = json
-        return FakeResponse()
+        def __init__(self, **kwargs) -> None:
+            captured["client_kwargs"] = kwargs
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        def post(self, url: str, json: dict):  # noqa: A002 - mirrors httpx
+            captured["post_url"] = url
+            captured["payload"] = json
+            return FakeResponse({"job_id": "S-abc", "state": "queued", "status_url": "/x"})
+
+        def get(self, url: str):
+            captured.setdefault("get_urls", []).append(url)
+            polls = len(captured["get_urls"])
+            if polls == 1:
+                return FakeResponse({"job_id": "S-abc", "state": "running", "result": None})
+            return FakeResponse(
+                {"job_id": "S-abc", "state": "succeeded", "result": body}
+            )
+
+        def delete(self, url: str):  # pragma: no cover - not used in this test
+            raise AssertionError("a successful scan must not be cancelled")
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
 
     outcome = client.run_scan_anywhere(
         ScanRequest(workspace=workspace, rule_config="auto", out_dir=None)
     )
 
-    assert captured["url"] == "http://scan:8101/v1/scan"
+    assert captured["post_url"] == "http://scan:8101/v1/scan/jobs"
     assert captured["payload"]["workspace"] == str(workspace)
     assert captured["payload"]["rule_config"] == "auto"
+    assert captured["get_urls"] == [
+        "http://scan:8101/v1/scan/jobs/S-abc",
+        "http://scan:8101/v1/scan/jobs/S-abc",
+    ], "the caller must poll, not block on one long request"
+    # Short per-request timeouts are the mechanism: no single call may park the caller.
+    limits = captured["client_kwargs"]["timeout"]
+    assert limits.read is not None and limits.read <= 30.0
 
     assert outcome.engine == "opengrep"
     assert outcome.engine_version == "1.16.0"
@@ -171,10 +204,20 @@ def test_remote_failure_degrades_like_a_local_one(
 
     import httpx
 
-    def fake_post(url: str, json: dict, timeout: float):  # noqa: A002
-        raise httpx.ConnectError("connection refused")
+    class FailingClient:
+        def __init__(self, **kwargs) -> None:
+            pass
 
-    monkeypatch.setattr(httpx, "post", fake_post)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        def post(self, url: str, json: dict):  # noqa: A002 - mirrors httpx
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "Client", FailingClient)
 
     outcome = client.run_scan_anywhere(ScanRequest(workspace=workspace, rule_config="auto"))
 
@@ -183,8 +226,96 @@ def test_remote_failure_degrades_like_a_local_one(
     assert outcome.scan_record is not None
     assert outcome.scan_record.failure_mode is not None
     assert "connection refused" in outcome.scan_record.failure_mode
-    assert outcome.scan_record.zero_findings_is_suspicious is True
-    assert outcome.warnings and "scan service" in outcome.warnings[0]
+    # `configured=True` here because the request asked for rules: a *configured* scan that
+    # produced nothing is the suspicious case, and that distinction is carried from the
+    # request rather than assumed.
+    assert outcome.scan_record.configured is True
+    assert outcome.scan_record.zero_findings_is_suspicious is False
+    assert outcome.warnings and "扫描服务" in outcome.warnings[0]
+
+
+def test_remote_cancel_sends_a_delete_and_reports_a_cancellation(
+    monkeypatch: pytest.MonkeyPatch, workspace: Path
+) -> None:
+    """The point of the job protocol: a cancel stops the *remote* work, not just our wait.
+
+    Before this, cancelling a delegated scan left the scanner running in the other container
+    for the rest of its timeout, and the caller could not even notice the cancel request
+    until the blocking HTTP call returned. The DELETE is what makes it real.
+    """
+    import threading
+
+    monkeypatch.setenv(client.ENV_SCAN_SERVICE_URL, "http://scan:8101")
+    # No sleeping between polls: the test drives the cancel itself.
+    monkeypatch.setenv(client.ENV_SCAN_JOB_POLL_MS, "50")
+
+    import httpx
+
+    cancel_event = threading.Event()
+    seen: dict = {"polls": 0}
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        def post(self, url, json):  # noqa: A002
+            class R:
+                status_code = 202
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"job_id": "S-cancel", "state": "queued", "status_url": "/x"}
+
+            return R()
+
+        def get(self, url):
+            seen["polls"] += 1
+            cancel_event.set()  # the user's cancel arrives while the scan runs
+
+            class R:
+                status_code = 200
+
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"job_id": "S-cancel", "state": "running", "result": None}
+
+            return R()
+
+        def delete(self, url):
+            seen["deleted"] = url
+
+            class R:
+                status_code = 200
+
+                def json(self):
+                    return {"job_id": "S-cancel", "state": "canceled"}
+
+            return R()
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+
+    outcome = client.run_scan_anywhere(
+        ScanRequest(workspace=workspace, rule_config="auto", cancel_event=cancel_event)
+    )
+
+    assert seen.get("deleted") == "http://scan:8101/v1/scan/jobs/S-cancel", (
+        "a cancel must tell the scan service to stop, not merely stop waiting"
+    )
+    assert outcome.canceled is True
+    assert outcome.scan_record is not None
+    assert outcome.scan_record.failure_mode == "scan_aborted"
+    assert outcome.scan_record.location == "remote"
+    assert outcome.findings == []
 
 
 def test_both_transports_return_the_same_type(

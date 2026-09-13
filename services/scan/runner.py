@@ -13,6 +13,7 @@ Both paths must behave identically, so there is no second implementation to drif
 from __future__ import annotations
 
 import shutil
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,14 @@ class ScanRequest:
     # --- interruptibility (all optional; None means "behave exactly as before") ---
     #: Consulted while waiting for the scanner. True means "stop and say so".
     abort: Callable[[], bool] | None = None
+    #: An event an *outsider* can set to stop this scan.
+    #:
+    #: Separate from `abort` because the two are asked by different owners: `abort` is the
+    #: caller's own predicate, polled from this process, while `cancel_event` is how a
+    #: long-lived service (the scan HTTP service) lets a *later request* -- a DELETE -- stop a
+    #: scan that is already running in another thread. Reusing `abort` for both would mean the
+    #: in-process caller and the HTTP service overwrite each other's cancellation source.
+    cancel_event: threading.Event | None = None
     #: Handed the process as soon as it exists, so the caller can terminate it.
     process_sink: Callable[[Popen], None] | None = None
     #: Called once the process is finished, however it finished, to drop the handle.
@@ -113,6 +122,18 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
     warnings: list[str] = []
     configured = bool(request.rule_config or request.rules)
 
+    # One predicate, two owners: the caller's own `abort` and the external `cancel_event`.
+    # The runner polls a single callable, so they are combined here rather than teaching it
+    # about both -- which keeps `OpengrepRunner.scan` unchanged in shape.
+    external = request.cancel_event
+    if external is None:
+        abort = request.abort
+    else:
+        own = request.abort
+
+        def abort() -> bool:
+            return external.is_set() or (own is not None and own())
+
     try:
         engine_result = runner.scan(
             request.workspace,
@@ -121,7 +142,7 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
             rules=request.rules,
             include_globs=request.include_globs,
             exclude_globs=request.exclude_globs,
-            abort=request.abort,
+            abort=abort,
             process_sink=request.process_sink,
             process_done=request.process_done,
         )
@@ -131,7 +152,7 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
         # returning a named ledger entry plus `canceled=True` -- the flag says "do not
         # treat me as a failure", the ledger says what happened for anyone reading the
         # manifest later. This is the one place cancellation and the never-raise rule meet.
-        reason = "the scan was terminated on request"
+        reason = "扫描已按请求终止"
         log.info("scan aborted during %s", request.workspace)
         return ScanOutcome(
             engine=Path(request.binary).stem,
@@ -154,7 +175,7 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
         )
     except Exception as exc:  # no engine at all
         log.error("scan could not start: %s", exc)
-        reason = f"scanner could not be started: {exc}"
+        reason = f"无法启动扫描器：{exc}"
         return ScanOutcome(
             engine=Path(request.binary).stem,
             sarif_path=None,
@@ -223,7 +244,7 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
         # nowhere else.
         was_aborted = request.abort is not None and request.abort()
         if was_aborted:
-            reason = "the scan was terminated on request"
+            reason = "扫描已按请求终止"
             log.info("scan process killed while a cancel was pending")
             return ScanOutcome(
                 engine=outcome.engine,
@@ -247,7 +268,7 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
             )
         killed = _looks_killed(outcome.returncode)
         return failed(
-            f"scanner exited with rc={outcome.returncode}" + (f": {tail}" if tail else ""),
+            f"扫描器已退出（rc={outcome.returncode}）" + (f"：{tail}" if tail else ""),
             # Killed without a cancel pending: an external stop (OOM killer, an operator's
             # `kill`). It is a failure, and it gets its own name so it is not confused with
             # a scanner that ran and objected.
@@ -257,16 +278,16 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
         # A scanner that reports success without a path is a failure with a name, not a
         # crash: `run_scan` may not raise, and a missing artifact is exactly the case it
         # exists to describe.
-        return failed("scanner reported success but produced no SARIF path")
+        return failed("扫描器报告成功，但没有产出 SARIF 路径")
     if not outcome.sarif_path.exists():
-        return failed(f"scanner produced no SARIF output (rc={outcome.returncode})")
+        return failed(f"扫描器未产出 SARIF 输出（rc={outcome.returncode}）")
     if outcome.sarif_path.stat().st_size == 0:
-        return failed(f"scanner wrote an empty SARIF file (rc={outcome.returncode})")
+        return failed(f"扫描器写出的 SARIF 文件为空（rc={outcome.returncode}）")
 
     try:
         findings = parse_sarif(outcome.sarif_path, workspace=request.workspace)
     except ValueError as exc:
-        return failed(f"scanner output is not valid SARIF: {exc}")
+        return failed(f"扫描器输出不是有效的 SARIF：{exc}")
 
     return ScanOutcome(
         engine=outcome.engine,

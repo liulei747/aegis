@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker" / "docker-compose.yml"
 
 #: The only services allowed to be reachable from the host.
-USER_FACING = {"gateway", "web"}
+USER_FACING = {"gateway", "frontend"}
 
 
 @pytest.fixture(scope="module")
@@ -76,8 +76,17 @@ def test_workers_publish_nothing(compose: dict) -> None:
 
 def test_every_service_has_a_healthcheck_and_a_restart_policy(compose: dict) -> None:
     """Both are needed for the queue to recover: an unhealthy worker must be restarted, and
-    a service nobody can probe cannot be part of `depends_on: condition: service_healthy`."""
+    a service nobody can probe cannot be part of `depends_on: condition: service_healthy`.
+
+    Services behind `profiles:` are exempt, and not as a convenience. A profiled service is not
+    started by `up`, cannot be a `depends_on` target, and is nothing the queue has to recover.
+    `harness` is the one such entry: a one-shot CLI that reviews a workspace and exits, so a
+    healthcheck would describe a long-lived process that does not exist and a restart policy
+    would restart a batch job that had already finished.
+    """
     for name, service in compose["services"].items():
+        if service.get("profiles"):
+            continue
         assert service.get("healthcheck"), f"{name} has no healthcheck"
         assert service.get("restart"), f"{name} has no restart policy"
 
@@ -138,6 +147,95 @@ def test_redis_never_evicts(compose: dict) -> None:
     assert "--appendonly" in command and "no" in command, "no persistence: the bundle is the record"
 
 
+def test_the_dataflow_fleet_matches_the_configured_worker_count(compose: dict) -> None:
+    """Affinity divides the project hash by `worker_count`, so the number is load-bearing.
+
+    `worker_for(workspace, N) = hash % N` -- if the deployment starts fewer workers than `N`,
+    the projects that hash to the missing index are not "slower", they are unreachable: the
+    request goes to a hostname that does not resolve. And the names must be exactly
+    `dataflow-<index>`, because that is what the default `worker_url_template`
+    (`http://dataflow-{index}:8105`) expands to.
+    """
+    import re
+
+    services = compose["services"]
+    fleet = {name: svc for name, svc in services.items() if re.fullmatch(r"dataflow-\d+", name)}
+    assert fleet, "the dataflow fleet is not in the compose file"
+
+    indices = sorted(int(name.rsplit("-", 1)[1]) for name in fleet)
+    assert indices == list(range(len(fleet))), (
+        f"the fleet must be indexed 0..N-1 with no gaps; got {indices}"
+    )
+
+    for name in ("extract", "worker"):
+        declared = services[name]["environment"].get("AEGIS_DATAFLOW__WORKER_COUNT")
+        assert declared is not None, f"{name} runs extraction but does not size the fleet"
+        assert int(declared) == len(fleet), (
+            f"{name} says there are {declared} workers but the file starts {len(fleet)}"
+        )
+        assert services[name]["environment"].get("AEGIS_DATAFLOW__ENABLED"), (
+            f"{name} would never use the fleet it just sized"
+        )
+
+
+def test_every_dataflow_worker_sees_the_same_workspace(compose: dict) -> None:
+    """Identical mounts are what make a wrong affinity guess slower instead of fatal.
+
+    Affinity is a policy -- keep a graph hot -- not a routing necessity. The moment the workers
+    mount *different* projects, a request routed to the "wrong" worker hits a path it cannot see
+    and 404s. It would also break the shared-volume contract: the extractor sends the workspace
+    path it already has, with no translation anywhere (see `test_shared_volumes_...`).
+    """
+    import re
+
+    sources = {}
+    indices = {}
+    for name, service in compose["services"].items():
+        if not re.fullmatch(r"dataflow-\d+", name):
+            continue
+        mounts = [str(volume) for volume in service.get("volumes") or []]
+        workspace = [m for m in mounts if re.search(r"/workspace(?::|$)", m)]
+        assert len(workspace) == 1, f"{name} must mount exactly one /workspace: {mounts}"
+        sources[name] = workspace[0].rsplit(":/workspace", 1)[0]
+        indices[name] = service["environment"]["AEGIS_DATAFLOW__WORKER_INDEX"]
+        assert "ports" not in service, f"{name} must not publish a host port"
+
+    assert len(set(sources.values())) == 1, (
+        f"every worker must mount the same project path; got {sources}"
+    )
+    assert len(set(indices.values())) == len(indices), (
+        f"each worker needs its own scratch and its own index; got {indices}"
+    )
+
+    # ...and the same one the caller has, because the caller sends the path it already sees.
+    caller_mounts = [str(v) for v in compose["services"]["extract"].get("volumes") or []]
+    caller_workspace = next(
+        (m for m in caller_mounts if re.search(r"/workspace(?::|$)", m)), None
+    )
+    assert caller_workspace is not None, "extract must mount /workspace"
+    assert caller_workspace.rsplit(":/workspace", 1)[0] == next(iter(sources.values())), (
+        "the extractor and the workers must mount the same host path at /workspace, or the "
+        f"path the extractor sends will not exist in the worker: {caller_workspace} vs {sources}"
+    )
+
+
+def test_nothing_depends_on_a_dataflow_worker(compose: dict) -> None:
+    """Both callers probe `/health` and fall back to the crawl with a recorded warning.
+
+    Gating their startup on a 5.9 GB JVM would trade a degraded bundle for no bundle at all --
+    the same trade the gateway already refuses to make with `worker`.
+    """
+    import re
+
+    for name, service in compose["services"].items():
+        if re.fullmatch(r"dataflow-\d+", name):
+            continue
+        depends = service.get("depends_on") or {}
+        assert not any(re.fullmatch(r"dataflow-\d+", target) for target in depends), (
+            f"{name} waits for the dataflow fleet; it must degrade instead"
+        )
+
+
 def test_the_worker_healthcheck_can_actually_run(monkeypatch, capsys) -> None:
     """The probe in `healthcheck:` must be a command that exists and reports sensibly.
 
@@ -163,20 +261,59 @@ def test_the_worker_healthcheck_can_actually_run(monkeypatch, capsys) -> None:
 
 
 def test_the_console_is_its_own_published_service(compose: dict) -> None:
-    """`web` is the second and last service allowed to publish a port.
+    """`frontend` is the second and last service allowed to publish a port.
 
     Its inclusion in the port policy's allowlist was written before it existed; this is what
     holds the two together, so the day someone adds a `ports:` entry to make a worker
     reachable, the allowlist cannot quietly grow to cover it.
     """
-    web = compose["services"]["web"]
-    assert web["build"]["dockerfile"] == "services/web/Dockerfile"
-    published = [str(entry) for entry in web.get("ports") or []]
-    assert published == ["127.0.0.1:${AEGIS_WEB_PORT:-8102}:8102"], published
+    frontend = compose["services"]["frontend"]
+    assert frontend["build"]["dockerfile"] == "docker/frontend.Dockerfile"
+    published = [str(entry) for entry in frontend.get("ports") or []]
+    assert published == ["127.0.0.1:${AEGIS_FRONTEND_PORT:-8102}:8102"], published
     # A console that will not start while the API restarts hides the outage from the reader.
-    assert "gateway" not in (web.get("depends_on") or {}), (
+    assert "gateway" not in (frontend.get("depends_on") or {}), (
         "the console must serve its page even when the gateway is unreachable"
     )
+
+
+def test_the_console_is_told_where_the_api_is_at_run_time(compose: dict) -> None:
+    """The API's address is configuration, not something baked into the image.
+
+    Two halves, and both are load-bearing. The compose service passes `AEGIS_API_BASE`, which the
+    image's entrypoint turns into `/config.js`; and nginx in that image proxies nothing, so the
+    browser's request goes to the gateway rather than back through this container. Drop either and
+    the front-end becomes deployable only from behind one specific proxy -- which is what the
+    preceding `aegis-web` service was, and why it was replaced.
+    """
+    frontend = compose["services"]["frontend"]
+    environment = frontend.get("environment") or {}
+    assert "AEGIS_API_BASE" in environment, (
+        "without it the image has no address to serve and falls back to same-origin"
+    )
+    # It must be the gateway as the *browser* sees it: the published host port, not the compose
+    # service name, because the browser is not on the compose network.
+    assert "AEGIS_GATEWAY_PORT" in str(environment["AEGIS_API_BASE"]), (
+        f"the address must be the published gateway port; got {environment['AEGIS_API_BASE']!r}"
+    )
+
+    nginx = (ROOT / "frontend" / "nginx.conf").read_text(encoding="utf-8")
+    # Directives only. The file's own comment explains that there is no `proxy_pass` here, and a
+    # substring search would trip over that sentence instead of over a directive.
+    directives = [
+        line.strip()
+        for line in nginx.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert not [line for line in directives if line.startswith("proxy_pass")], (
+        "the console image must serve files only; proxying /v1 would weld it to the gateway again"
+    )
+    assert not [line for line in directives if line.startswith("resolver")], (
+        "a resolver means something here is proxying; nothing should be"
+    )
+    entrypoint = ROOT / "frontend" / "docker-entrypoint.d" / "10-api-base.sh"
+    assert entrypoint.is_file(), "the entrypoint that writes /config.js is what makes one image reusable"
+    assert "AEGIS_API_BASE" in entrypoint.read_text(encoding="utf-8")
 
 
 def test_shared_volumes_use_identical_container_paths(compose: dict) -> None:

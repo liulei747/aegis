@@ -37,11 +37,12 @@ from aegis_core.cancel import CanceledAbort, TeardownHandle
 from aegis_core.config import BudgetConfig, Settings
 from aegis_core.logging import get_logger
 from aegis_core.utils import sha1
+from aegis_core.workspace import workspace_digest
 from services.extraction.assembler.contexts import AssemblyResult, ContextAssembler
 from services.extraction.assembler.package import BundlePackager, write_text
 from services.extraction.assembler.reader import MethodReader
 from services.extraction.assembler.render import BundleRenderer
-from services.extraction.graph.builder import CallGraphBuilder, FocusSlice
+from services.extraction.graph.builder import CallGraphBuilder, DataflowProvider, FocusSlice
 from services.extraction.graph.providers import CallGraphResolver
 from services.extraction.graph.resolver import SymbolIndex, Workspace
 from services.extraction.lsp.manager import LanguageServerManager, load_catalog
@@ -223,8 +224,8 @@ class AssemblyPipeline:
             # The SARIF lives in the scan service's filesystem. We cannot attach it
             # to the package, so say so instead of writing a path we cannot read.
             warnings.append(
-                "scan ran in the scan service: its raw SARIF is not in this filesystem "
-                f"({sarif_path}) and is not attached to the bundle"
+                "扫描在扫描服务中运行：其原始 SARIF 不在本文件系统中 "
+                f"（{sarif_path}），因此未附加到分析包"
             )
             sarif_path = None
 
@@ -235,8 +236,8 @@ class AssemblyPipeline:
             degradations.append(
                 Degradation(
                     capability="lsp",
-                    reason="LSP disabled by configuration",
-                    impact="all method locations and edges come from syntax heuristics",
+                    reason="LSP 已被配置禁用",
+                    impact="所有方法位置与调用边都来自语法启发式",
                 )
             )
 
@@ -266,12 +267,7 @@ class AssemblyPipeline:
             "setup",
             "end",
             ms=stats.stage_ms["setup"],
-            note=(
-                "lsp disabled by configuration"
-                if lsp is None
-                else "lsp configured: "
-                + ",".join(sorted({spec.language for spec in lsp.catalog}))
-            ),
+            note=_lsp_note(lsp),
         )
         check_abort("setup")
 
@@ -318,13 +314,13 @@ class AssemblyPipeline:
                 counters={"located": located_findings, "focus_methods": len(located)},
                 units_done=len(located),
                 units_total=len(located),
-                unit_label="focus methods",
+                unit_label="焦点方法",
             )
             check_abort("locate")
 
             # ---------------------------------------------------- expand
             started = time.perf_counter()
-            slices = await self._expand(located, resolver, budget, warnings)
+            slices = await self._expand(located, resolver, budget, warnings, workspace_root)
             stats.stage_ms["expand"] = _ms(started)
             stats.counts["slices_expanded"] = len(slices)
             stats.counts["slices_lost_to_errors"] = len(located) - len(slices)
@@ -343,9 +339,9 @@ class AssemblyPipeline:
                 counters={"contexts": len(located), "slices": len(slices)},
                 units_done=len(slices),
                 units_total=len(located),
-                unit_label="slices",
+                unit_label="切片",
                 note=(
-                    f"{len(located) - len(slices)} slice(s) failed and were recorded as warnings"
+                    f"{len(located) - len(slices)} 个切片失败，已记录为警告"
                     if len(slices) < len(located)
                     else None
                 ),
@@ -385,7 +381,7 @@ class AssemblyPipeline:
                 },
                 units_done=len(body_set.bodies),
                 units_total=net_methods,
-                unit_label="bodies",
+                unit_label="方法体",
             )
             check_abort("read")
 
@@ -411,6 +407,7 @@ class AssemblyPipeline:
                 degradations=degradations,
                 scan_record=scan_record,
                 warnings=warnings,
+                dataflow_anchors=[s.dataflow_anchor for s in slices],
             )
             bundle = AnalysisBundle(manifest=manifest)
             for context in assembly.contexts:
@@ -457,7 +454,7 @@ class AssemblyPipeline:
                 },
                 units_done=sum(len(c.bodies) for c in assembly.contexts),
                 units_total=net_methods,
-                unit_label="bodies",
+                unit_label="方法体",
             )
             check_abort("assemble")
 
@@ -616,9 +613,9 @@ class AssemblyPipeline:
                     PruneDecision(
                         rule="max_contexts",
                         detail=(
-                            f"finding not expanded: the context limit ({budget.max_contexts}) "
-                            "was already reached, so this finding never got a method or a "
-                            "context; raise max_contexts to include it"
+                            f"命中未展开：上下文上限（{budget.max_contexts}）"
+                            "已经达到，因此这个命中既没有得到方法，也没有得到上下文；"
+                            "提高 max_contexts 即可把它纳入"
                         ),
                         path=finding.path,
                         line=finding.region.start_line,
@@ -630,11 +627,11 @@ class AssemblyPipeline:
                 finding.path, finding.region.start_line, finding.region.start_char
             )
             if result is None:
-                message = workspace.failures.get(finding.path) or "no enclosing callable found"
+                message = workspace.failures.get(finding.path) or "没有找到任何可调用体"
                 prunes.append(
                     PruneDecision(
                         rule="locate_failed",
-                        detail=f"could not locate enclosing method: {message}",
+                        detail=f"无法定位所属方法：{message}",
                         path=finding.path,
                         line=finding.region.start_line,
                         provider=Provider.NONE,
@@ -662,8 +659,10 @@ class AssemblyPipeline:
         resolver: CallGraphResolver,
         budget: BudgetConfig,
         warnings: list[str],
+        workspace_root: Path,
     ) -> list[FocusSlice]:
-        builder = CallGraphBuilder(resolver.workspace, resolver, budget)
+        dataflow = self._dataflow_provider(workspace_root, warnings)
+        builder = CallGraphBuilder(resolver.workspace, resolver, budget, dataflow=dataflow)
         semaphore = asyncio.Semaphore(max(1, budget.expand_concurrency))
 
         async def one(symbol: MethodSymbol, group: list[Finding]) -> FocusSlice | None:
@@ -672,11 +671,45 @@ class AssemblyPipeline:
                     return await asyncio.to_thread(builder.build, symbol, group)
                 except Exception as exc:  # a single bad node must not kill the run
                     log.warning("call-graph expansion failed for %s: %s", symbol.qualified_name, exc)
-                    warnings.append(f"call-graph expansion failed for {symbol.qualified_name}: {exc}")
+                    warnings.append(f"调用图展开失败（{symbol.qualified_name}）：{exc}")
                     return None
 
         results = await asyncio.gather(*(one(sym, group) for sym, group in located))
         return [slice_ for slice_ in results if slice_ is not None]
+
+    # ------------------------------------------------------------------
+    def _dataflow_provider(
+        self, workspace_root: Path, warnings: list[str]
+    ) -> DataflowProvider | None:
+        """Build the worker client, or return None so the crawl stays in charge.
+
+        Configuration is a promise, not a hint: if dataflow is switched on and the worker that
+        owns this project cannot be reached, that is recorded as a warning the bundle carries,
+        rather than quietly falling back to a crawl that cannot see a sanitizer called by the
+        sink's caller.
+        """
+        config = self.settings.dataflow
+        if not config.enabled:
+            return None
+
+        from services.extraction.dataflow import WorkerDataflowClient
+
+        client = WorkerDataflowClient(config, workspace_root=workspace_root)
+        if not client.health():
+            message = (
+                f"已请求数据流，但 worker {client.index}（{client.url}）未响应 "
+                "/health；本次运行回退到调用方/被调用方爬取，而它看不到由汇聚点调用方调用的"
+                "净化函数"
+            )
+            warnings.append(message)
+            log.warning(message)
+            return None
+        log.info(
+            "dataflow: project %s routed to worker %s (%s)",
+            workspace_digest(workspace_root), client.index, client.url,
+            extra={"stage": "dataflow"},
+        )
+        return client
 
     # ------------------------------------------------------------------
     def _manifest(
@@ -694,7 +727,9 @@ class AssemblyPipeline:
         degradations: list[Degradation],
         scan_record: ScanRecord,
         warnings: list[str],
+        dataflow_anchors: list[dict] | None = None,
     ) -> AnalysisBundleManifest:
+        dataflow_anchors = dataflow_anchors or []
         all_edges = [edge for context in assembly.contexts for edge in context.edges]
         methods = {
             ref.method.method_id: ref.method
@@ -710,7 +745,7 @@ class AssemblyPipeline:
                 Degradation(
                     capability="callHierarchy",
                     reason=message,
-                    impact="caller direction falls back to reference-based edges (lower confidence)",
+                    impact="调用方方向回退到基于引用的边（置信度更低）",
                 )
             )
         # Only surface degradations that actually changed the outcome: if no LSP
@@ -726,15 +761,17 @@ class AssemblyPipeline:
                 collected.append(
                     Degradation(
                         capability="lsp",
-                        reason="no language server was available for the scanned files",
+                        reason="被扫描的文件没有可用的语言服务器",
                         impact=(
-                            "every method location and call graph edge comes from syntax "
-                            "heuristics (syntax_regex, confidence 0.40)"
+                            "每个方法位置与每条调用图边都来自语法启发式"
+                            "（syntax_regex，置信度 0.40）"
                         ),
                     )
                 )
         else:
-            collected = [d for d in collected if not d.reason.startswith("no usable language server")]
+            collected = [
+                d for d in collected if not d.reason.startswith("没有可用于")
+            ]
 
         capabilities: dict[str, object] = {
             "lsp_enabled": bool(lsp is not None),
@@ -743,6 +780,11 @@ class AssemblyPipeline:
             "providers_used": sorted(used_providers),
             "edge_providers": sorted({edge.provider.value for edge in all_edges}),
             "scan_transport": scan_record.location,
+            # Which source anchor each slice was analysed from, and the caller walk that chose
+            # it. A flow that starts at an inner method *looks* complete (measured: 8 elements
+            # against 24 for the entry's parameter), so the choice has to be auditable from the
+            # bundle rather than only from a log line.
+            "dataflow_anchors": [anchor for anchor in dataflow_anchors if anchor],
             # Warnings are the run's own caveats (a delegated scan whose SARIF could
             # not be attached, a scanner fallback, ...). They belong in the contract,
             # not only in a log line, or a consumer never learns about them.
@@ -825,6 +867,23 @@ def _scan_record(
 
 def _ms(started: float) -> int:
     return int((time.perf_counter() - started) * 1000)
+
+
+def _lsp_note(lsp) -> str:
+    """What the setup stage says about language servers.
+
+    Names the *usable* languages, and names the ones the catalog lists but this image cannot
+    serve. The second half is the important one: a Java project on an image without ``jdtls``
+    silently gets a heuristic graph, and this note is the only place a reader can find out why
+    before reading 52 degradations.
+    """
+    if lsp is None:
+        return "LSP 已被配置禁用"
+    usable, missing = lsp.installable()
+    note = "LSP 可用：" + (",".join(usable) if usable else "（无）")
+    if missing:
+        note += f"；目录中另有 {','.join(missing)}，但镜像未安装其语言服务器"
+    return note
 
 
 def _now() -> datetime:

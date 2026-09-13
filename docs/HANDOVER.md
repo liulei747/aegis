@@ -25,13 +25,13 @@ opengrep 命中位置
   → 组装分析包交给 AI
 ```
 
-**当前状态一句话**：上面这条流水线**端到端可跑、有 288 个测试、有 Docker 本地部署、有可观测台接口**；
+**当前状态一句话**：上面这条流水线**端到端可跑、有 338 个测试、有 Docker 本地部署、有可观测台接口**；
 AI 部分（威胁建模子代理、prompt 前缀缓存）**刻意没做**，但 bundle 的排版已经按「前缀可复用」设计好了。
 
 **新人第一天该跑的三条命令**（详见 §4）：
 
 ```powershell
-python -m pytest -q                                  # 286 passed, 2 skipped（2 个是引擎探测，见 §8）
+python -m pytest -q                                  # 395 passed, 12 skipped（见 §8 的构成说明）
 python scripts/demo.py                               # 本地跑一遍完整流水线（**先跑它，见下**）
 docker compose -f docker/docker-compose.yml up --build
 ```
@@ -125,26 +125,30 @@ run()
 | 服务拆分（scan / extract / gateway） | ✅ 完成并验证三跳链路 | `docker/docker-compose.yml`、`docs/SERVICE_TOPOLOGY.md` |
 | prompt 前缀契约（可复用前缀从哪开始） | ✅ 已修并加测试 | `ai/cache_prefix.json`、`tests/test_prompt_prefix.py`（§6.3） |
 | demo 夹具（`demo/repo` 进仓库） | ✅ 已提交并加防漂移测试 | `tests/test_demo_fixture.py`（§11.5） |
-| 前端观测台（`aegis-web`） | ✅ **已建成**：React + TS + nginx，自己的镜像与端口 | `services/web/`；`tests/test_web_contract.py`、`tests/test_compose_policy.py` |
+| 前端观测台（`aegis-frontend`） | ✅ **已建成并重做为独立部署**：静态镜像不反代任何东西，API 地址运行期注入 | `frontend/`；`tests/test_frontend_contract.py`、`tests/test_compose_policy.py` |
 | 任务队列 | ✅ **完成**（Redis Streams + worker + reaper + 真取消 + job 端点） | `docs/QUEUE_PLAN.md`；`services/queue/`、`aegis_contracts/jobs.py`、`app/api/jobs.py` |
 | 队列的可中断扫描 | ✅ 完成：`subprocess.run` → `Popen` + 轮询 + 具名 `scan_aborted` | `services/scan/opengrep.py`、`services/scan/runner.py`；`CanceledAbort` 继承 `BaseException` |
-| AI 分析（威胁建模子代理、prompt 缓存命中） | ❌ **刻意未做** | bundle 排版已按前缀复用设计，前缀契约已修 |
+| AI 分析（威胁建模子代理） | ❌ **刻意未做** | 数据流已能喂出结论（§10.20），缺口只剩"自动调用" |
+| **完整数据流（Joern）** | ✅ **已接入**：Joern 提供跨文件污点路径，替掉有"方向墙"缺陷的调用链爬取 | §10.20；`services/extraction/dataflow/`、`docs/DATAFLOW_CONTRACT.md` |
+| prompt 前缀缓存**真实命中率** | ✅ **已验证**：provider 计费字段证明命中 81–93%；但它只作用于输入（占总量 18–22%） | §10.21 |
 | `app/` 物理迁入 `services/extraction/` | ✅ **已完成**，并顺带解掉 `app ↔ services` 顶层环 | §11.4；`tests/test_contracts.py` 用 AST 钉住边数 |
 
-> **测试基线（本机实测，2026-09-11 21:45）**：`288 tests collected`。
-> 没有 Redis 时：**276 passed, 12 skipped**；起一个 Redis 后：**286 passed, 2 skipped**。
-> 另有前端自己的 4 条（`cd services/web && npm test`），由 `tests/test_web_contract.py` 转接。
+> **测试基线（本机实测，2026-09-12，前端重做后）**：`407 tests collected`。
+> 没有 Redis 时：**395 passed, 12 skipped**（实测）。
+> 起一个 Redis 后应为 **405 passed, 2 skipped** —— 这一行是**按跳过的 10 例推算的，本轮没有实测**，
+> 因为当前栈里有一个 worker 正在消费同一个 Redis，跑那些用例会动到它。
+> 另有前端自己的 19 条（`cd frontend && npm test`），由 `tests/test_frontend_contract.py`
+> 转接；设了 `API_URL` 时其中一条会额外比对线上 `/openapi.json`。
 >
 > ```powershell
 > docker run --rm -d -p 127.0.0.1:6379:6379 redis:7-alpine
-> python -m pytest -q          # 286 passed, 2 skipped
+> python -m pytest -q          # 405 passed, 2 skipped
 > ```
 >
 > 其中 10 例需要真 Redis，不是冗余：**fakeredis 与真 Redis 对空容器的 cjson 行为方向相反**，
 > 只跑 fakeredis 会让队列在第一次接触生产时崩掉（详见 §10.15）。
 > 两个 skip 是 `test_scanner_command.py:86` 的引擎二进制探测（本机无 opengrep / semgrep），
-> **不是失败**；装了引擎就是 125 或 126 passed。
-> 旧版这里写的「118 passed, 1 skipped」说的是装好 opengrep 的机器，同一个测试集。
+> **不是失败**。
 
 ---
 
@@ -373,17 +377,24 @@ total_chars / estimated_tokens
 
 ## 6. Prompt 排版顺序（**这是契约，改动会使缓存全部失效**）
 
-`services/extraction/assembler/render.py` 里 `PROMPT_VERSION = "2025-01-assemble-v1.1"`，块顺序固定为：
+`services/extraction/assembler/render.py` 里 `PROMPT_VERSION = "2025-01-assemble-v1.2"`，块顺序固定为：
 
 ```
 bundle.header            ← 非 cacheable（含 bundle_id 与总数），因此前缀不从这里开始
   → instructions.system  ┐
   → instructions.legend  │ 可复用前缀：前缀从这里开始
-  → instructions.chunking│
   → method_catalog       ┘
+  → fanout.plan            ← 非 cacheable：它列的是**本 bundle** 的 context 表
   → context.<id>          ← 从这里开始随 bundle 变化
   → run.notes
 ```
+
+**注意 `fanout.plan` 的位置**：它排在 `method_catalog` **之后**，因此不落在前缀里。
+它曾经叫 `instructions.chunking`、被标成 cacheable、排在 `method_catalog` 之前 ——
+那等于把一个逐 bundle 变化的表塞进"全版本稳定"的 `instructions.*` 里，前缀就成了假话。
+改名的同时换了位置，也换了 `cacheable=False`；`tests/test_prompt_prefix.py` 现在用一个
+**两个 sink 的工作区**来构造第二个 bundle（只差 `max_contexts` 的话 context 集合不变，
+这个缺陷会继续漏过去）。
 
 **为什么这么排**：AI 侧的 prompt 前缀缓存（用户提到的 IAI 式预填充加速）只对**完全相同的前缀**命中。
 把随 bundle 变化的内容全部压到后面，前缀就能跨 bundle 复用。
@@ -392,11 +403,12 @@ bundle.header            ← 非 cacheable（含 bundle_id 与总数），因此
 
 | 范围 | 包含什么 | 什么时候命中 |
 |---|---|---|
-| **全版本稳定** | `instructions.*`（3 块） | 任何两个 bundle 之间，只要 `PROMPT_VERSION` 没变 |
-| **同输入稳定** | `instructions.*` + `method_catalog` | 同一 workspace + 同一规则集跑出来的两个 bundle |
+| **全版本稳定** | `instructions.*`（2 块：`system` / `legend`） | 任何两个 bundle 之间，只要 `PROMPT_VERSION` 没变 |
+| **同输入稳定** | 上面 2 块 + `method_catalog` | 同一 workspace + 同一规则集跑出来的两个 bundle |
 
 `method_catalog` 属于第二种：它列的是**这次跑收集到的方法体**，工作区变了它就变。
 一次 fan-out（同一个包切给多个子代理）落在第二种里，所以它是真正被复用的那一层。
+`fanout.plan` 两种都不属于 —— 它是本 bundle 的派发说明，只排在上面前缀之后。
 
 ### 6.2 前缀从哪里开始，现在由产物明确声明
 
@@ -409,9 +421,8 @@ bundle.header            ← 非 cacheable（含 bundle_id 与总数），因此
 ```json
 {
   "prefix_start": 1,
-  "prefix_blocks": ["instructions.system", "instructions.legend",
-                    "instructions.chunking", "method_catalog"],
-  "stable_prefix_tokens": 1171,
+  "prefix_blocks": ["instructions.system", "instructions.legend", "method_catalog"],
+  "stable_prefix_tokens": 1038,
   "note": "Blocks before cache_prefix_start are volatile and must be sent per request. ..."
 }
 ```
@@ -419,19 +430,19 @@ bundle.header            ← 非 cacheable（含 bundle_id 与总数），因此
 **消费端的正确读法**：从 `prefix_start` 起、连续读到第一个 `cacheable=false` 为止，那就是可以
 预填充/打缓存标记的部分。不要按 `order == 0` 开始拼。
 
-实测（demo bundle，7 个块，约 1872 tokens）：
+实测（demo bundle `B-909bbbe468`，7 个块，1852 tokens）：
 
 | order | 块 | tokens | cacheable |
 |---|---|---|---|
-| 0 | `bundle.header` | 32 | ❌ |
+| 0 | `bundle.header` | 38 | ❌ |
 | 1 | `instructions.system` | 623 | ✅ |
 | 2 | `instructions.legend` | 119 | ✅ |
-| 3 | `instructions.chunking` | 133 | ✅ |
-| 4 | `method_catalog` | 296 | ✅ |
+| 3 | `method_catalog` | 296 | ✅ |
+| 4 | `fanout.plan` | 149 | ❌ |
 | 5 | `context.C-…` | 576 | ❌ |
 | 6 | `run.notes` | 89 | ❌ |
 
-稳定前缀 = **1171 tokens**（`prefix_start=1`），占这个小 bundle 的 **63%**；前缀大小基本恒定，
+稳定前缀 = **1038 tokens**（`prefix_start=1`），占这个小 bundle 的 **56%**；前缀大小基本恒定，
 所以 bundle 越大占比越高（demo 这种小 bundle 是最差情况）。
 
 ### 6.3 这一处曾经的真实缺陷（已修，别再犯）
@@ -481,51 +492,64 @@ fan-out 真正依赖的属性。加块、改块顺序、或让某个块混进随
 ## 8. 测试与验证
 
 ```powershell
-python -m pytest -q                    # 286 passed, 2 skipped（本机实测，见下面的说明）
+python -m pytest -q                    # 395 passed, 12 skipped（本机无 Redis，见下面的说明）
 python -m pytest -q -m slow            # 需要真实语言服务器子进程的 6 个（用假 LSP server）
 python -m ruff check .                 # lint（demo/ 已排除，见下）
 python -m pytest tests/test_observability.py -q
 ```
 
-> **那两个 skip 不是失败**：都是 `tests/test_scanner_command.py:86` 的**二进制探测**，
+> **那 12 个 skip 的构成**：10 例需要真 Redis（起一个 Redis 后变成
+> **336 passed, 2 skipped**），2 例是 `tests/test_scanner_command.py:86` 的**二进制探测**，
 > 本机没装 opengrep 与 semgrep 就各跳一个。装上任一引擎（或跑
-> `AEGIS_OPENGREP_BIN=<路径>`）会变成 287 passed、1 skipped 或 288 passed。
-> 交接文件旧版写的「118 passed, 1 skipped」对应的是**装了 opengrep 的机器**，
-> 不是另一个测试集 —— `--collect-only` 始终是 119（现在是 215）。
+> `AEGIS_OPENGREP_BIN=<路径>`）那 2 例会转成 passed，跳过数归零。
 >
 > `ruff` 在 `pyproject.toml` 里 `extend-exclude` 掉了 `demo/`：那是**被分析的代码**，
 > 不是我们的代码，它故意留着一个未使用的 import 和一处拼接 SQL。
+>
+> 注意仓库**没有跑 `ruff format`**（`ruff check` 的 `E501` 是 ignore 的），所以别把
+> 全仓 `ruff format` 当成"顺手修一下"——那会重排 40+ 个你没碰过的文件。
 
-测试文件分布（共 288 例）：
+测试文件分布（共 407 例；下表的例数是 `--collect-only` 实测，不是估计）：
 
 | 文件 | 例数 | 覆盖 |
 |---|---|---|
+| `test_dataflow.py` | 36 | ★数据流契约 + 接入：空流是答案、流不拍平、引擎坏了要留痕降级、sink 推导取 finding 自己的行、亲缘路由、worker 的 cold 语义与路径映射、**LSP 上溯选入口与回退**（§10.20） |
+| `test_queue_worker.py` | 32 | ★worker 与 reaper：阶段上报、具名失败、关停 vs 取消、**不误杀慢任务**、AI 作业按名字拒绝与"未配置仍成功"（§10.22） |
 | `test_queue_store.py` | 26 | ★Job 记录、状态迁移、CAS 拒绝陈旧写入、cjson 空表归一化 |
+| `test_ai.py` | 23 | ★AI 阶段：前缀/上下文切分、宽松解析（围栏/百分比/缺键）、重试策略、**失败即结果**、报告不写密钥（§10.22） |
 | `test_observability.py` | 22 | 漏斗同单位、来源直方图、diff |
+| `test_ai_api.py` | 4 | ★/analyze 与 /verdicts：不存在的包 404、未分析 404、关闭时如实回答、真跑一次并读回 |
+| `test_scan_stage.py` | 21 | 扫描阶段 + ★取消返回台账而不抛、`Popen` 句柄、argv 未变、杀到孙进程 |
 | `test_jobs_contract.py` | 20 | ★Job 契约往返、阶段↔漏斗映射、指纹稳定性与区分度 |
-| `test_scan_stage.py` | 19 | 扫描阶段 + ★取消返回台账而不抛、`Popen` 句柄、argv 未变 |
+| `test_jobs_api.py` | 19 | ★job 端点：202/200/409/503 边界、幂等提交、取消三态、同步路径不漂移 |
 | `test_queue_cancel.py` | 14 | ★Teardown 终止与幂等、`CanceledAbort` 穿过四处容错、LSP 轮询可中断 |
 | `test_read_stage.py` | 13 | 方法体读取、字符预算 |
+| `test_scan_jobs.py` | 13 | ★可轮询扫描作业：202 + 轮询 + `DELETE` 取消（真的杀得掉在跑的扫描） |
+| `test_compose_policy.py` | 15 | ★端口策略、依赖方向、worker 不委派提取、redis 不淘汰、**dataflow 集群规模与挂载一致**（机器断言） |
+| `test_dataflow.py` | 36 | ★数据流契约 + 接入：空流是答案、流不拍平、引擎坏了要留痕降级、sink 推导取 finding 自己的行、亲缘路由、worker 的 cold 语义与路径映射、**LSP 上溯选入口与回退**（§10.20） |
 | `test_queue_streams.py` | 11 | ★Streams 路由字段、`id="0"` 读历史、pending 与陈旧认领 |
-| `test_assemble_stage.py` | 10 | 组装阶段 |
+| `test_assemble_stage.py` | 10 | 组装阶段、裁剪（`region_line` 故意落在任何方法之外） |
 | `test_contracts.py` | 10 | 数据契约 + ★AST 架构守卫（`services -> app` 边数必须为 0，见 §11.4） |
 | `test_pipeline_observer.py` | 10 | ★阶段事件顺序与计数、abort 边界、staging 写入、不 import 队列包 |
-| `test_scan_transport.py` | 9 | 本地 / 远程两种传输 |
-| `test_sarif.py` | 9 | SARIF 解析、路径重定位 |
+| `test_sarif.py` | 10 | SARIF 解析、路径重定位、★region 必须指向它引用的那一行（§10.19 A） |
+| `test_scan_transport.py` | 10 | 本地 / 远程两种传输 |
 | `test_syntax_and_lsp_types.py` | 8 | 位置编码、LSP 类型 |
 | `test_scanner_command.py` | 8 | argv 组装（防引擎参数混用）；其中 2 例按二进制存在与否 skip |
 | `test_assembler.py` | 7 | 打包、去重 |
 | `test_api.py` | 6 | 路由 |
 | `test_pipeline_lsp.py` | 6 | 端到端 LSP（`slow` 标记） |
-| `test_jobs_api.py` | 19 | ★job 端点：202/200/409/503 边界、幂等提交、取消三态、同步路径不漂移 |
-| `test_queue_worker.py` | 28 | ★worker 与 reaper：阶段上报、具名失败、关停 vs 取消、**不误杀慢任务** |
-| `test_queue_real_redis.py` | 5 | ★真 Redis：Lua CAS、cjson 双向空容器、Streams 认领（无服务器时 skip） |
-| `test_queue_end_to_end.py` | 6 | ★提交 → worker → 磁盘上的 bundle（真 Redis，无服务器时 skip） |
-| `test_compose_policy.py` | 12 | ★端口策略、依赖方向、worker 不委派提取、redis 不淘汰（机器断言） |
-| `test_web_contract.py` | 3 | ★转接前端的 4 条测试 + 构建产物里没有绝对 origin |
-| `test_prompt_prefix.py` | 4 | ★prompt 前缀契约：连续性、起点声明、跨 bundle 逐字节稳定（§6.3） |
+| `test_prompt_prefix.py` | 6 | ★prompt 前缀契约：连续性、起点声明、跨 bundle 逐字节稳定（§6.3） |
+| `test_queue_end_to_end.py` | 6 | ★提交 → worker → 磁盘上的 bundle（真 Redis，无服务器时 5 例 skip） |
+| `test_queue_real_redis.py` | 5 | ★真 Redis：Lua CAS、cjson 双向空容器、Streams 认领（无服务器时 5 例 skip） |
 | `test_demo_fixture.py` | 3 | ★`demo/repo` 必须已提交、与 fixture 逐字节一致、`write_fixture` 幂等（§11.5） |
-| **合计** | **288** | 本机：无 Redis 276 passed/12 skipped；有 Redis 286 passed/2 skipped |
+| `test_frontend_contract.py` | 3 | ★转接前端的测试（HTTP 契约 + 算术前端自算）+ 构建产物里没有 API origin |
+| `test_traffic_settings.py` | 11 | ★环形缓冲（回绕/排序/count）、读日志不写日志、404 被记录、settings 形状、密钥只出现变量名、CORS 可配 |
+| **合计** | **407** | 本机：无 Redis **395 passed / 12 skipped**（实测）；有 Redis 按跳过数推算 **405 / 2** |
+
+> 12 个 skip 的构成（实测，不是"大概"）：**10 例需要真 Redis**
+> （`test_queue_real_redis` 5 + `test_queue_end_to_end` 5）、**2 例是引擎探测**
+> （`test_scanner_command.py:86`，本机没有 opengrep 与 semgrep）。装上任一引擎后
+> 那 2 例会转成 passed。
 
 **`tests/fake_lsp_server.py` 值得单独说**：一个**零依赖**的假语言服务器，
 实现了 `documentSymbol` / `definition` / `references` / `implementation` / `callHierarchy`。
@@ -679,6 +703,570 @@ GET  :8100/v1/jobs/J-8530…             → 6 秒后 succeeded
 `scan` 阶段 11.2 秒而本地就地扫描是 1 ms，说明**确实委托给了 scan 容器**（HTTP + 冷启动
 opengrep）；这是 §3 那个环境变量生效的直接证据。
 
+### 10.18 队列的失败/中断路径：实测数字与两个真被修掉的缺陷（2026-09-11）
+
+四条路径在真容器里各跑了一遍，**其中两条第一次跑就发现实现是错的**。
+
+#### 取消（缺陷，已修）
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 取消 → 终态 | **131 秒** | **0.85 秒** |
+| 取消后残留的 opengrep 进程 | 1 个（`opengrep-core` 在烧 CPU） | **0** |
+| scan 容器 CPU | 640% | **0.12%** |
+
+两个独立成因：
+
+1. **`httpx.post` 是一次阻塞调用**（`services/scan/client.py`）。worker 在整段扫描里回不到
+   主循环，所以既看不到自己的取消请求，也刷不了心跳。改成**可轮询的扫描作业**
+   （`services/scan/jobs.py`：`POST /v1/scan/jobs` → 202 + id、`GET` 轮询、`DELETE` 取消），
+   服务端持有 `Popen` 句柄，所以「后来的一个 HTTP 请求」能杀掉「已经在跑的扫描」。
+   文档 §6.5.3 原本承诺的"本端 ≤2s"从未实现，现在是真做到了。
+2. **只杀直接子进程，孙进程活下来**。opengrep 是个启动器，干活的是 `opengrep-core`。
+   `terminate_tree` 在 POSIX 上只做 `terminate()→kill()`，`taskkill /T` 那支因为
+   `os.name == "posix"` 根本不走 —— 于是**所有可观测信号都说取消成功了，CPU 还在烧**。
+   修法：`Popen(start_new_session=True)` + `os.killpg()`，信号打到整个进程组。
+   回归测试在 `tests/test_scan_stage.py::test_terminating_a_scan_reaches_its_grandchildren`。
+
+#### 优雅关停（正确）
+
+`docker compose stop worker` 中途：job 回到 **`queued`**（不是 canceled）、
+`cancel_requested=false`、`attempt` 仍是 1、进度保留、对端扫描被取消（0 残留），
+重启后**同一个 attempt** 被新 worker 接手。日志：`job … returned to the queue for a restart`。
+
+#### worker 崩溃（缺陷，已修）
+
+第一次测：`docker kill` worker 后，job **在 `running` 停留了 2 分钟以上**，而启动自检
+报告 `running: 1` 却什么都没做。原因是我的 `_reconcile_running` 里写了
+`if heartbeat_age < visibility_timeout_s: return` —— 而方案 §6.3 明确要求这一层
+**不依赖那个时钟**（默认 1800 秒，所以它实际上永远不会触发）。
+
+修法：把判据从「心跳多新」换成「**那个 worker 还在不在**」
+（`_worker_is_alive`：查 `aegis:queue:worker:{worker_id}` 这个存活键）。
+因为慢任务**不会**停止 worker 的心跳，所以这个判据不会误杀慢任务。
+
+**实测的恢复时限**（比我原先以为的长，如实记下）：
+
+```
+worker 被杀 → 它的存活键 TTL 到期（max(heartbeat*4, 60) = 60s）
+            → 下一个 worker 启动时的自检把它救回 queued（attempt 不变）
+```
+日志证据：`reclaimed job J-618… at startup (worker efa78cca6774:1:96ba gone, heartbeat age 162s)`。
+
+所以第 1 层的真实语义是「**至多一个存活键 TTL**」，不是"秒级"。
+注意 `docker kill` 会让容器停在那里（`Exited (137)`），**不会自动重启** ——
+`restart: unless-stopped` 由编排器在容器退出时执行，`docker kill` 之后我实测到
+`aegis-worker | Exited (137) 2 minutes ago`，是我手动 `up -d worker` 才回来的。
+也就是说：**没有 worker 就没有 reaper**（§6.3 第 3 层那条已知静默窗口），
+生产上必须有编排器保证 worker 会回来。
+
+#### 一个部署建议
+
+`AEGIS_QUEUE__VISIBILITY_TIMEOUT_S` 默认 1800 秒，即一个死掉的 job 最多可以被
+"合法地"留在 running 半小时。它与"最长任务时长"应该同量级，建议设为**最长任务的
+2–3 倍**并在 `.env` 里显式写出来，不要靠默认值。
+
+---
+
+### 10.19 "数据能不能直接喂给 AI"审计出的两处缺陷（2026-09-11，均已修）
+
+为了回答"当前产物是不是已经能直接喂给模型"，逐字读了 `ai/prompt.md` 并与真实源码核对，
+**两处都在"看起来完全正常"的地方**：
+
+#### 缺陷 A：示例 SARIF 的行号与它自己引用的片段不符
+
+`demo/scan.sarif` 里 `startLine` 是**在 `write_sarif()` 里硬编码的 5**，紧挨着一个同样硬编码的
+`snippet`。夹具后来在前面加了 docstring 和两个空行，片段移到了第 6 行，**数字没动**。于是：
+
+```
+demo/scan.sarif: startLine=5, startColumn=12, snippet='sql = "SELECT ..."'
+demo/repo/repo.py:5 → '    cursor = connect()'     ← 声称的位置
+demo/repo/repo.py:6 → '    sql = "SELECT ..."'     ← 片段真正所在
+```
+
+**为什么一直没被发现**：`tests/test_sarif.py` 与 `tests/test_scan_stage.py` 只断言了
+`region.start_line == 4`（5→4 的 base 转换），而**转换本身是对的**，所以两个数字
+"互相证明"了对方。错的行号一路进到 `demo/scan.sarif` → bundle → 每一个 prompt：
+模型被告知"at repo.py:5"，而片段在第 6 行。
+
+**修法**：`tests/fixtures.py::sink_line_in_fixture()` 从夹具源码里**推导**出 sink 行，
+使行号与片段不可能再分家；`write_sarif()` 的 region 默认用推导值，需要故意摆位置
+（比如放在任何方法之外）的测试改用新的 `region_line=` 参数显式表达意图
+（`tests/test_assemble_stage.py::_sarif_with_two_contexts` 就是这种，它靠"落在方法外"
+才产生 prune 和 alias）。回归测试：`tests/test_sarif.py::test_the_sample_sarif_points_at_the_line_it_quotes`。
+
+> 该测试断言的正是过去缺失的那件事：**region 指向的那一行必须真的包含它引用的片段。**
+
+#### 缺陷 B：fan-out 表的 `approx tokens` 少报约 5 倍
+
+`fanout.plan` 的表给每个 context 报一个 token 数，取值是
+`AssembledContext.estimated_tokens`。而这个字段在 `contexts.py` 里只累加
+**内联方法体 + 调用点片段**：
+
+```python
+context.estimated_tokens = estimate_tokens("\n".join(b.text for b in inlined.values())) \
+                         + estimate_tokens("\n".join(e.call_site_snippet for e in context.edges))
+```
+
+它**不含** context 标题、`### Static-scan findings` 段、`refs` 调用链段、`### Edges` 段。
+实测同一个 context：表里 **120**，真实渲染出来的块 **576 —— 4.8 倍**。而这张表存在的
+全部意义就是让调用方按它给子代理分配预算，所以这是最不该出错的一个数字。
+
+**修法**：`BundleRenderer.render()` 先把渲染好的 context 块收集成
+`{context_id: tokens}` 传给 `_chunking_plan()`，表里报**真实块体积**；列名从
+`approx tokens` 改成 `block tokens`。`summary.md` 里那张同源的表同样改用
+`bundle.prompts` 里的块体积。`estimated_tokens` 本身保留（它是"可读载荷"的下界），
+但不再冒充交付体积。
+
+> 教训与 §6.3 同源：**同一个量有两个出处时，一定有一个是错的。** 表的数字必须来自
+> 真正被打包和发送的那个对象（`PromptBlock.estimated_tokens`），不能来自渲染前的中间字段。
+
+### 10.20 完整数据流：用 Joern 替掉有"方向墙"缺陷的调用链爬取（2026-09-11）
+
+这是**这一轮最重要的结构性修正**，它来自一个具体缺陷，而不是"想更精确一点"。
+
+#### 缺陷回顾：`builder.py` 的方向墙
+
+`services/extraction/graph/builder.py` 的 BFS 从焦点出发，向上走 caller、向下走 callee，
+但**节点被哪个方向发现，就只沿那个方向继续走**：
+
+```python
+# 发现节点时把方向固化
+queue.append((symbol, depth + 1, direction))
+# 出队时按这个方向决定问谁
+if direction is EdgeDirection.CALLER:
+    neighbours = self.resolver.callers(method)   # 只问"谁调用它"
+else:
+    neighbours = self.resolver.callees(method)   # 只问"它调用谁"
+```
+
+后果（实测，用 `var/variants3/` 四个算例 + LSP 提问日志确认）：
+
+| `clean()` 被谁调用 | 收到了吗 | 怎么进来的 |
+|---|---|---|
+| sink 自己 | ✅ | `callees(sink)` |
+| sink 的**直接调用者** | ❌ | `callees(handle)` **从未被问过** |
+| 入口（再上一层） | ❌ | 从未被问过 |
+| 兄弟分支 | ❌ | 从未被问过 |
+
+**而且没有任何 prune 记录这件事** —— 包看起来是完整的。
+
+最严重的实例就是 demo：`handle_request` 调用 `safe_escape`（`util.py:4`，真的在做
+`'` → `''` 转义），它是决定这条 SQL 注入成不成立的**唯一**函数，却不在包里。模型因此
+只能答 `needs_more_context`。
+
+**关键证据**：同一批算例上，语言服务器**明确答得出** `callees(handle_request) ->
+['safe_escape', ...]`。信息一直在，只是没人问 —— 但这不是"提问方式错了"能概括的：
+**别名、动态派发、跨文件这些是能力边界，爬取怎么调参都到不了。**
+
+#### 修法：让 Joern 给完整数据流，判断权交给模型
+
+```
+opengrep  找告警（不变）
+   ↓
+Joern     reachableByFlows：从不可信输入到 sink 的完整路径（跨文件）
+   ↓
+Aegis     把路径上每个方法的全文附进包（reader 已有）
+   ↓
+AI        判断"路径上的转换是否足够"
+```
+
+**为什么不让 Joern 判"清洗够不够"**：`safe_escape` 是项目自定义函数，形式化引擎默认
+当普通函数 —— 实测把清洗版与未清洗版的包给 Joern，它 `reachableByFlows` **返回相同的
+流**。判断"够不够"需要业务知识，是模型的活。我在这上面卡了 6 次（猜 `Semantics` /
+`FlowSemantic` 的工厂方法都失败），最后放弃声明 sanitizer，改用"给流 + 给全文"。
+
+#### 落地
+
+| 文件 | 作用 |
+|---|---|
+| `docs/DATAFLOW_CONTRACT.md` | **字段级契约**（从真实输出定稿，不是设计稿） |
+| `aegis_contracts/dataflow.py` | `FlowElement` / `TaintFlow` / `FlowBundle` / `FlowMethodBody` |
+| `services/dataflow/worker.py` | worker 核心：常驻 Joern server（本地子进程）、CPG 缓存、流查询、sink 推导 |
+| `services/dataflow/worker_app.py` | worker 的 HTTP 面：`POST /v1/query`、`GET /health` |
+| `services/dataflow/router.py` | 亲缘路由：`worker_for(workspace, N)`，内容哈希取模，纯函数 |
+| `services/dataflow/Dockerfile` | worker 镜像：Joern 基底 + Python 3.9 supervisor |
+| `services/extraction/dataflow/client.py` | 调用方：算亲缘 → HTTP；方法正文在本地拼装 |
+| `services/extraction/graph/builder.py` | `build()` 改为分发器：有 dataflow 走流，否则走爬取 |
+| `docker/docker-compose.yml` | `dataflow-0` / `dataflow-1` 两个 worker 服务 |
+| `aegis_core/config.py` | `DataflowConfig`（**默认关**，需要 JVM + 镜像；**没有 `sink` 旋钮**） |
+| `tests/test_dataflow.py` | 23 条，用 stub 替代 JVM |
+
+三个设计决定值得记住：
+
+1. **空流是答案，不是失败**。参数化查询实测 `flow=0` —— 引擎**证明**了值到不了 sink。
+   失败会 `raise`，空流返回 `FlowBundle(flows=[])`。把两者混起来会把"已修复"说成"分析坏了"。
+2. **流不能拍平**。拍平后看起来像"一条路重复自己"，所以契约是 `flows: list[TaintFlow]`
+   而不是一个元素数组。
+   > 当时的证据是 demo 返回 **2 条**独立路径（16 和 20 个元素）。**2026-09-12 起不再复现**：
+   > 四种锚点形式各跑一遍，全部只有一条 20 元素、跨 4 文件的流。形状仍然必须支持，但
+   > "demo 有两条"已经是一段记忆 —— 见 `docs/DATAFLOW_CONTRACT.md` §4 第 1 条。
+3. **引擎坏了要降级且留痕**。`dataflow_unavailable` prune 记录原因，然后回退到爬取 ——
+   绝不能把"JVM 挂了"表现得像"没找到路径"。
+
+#### 实测数字
+
+| 项 | 值 |
+|---|---|
+| 建 CPG（demo，4 文件） | **2.3 秒**；查询一次 JVM 约 **8 秒**（`--server` 常驻可摊薄到 ~1 秒/次） |
+| 首请求（新容器：起 server + 建图 + 推导 + 查询） | **≈16.6 s**（server 启动就占 11.3 s） |
+| WARM 请求（server 与图都常驻） | **≈2.1 s**（推导 1.0 + 查询 1.0） |
+| 两个 worker 并行（同项目、两查询） | **1.99× 加速**（wall 2.1 s，串行 4.2 s） |
+| Python 前端 | 纯语法解析，**不需要项目能编译、不需要装依赖** |
+| 参数类型 | 全是 `ANY`（无类型推断）；装饰器 / `getattr` / 动态派发看不穿 |
+| 镜像 | 5.92GB，需要 JVM；每个 worker 一个常驻 JVM |
+
+> **读数字的坑（记账）**：最初把 `elapsed_s`（只是流查询那一段）当成"请求成本"，于是
+> warm 记成 1.0 s（实际 2.1 s）、首请求记成 4.4 s（实际 16.6 s）。worker 现在一次返回
+> `start_s` / `load_s` / `sink_elapsed_s` / `elapsed_s` 四个数与它们的和 `total_s`。
+> 这个错误也污染过 `var/joern/test_fleet.py` 的第一版 —— 它打印"wall 2.1 s，各 worker
+> 报的耗时之和 2.0 s"，把"看起来串行了"当成结论，而其实是**每个 worker 的耗时少算了
+> 推导那一段**。重写后它实测并行加速 1.99×，并且 verdict 会真的去比这个比值。
+
+#### 验收结果（`var/joern/acceptance.py`）
+
+```
+methods (4): handle_request, load_user, query_user, safe_escape      ← 之前只有 3 个
+Call chain slice: - d9 ^ safe_escape (util.py:4-5) [joern_dataflow]
+prunes: dataflow_multiple_paths: 引擎返回 2 条独立路径，全部包含
+prompt 里有 def safe_escape: True
+```
+
+> 上面这段是**当时的**输出，`prunes: dataflow_multiple_paths` 一行现在已经不会出现（那条
+> 路径不再复现，原因见上）。2026-09-12 重跑，改成走集群后的实际结果：
+>
+> ```
+> 冷启动（刚清空 cpg/ 并重启 worker）: 14.6s   methods 4 个，files 4 个  prunes 无
+> 温请求（worker 常驻）              :  2.2s   methods 4 个，files 4 个  prunes 无
+>   PASS  safe_escape collected / sanitizer body in prompt / transformation visible
+>   PASS  joern_dataflow labeled / flow crosses files
+> ```
+>
+> 那 2.2 s 是**穿过整条流水线**测到的，与 `test_fleet.py` 在 worker 层测到的 2.1 s 一致 ——
+> 两个独立测量相互印证，说明编排本身没有额外开销。
+
+#### 判别力验证（`var/joern/RESULTS.md`）
+
+同一个调用链、同一个 sink，**只改清洗函数的实现**：
+
+| 清洗函数 | verdict | severity | confidence |
+|---|---|---|---|
+| `return value.replace("'", "''")` | true_positive | high | 0.60（并指出取决于 DB 驱动） |
+| `return v`（空操作） | true_positive | **critical** | **0.97** |
+| 反斜杠+单引号都处理 | **false_positive** | informational | 0.95 |
+| 参数化查询 | **无流**（Joern 直接报 flow=0，不用调用模型） | — | — |
+
+模型从"我不知道这个清洗函数是什么"前进到"它只处理了一个字符，够不够取决于 DB 驱动"。
+**这是"数据够不够"的直接证据。**
+
+#### 锚点：sink 不必再配置（同日补做）
+
+初版把 source/sink 都做成配置项。**这是偷懒** —— finding 自己就说了规则在哪一行命中。
+
+**2026-09-12 又往前走了一步：`sink` 配置旋钮被删掉了**。第一版只是让"配置优先"退位，
+旋钮还在，等于留了一条"把答案写进部署"的路。现在的解析顺序是：
+**调用方显式给（HTTP 字段，pipeline 从不发）→ 否则从 finding 位置推导 → 都没有就如实
+报告、不猜**。`derive_sink_from_finding` 这个开关也一并删了：它默认开，关掉只会让
+`sink_anchor` 变空，没有第二种合理行为。
+
+推导规则：在包含 finding 的方法里，取 **finding 行及之后第一个非 operator 调用**。
+operator 必须排除，因为 finding 通常报在**构造**那行（`sql = "..." + x`），而 sink 在
+**执行**那行。实测：
+
+```
+repo.py:6（真实 finding；该行只有 <operator>.addition/.assignment）
+      -> 推导出 execute（第 7 行）✓
+repo.py:7（sink 行本身）  -> execute ✓
+service.py:7（无关行）     -> query_user ✓
+```
+
+**为什么不能直接从 opengrep 规则读 sink**：实测 demo 的 `scan/original.sarif` 里，
+rule 只有 `id / shortDescription / defaultConfiguration / properties{tags}`，result 只有
+`ruleId / level / message / locations{fingerprints, region}` —— **SARIF 不携带 source/sink
+语义**。真正的 sink 声明在规则源文件的 `pattern-sinks:` 里，而
+`services/scan/opengrep.py:189` 也注明 `--sarif` 模式下不加 `--metrics`（semgrep 专有）。
+从规则读 sink 需要自己实现规则解析，属将来的事（`docs/DATAFLOW_CONTRACT.md` §9 记着）。
+
+推导是启发式，所以契约记录 `sink_derived_from` / `sink_derivation_method` /
+`sink_derivation_alternatives` —— **出处必须能复查**。
+
+#### 两个真 bug（都是实测抓出来的）
+
+1. **空锚点匹配一切**：`anchored("")` 让查询变成"每个调用到每个调用"而爆掉。查询里加
+   `if (needle.isEmpty) Nil`，且调用方在没有 sink 时**根本不发起查询**。
+2. **传错了行号**：最初把**焦点方法的起始行**（`query_user` 的第 4 行）传给推导，于是它
+   选中第 5 行的 `connect` 而不是 finding 第 6 行对应的 `execute`。必须传 **finding 自己的行**。
+
+#### 三种"没有流"必须分清
+
+| 情形 | 表现 | 含义 |
+|---|---|---|
+| 引擎证明无路径 | `flows=[]` 且 `sink_anchor != ""` | 代码安全，**不要调用模型** |
+| 没有 sink 可查 | `flows=[]` 且 `sink_anchor == ""` | **我们不知道要找什么** —— 配置缺口 |
+| 引擎失败 | 抛异常 | 记 `dataflow_unavailable`，降级爬取 |
+
+后两者混起来，会把**配置缺口**说成**健康报告** —— 所以 builder 产生不同的 prune：
+`dataflow_sink_unresolved` vs `dataflow_no_path`，`tests/test_dataflow.py` 各有断言。
+
+#### 仍未做
+
+- **source 仍是配置项**（`AEGIS_DATAFLOW__SOURCE`）。它不像 sink 有位置可依：finding 说的是
+  "危险发生在哪"，不是"不可信输入从哪进来"，那需要规则语义或框架知识。
+- **未从规则源文件读 `pattern-sinks`**（见上）。
+- **推导候选多于一个时未降级**：现在取第一个并记录其余候选，正确做法应是要求人工确认。
+- **`attach_bodies` 没被流水线消费**：正文仍由 `MethodReader` 从 `MethodSymbol` 读
+  （两条路读到同样的字节），属重复。
+- **未接进 prompt 渲染器**：`render.py` 只多了 provider 图例行；拼装样例在
+  `var/joern/ask_with_dataflow.py`（做成一个 block 是下一步）。
+
+#### 2026-09-12 收口：从"进程内直连"改成 worker 集群
+
+初版有三套重叠实现：`services/dataflow/{app,runner}.py`（一次性容器的 HTTP 服务）、
+`services/extraction/dataflow/joern.py`（进程内直连，流水线真正走的那条）、以及
+`var/joern/` 里的一堆脚本。三者都要维护，且流水线走的偏偏是最慢、最不可控的那条。
+现在只剩一套：
+
+```
+extract / worker 容器                       dataflow-N 容器
+  WorkerDataflowClient                        worker_app (FastAPI)
+    算亲缘 worker_for(workspace, N) ──HTTP──▶   JoernWorker
+    收 FlowBundle ◀──────────────────────────    └─ joern --server（本地子进程，常驻）
+    方法正文在本地读（字节即源码）                 ├─ 共享 CPG 缓存 cpg/<digest>/cpg.bin
+                                                  └─ 各自 scratch worker-<index>/
+```
+
+删掉的：`services/dataflow/app.py`、`services/dataflow/runner.py`、
+`services/extraction/dataflow/joern.py`（拉一个容器跑 `joern --script`，每次查询一个新 JVM）。
+
+**三个值得记住的决定**：
+
+1. **Joern 是 worker 容器里的本地子进程，不是兄弟容器。** 曾经用 `docker run` 起一次性
+   容器，必须在 worker 进程里挂 docker socket —— 那等于把宿主机 root 交给一个跑在容器里
+   的进程，而且容器内的 workspace 路径和宿主路径不一致，还得做路径翻译。改成子进程后两个
+   问题都消失，也少了一次容器启动（约 1 秒/次）。
+2. **每次查询不再是新 JVM。** `joern --server` 常驻 + `importCpg` 让图留在会话里：查询从
+   约 8 秒降到约 1 秒。代价是**同一 worker 内串行**（一个会话不能同时回答两个查询），所以
+   并行靠 worker 数量。实测 2 worker 并行查询加速 **1.99×**。
+3. **亲缘是算出来的，不是发现出来的**：`worker_for(workspace, N) = 内容哈希 % N`。纯函数，
+   跨进程稳定，不需要注册表；代码一变哈希就变，旧 worker 下次请求时自然换项目。
+   **每个 worker 挂同一个 `/workspace`**：算错只是慢一点，而不是路由到看不见路径的容器
+   上 404（详见 `docs/DATAFLOW_CONTRACT.md` §8 的说明）。
+
+**镜像**：`services/dataflow/Dockerfile` 以 Joern 官方镜像为基底（AlmaLinux 9，**自带
+Python 3.9**），只补几个 wheel，不装第二个 Python。代价是项目声明的 `requires-python
+>=3.10` 在容器里不成立，所以 `pip install .` 不可用，依赖按名字装、源码走 `PYTHONPATH`，
+并且**必须装 `eval_type_backport`** —— 否则 pydantic 无法求值 `X | None` 注解，import 就炸。
+这是全仓唯一一处这样的偏离，写在 Dockerfile 头部了。
+
+**验收**：`var/joern/test_fleet.py`（2 容器、14 项断言全过）覆盖亲缘稳定性、cold/warm
+四段耗时、并行加速比、共享 CPG + per-worker scratch。注意它的**第一版是假通过** ——
+verdict 没有真的去比并行加速比，却在打印"sum of worker times"；重写后比值不过就 FAIL。
+
+**它第一次真跑就抓出一处缺陷，而且是它自己抖出来的**：有一轮"warm 不该付载入成本"红了。
+原因不是 worker 坏了，而是 `_load` 每个请求都会**重算整个工作区哈希**（4 文件夹具
+0.7 ms，**本仓 107 个文件 401 ms**），于是"warm 的载入成本 ≈ 0"在真实仓库上不成立。
+断言已改成与 cold 对比（要测的是"没有重新 import"），缺陷本身记进
+`docs/DATAFLOW_CONTRACT.md` §9 第 4 条 —— **每次查询都要付一遍 O(项目规模) 的哈希**，
+方向上给了三个可选修法，都还没做。
+
+#### 端到端跑起来才暴露的三个集成缺陷（2026-09-12，均已修）
+
+单元测试和 worker 级验收全绿的时候，`var/joern/acceptance.py`（流水线 → HTTP → worker）
+仍然一次都没成功过。三个缺陷都是"两边各自正确、接口处错"的类型，只有端到端能看到：
+
+1. **`health()` 要求 `status == "ok"`，而刚起来的 worker 答 `cold`。** worker 是在**收到请求
+   时**才拉起 Joern server 的，所以 `cold` 的意思是"我在这儿，第一次会慢 11 秒"。探针把它
+   当成"不可用"，于是流水线**静默降级到爬取** —— 包照样产出、`safe_escape` 照样缺席、只有一条
+   warning。这与 compose 的 healthcheck 直接矛盾（`curl -fsS /health` 对 `cold` 是 200）。
+   现在 `cold` 算可达，理由写在 `client.health()` 的 docstring 里。
+2. **客户端发的是宿主路径，容器里根本没有这个路径。** 报错很干脆：`workspace not found:
+   E:\vib coding\aegis\demo\repo`。compose 里两边都挂 `/workspace`，所以生产路径一直是对的 ——
+   但"路径必须一致"这件事以前只是**口头契约**，任何在 compose 之外跑的调用方都会撞上。新增
+   `DataflowConfig.worker_workspace`：显式声明"worker 那边这个工作区叫什么"，方法正文仍从
+   本地路径读。
+3. **删掉正在运行的 worker 的缓存目录会把它弄坏**。原脚本的"清空缓存"会 `rmtree` 掉
+   `var/dataflow`，而它被 bind-mount 进容器，并且 `worker-<index>/` 正是 worker 里 Joern
+   进程的**工作目录**。宿主删掉之后，容器里那个路径变成幽灵：`mkdir(parents=True,
+   exist_ok=True)` 抛 `FileExistsError: File exists`，而 `is_dir()` 同时是 False —— 表面症状
+   是一个不带原因的 HTTP 500。**正确做法是停掉 worker 再清 `cpg/`**，两个验收脚本现在都
+   不碰缓存，并把原因写在原地。
+
+**结论**：worker 级验收（`test_fleet.py`，14 项断言）证明不了插件链是通的。`acceptance.py`
+这一层不可省 —— 它现在冷启动 14.6 s、温请求 2.2 s，与 worker 级测得的 2.1 s 相互印证。
+
+---
+
+### 10.22 AI 阶段接线：从脚本变成服务，并第一次拿到真判决（2026-09-12）
+
+`JobKind.AI_FANOUT` 之前在 worker 里直接 `NotImplementedError`。现在它是真的：契约
+（`aegis_contracts/ai.py`）、配置（`AIConfig`，`AEGIS_AI__*`，**默认关**）、服务
+（`services/ai/{blocks,client,parse,runner}.py`）、队列作业、两个 HTTP 端点
+（`POST /v1/bundles/{id}/analyze`、`GET /v1/bundles/{id}/verdicts`）都齐了，
+`scripts/feed_ai.py` 改成服务的薄 CLI —— **同一份实现**，不是第二份。
+
+字段级契约、决策理由、实测数字都写在 **`docs/AI_STAGE.md`**，这里只留四条最要紧的：
+
+1. **密钥只存名字。** `api_key_env` 是"环境变量叫什么"。服务只读环境；CLI 额外支持 `.env`
+   （checkout 不是容器）。用**真密钥**扫过整个包：0 次出现。
+2. **模型失败是结果，不是异常。** 每次调用都记档（含原始回答到 `ai/answers/<context>.md`）。
+   一个 504 不能吞掉"其他上下文答对了"这个事实，也不能看起来像"模型说没问题"。
+3. **每个 context 一次调用。** 前缀（指令+图例+方法目录）作为 system，跨同工作区的包逐字节
+   相同 —— 这就是 provider 端缓存能命中的前提。
+4. **`concurrency` 默认 1。** 实测：某网关 ~60 s 硬顶下，6 并发只回 3 个可用答案，6 串行回 6 个。
+
+**实测（demo 包 `B-af99db8f80`，单 context）**：
+
+| 模型 | 结果 |
+|---|---|
+| `glm-5.3-flash`（`.env` 原值） | **HTTP 504，每次约 67 s，3 次全败** |
+| `deepseek-v4-flash` | **33.2 s，可用判决**；`cached=2048/2320（输入的 88%）` |
+
+两个都是推理模型，推理占了输出的大头（`completion=3848`，其中 `reasoning_tokens=2930`）。
+**约 60 s 的网关硬顶因此成为选模型的约束**，调大客户端 `timeout_s` 没用（504 是网关发的）。
+所以 `.env` 的 `MODEL` 换成了 `deepseek-v4-flash`，并把这条测量写在旁边。
+
+判决本身（demo 的 SQL 注入）：`true_positive / high / 0.8`，数据流逐跳引用了
+`request.args.get('id') -> safe_escape -> load_user -> query_user -> cursor.execute(sql)`。
+两点值得注意：
+
+- 它**用上了我们新加的溯源信息**：指出 `Controller.dispatch` 是 `syntax_regex` 定位的、
+  不是数据流引擎给的，并在 `missing` 里要求提供"证明 dispatch 对外暴露"的路由注册 ——
+  也就是我们讨论过的 dispatch/handle_request 那个问题，这次由模型自己提出来了；
+- 它要求 `connect()` 的定义/import 来判断 DBMS，因为 MySQL 的反斜杠转义会让单引号双写失效。
+
+顺带把那个从 §10.19 就记着、一直咬人的 **SARIF 外来绝对路径缺陷**修掉了：根因是
+`_candidate_suffixes()` 的候选里**永远不含裸文件名**（`range(1, len(parts)-1)`），所以
+"工作区根就是文件所在目录"这一最常见情形永远匹配不上；`file:///E:/.../repo.py` → 不存在的
+`vib coding/...` → 每条 finding `locate_failed` → **0 方法而 run 报成功**。修法是最后才试
+裸文件名、且**只在其唯一时**接受（发现第二个同名立刻放弃，扫描有预算上限）—— 宁可定位失败，
+也不把 finding 挂到错误的文件上。
+
+#### 接进运行中的栈，又抓出四个只有端到端才看得见的缺陷（同日）
+
+代码写对了不等于接上了。第一次真调 HTTP 端点，接连四个问题：
+
+1. `_job_request()` 直接读 `rules`/`rule_config`/globs，而 `AnalyzeRequest` 没有这些字段 →
+   **500**。同步路径不经过这个函数，所以带假传输的路由测试全绿也照样漏。改成全部 `getattr`。
+2. **`POST /v1/assemble` 只要配了队列就 500** —— 这是**早就存在**的线上缺陷：路由声明
+   `response_model=AssembleResponse`，而队列分支返回 `JobAcceptedResponse`，FastAPI 会拿返回值
+   去校验模型。compose 永远配队列，所以这个主入口一直是坏的。两个路由改为
+   `response_model=None` + `responses=` 文档化（不校验）。
+3. **指纹漏了 `kind` 和 `bundle_id`**：`ai_fanout` 与同一工作区早先的 `scan` 作业算出**同一个
+   指纹**，于是被去重到那个作业上、沿用它 id、报 `succeeded` 而**什么都没做**。抓到的线索是
+   磁盘上的报告比"写下它的作业"早 25 分钟。指纹现在含 kind 与 bundle_id。
+4. **所有调用都失败时作业仍报 `succeeded`** —— 既是假成功，又让 `force=true` 无法重跑
+   （它只重跑失败的作业）。现在全失败 = 具名 `ai_failed`；部分成功 = `succeeded` + warning。
+
+第五个是**规格与解析器互相矛盾**：prompt 明确要求"severity 取决于未证实的东西就写在
+severity 里"，而解析器却在等一个精确的枚举值。真调用回了
+`"high — impact could be critical if Controller.dispatch is externally exposed"`，被判
+`unknown severity` 丢掉。现在从前缀读类别（最长匹配 + 词边界），余下文字留在
+`severity_qualifier`，模型对自己结论的限定语不再丢失。
+
+**运维坑（值得单独记）**：**重建 `aegis:0.1.0` 不会重建容器** —— compose 比的是服务配置，
+不是镜像内容，所以 `docker compose up -d` 会让旧进程继续跑内存里的旧代码。必须
+`--force-recreate`。这一条让我误诊了一小时。
+
+端到端实测（真模型、走队列）：`POST /v1/bundles/B-9a5317fb78/analyze` → 202 →
+`GET .../verdicts` → `true_positive / critical / 0.85`，并且模型指出 `sql_quote` 是
+**恒等函数**（p1 的 no-op 清洗）—— 正是这套 bundle 设计要区分的东西。细节见
+`docs/AI_STAGE.md`。
+
+#### 源码 → AI 研判：整条链（同日，已通）
+
+`var/joern/source_to_ai.py` 一条命令跑完全链：`POST /v1/assemble`（opengrep 扫 → LSP + Joern
+集群 → bundle）→ `POST /v1/bundles/{id}/analyze`（模型）→ `GET .../verdicts`。实测：
+
+```
+STEP 1  202 → running/scan → running/setup → running/locate → succeeded
+STEP 2  methods (5): Controller.dispatch, handle_request, load_user, query_user, safe_escape
+        providers: ['joern_dataflow']   ← 切片来自 Joern
+        dataflow : source=dispatch(request)  warmed=4
+                   walk=query_user <- load_user <- handle_request <- dispatch
+STEP 4  true_positive / high / 0.75，数据流逐跳引用，并指出需要 connect() 的 DBMS
+        才能判断单引号双写是否充分
+```
+
+**为此又踩掉一个"环境坑"，值得单独记**：`.env` 里 `AEGIS_SCAN_TARGET=./demo/repo` 是相对
+**仓库根**写的，而 compose 把相对路径解析到**项目目录**（`docker/`）——于是挂上去的是
+`docker/demo/repo`，一个**不存在、被 Docker 建成空目录**的路径。后果极隐蔽：scan 容器
+（未重建，仍挂真 repo）扫出 finding，worker 容器（用 `--env-file` 重建，挂空目录）读不到文件，
+**0 方法、空 bundle，而整条链报 succeeded**；dataflow 集群（在修之前起）还顺手缓存了一份
+"空工作区"的 CPG。修法：`.env` 改为 `../demo/repo` 并把原因写在旁边，然后四个服务 + 两个
+dataflow 容器全部 `--force-recreate`。
+
+#### 两个遗留项的修法（已实现，同日）
+
+1. **`succeeded` 的作业无法重跑** → `force=true` 现在也能重跑**已成功**的作业
+   （`_handle_duplicate` 里 `force` 之前只走到失败分支）。指纹不变、job id 就不变，所以在此之前
+   同一个请求永远拿回那份没用的结果。实测：对已分析过的包再 `?force=true` → **202**（不再是 200）
+   → 报告 mtime 前移 → 新的判决（40.4s，confidence 0.65，上一次是 0.75）。
+2. **AI 作业报 `stage=scan`** → 契约新增 `JobStage.AI` 与 `first_stage(kind)`
+   （assemble→`scan`，ai_fanout→`ai`），`handle()` / `set_running` / `redrive` 都改用它。
+   另外 `mark_succeeded` 现在**不给已经结束的阶段补 `done`**，并把这个作业种类走不到的阶段标成
+   `skipped` 并写明原因 —— 于是 assemble 作业的 `ai` 行读作"not part of this job"，而不是
+   永远 `pending`（读起来像"还没轮到我"）。`redrive` 的备注也从写死的 `stages[0]`（=scan）
+   改到该作业种类的起始阶段。
+
+---
+
+### 10.21 prompt 前缀缓存：终于实测了，结论和预期不同（2026-09-11）
+
+§6.3 一直写着"只证明了前缀按契约不变，没证明 provider 真的命中"。现在有答案了，而且
+答案分两半。
+
+#### 前半：**确实命中**
+
+provider 的计费字段直接证明（`prompt_tokens_details.cached_tokens` 或
+`prompt_cache_hit_tokens`，两个键名不同厂商各用各的）：
+
+```
+call 1: cached_tokens=0       冷
+call 2: cached_tokens=896  /1046  → 86%
+call 3: cached_tokens=896         → 86%
+```
+
+所以 `ai/cache_prefix.json` 那块工作**没有白做**。
+
+#### 后半：**它打在小处，天花板约 20%**
+
+| 形态 | 输入占总 token |
+|---|---|
+| 并发 ×6 | 6,139 / 33,925 = **18%** |
+| 批量 | 3,706 / 17,210 = **22%** |
+
+输入已经命中 81–93%，**剩下 78–82% 是输出（推理+答案），任何前缀缓存都碰不到**。
+**所以缓存不可能成为这个负载的成本杠杆。**
+
+#### 批量 vs 并发（6 个 finding）
+
+token 侧（无 60s 上限的端点，3 轮中位数）：
+
+| | 批量 | 并发 ×6 |
+|---|---|---|
+| 输出 token | 13,504 | **27,786（2.06×）** |
+| **总计** | **17,210** | **33,925（1.97×）** |
+
+**每一轮**并发都约为 2 倍总 token —— 因为 6 次调用各自产生一份推理。**这个差异稳定。**
+墙钟差异（63.0s vs 57.5s）**落在噪声里**（批量单轮波动 36–100s），n=3~5 下不成立。
+
+#### 一条比 token 更重要的发现：网关 60 秒硬超时
+
+在 `tokens.store` 那个网关上实测：
+
+| 形态 | 耗时 | 完成 |
+|---|---|---|
+| 批量（6 个塞一个 prompt） | 64.8s | **0/1 → HTTP 504，全军覆没** |
+| 并发 ×6 | 64.9s | **3/6** |
+| 顺序 ×6 | 212.3s | **6/6** |
+
+**批量失败不是因为请求大，是因为网关在 60 秒切连接**，而批量调用在模型跑完前什么都不返回。
+
+> **架构含义**：如果生产端点有这类上限，**批量直接被否决** —— 一次超时丢掉全部结论。
+> fan-out（每个 finding 一个小请求）是唯一能跑完的形态。若无此上限，批量省约 2× token。
+
+完整数据与测量脚本：`var/joern/BENCHMARK.md`。
+
 ---
 
 ## 11. 未完成工作与两个待决策
@@ -705,37 +1293,64 @@ GET  /v1/jobs/{id} →  {status, progress, result}
 > `services/extraction/routes.py::extract` 里的 `pipeline.run()` 没有 observer / cancel 回调，
 > 远程模式下进度只剩 2 个粗阶段，真取消也不可能实现。
 
-### 11.2 待决策 B：前端技术栈
-倾向 **Vite + Vue 3**；备选是纯 JS 静态页（`services/web` 现在是 nginx + 静态资源的规划）。
-已完成的准备工作：
+### 11.2 前端技术栈 —— ✅ **已决策并落地：React 18 + TypeScript + Vite**
+当时倾向 Vue 3；实际选 React 是因为后端已经有一份现成的四屏实现可以直接演进，而框架偏好不值得
+把已经验证过的交互重写一遍。最终形态见 §11.3（2026-09-12 重做为独立部署）。
+
+准备工作（仍然有效）：
 - `docs/VISUAL.md`：Mermaid 数据流 + 四屏信息架构 + ASCII 原型
 - `docs/prototype.html`：可交互原型
-- `aegis_contracts/views.py`：所有视图数据已经由后端算好，**前端只负责渲染，不做计算**
+- 后面这条**已被推翻**：~~`aegis_contracts/views.py`：所有视图数据已经由后端算好，前端只负责渲染，
+  不做计算~~ —— 现在前端自己算展示数值（counts、cache 命中率、token 合计、project 分组），
+  后端只发原始事实。`verdicts_view` 因此被删掉，见 §11.3。
 
 > 历史提醒：上一版 console 的 `index.html` 里有个未修复的 JS 语法错误
 > （`SyntaxError: missing ) after argument list`，在 `screenContext` 末尾），
 > 当时控制台迁移到 `services/web/` 时那个文件被**删掉而不是修好**。
 > 重建时请保留语法检查：`node --check` 已用于校验 console JS。
 
-### 11.3 前端观测台 `aegis-web` —— ✅ **已建成（2026-09-11）**
-React 18 + TypeScript + Vite，nginx 服务构建产物并反代 `/v1` 到 gateway，端口 8102
-（**绑 127.0.0.1**）。自己的镜像，所以改一个组件不会重建 2 GB 的 Python 镜像。
+### 11.3 前端观测台 —— ✅ **已建成（2026-09-11），2026-09-12 重做为「独立部署」**
 
-**它只渲染，不算数。** 所有指标都来自 `aegis_contracts/views.py` 与 job 端点，前端连一个
-比例都不自己算 —— 这条不是靠约定，而是 `services/web/test/contract.test.ts` 里的静态检查：
-它会剥掉字符串与注释后在源码里找「两个标识符之间的算术」，并且**自带一条反向自检**
-（构造一个 `alpha - beta` 必须被抓到，构造 `scripts/demo.py` 与 `Static-scan findings`
-必须不被抓）。一个不会失败的检查比没有检查更糟，所以这条检查证明自己会失败。
+**第一版**（`services/web`，`aegis-web` 镜像）是 nginx 服务静态产物并**反代 `/v1`** 到 gateway，
+浏览器因此永远同源：没有 CORS，产物里也没有 API 地址。代价是两样东西被焊死 —— 静态文件只能由
+那一个 nginx 提供，而 API 的 host:port 成了前端部署的一部分。
 
-`services/web/test/contract.test.ts` 的三条断言：
+**现在**的 `frontend/`（`aegis-frontend` 镜像，端口 8102）**不反代任何东西**：
 
-1. **它调的每个端点都存在** —— 路径与 `python -m app.cli routes` 的输出比对（后者取自
-   FastAPI 应用自身的 OpenAPI 文档）。grep 路由装饰器或手工维护列表都会在改名后继续通过。
-2. **它不算任何后端已发布的指标**（上面那条）。
-3. **格式化器不改变数字** —— 用磁盘上真实的 bundle manifest 做输入。
+* **API 地址在运行期决定。** 容器入口脚本把 `AEGIS_API_BASE` 写成 `/config.js`，nginx 启动前
+  就位；构建期只剩 `VITE_API_BASE` 给 `npm run dev` 用，而且 `.dockerignore` 排除了 `.env*`，
+  所以生产镜像里**不可能**带上地址。**一个镜像可以指向任意 gateway**，改地址是重启而不是重建。
+  `tests/test_frontend_contract.py` 断言构建产物里不含 API origin。
+* **浏览器跨域直连 gateway**，所以 `AEGIS_CORS__ALLOW_ORIGINS` 必须包含前端 origin（默认 `*`）。
+  结构性证据：`GET /v1/bundles` 打在前端源站上返回的是**页面而不是 JSON**。
+* **与后端零源码耦合。** 契约测试改为从 gateway 拉 `/openapi.json` 比对
+  （`frontend/test/contract.test.ts`）；`frontend/test/openapi.snapshot.json` 是**抓下来的 HTTP
+  响应**（数据，不是后端源码），`npm run snapshot` 刷新；设了 `API_URL`/`AEGIS_API_BASE` 时
+  会同时比对线上文档，防止快照腐坏 —— 只靠快照的话，后端改名后前端仍会全绿。
+* **展示数字前端自己算**（`frontend/src/format.ts`）：counts、cache 命中率、token 合计、project
+  分组、进度分母。后端 `/v1/verdicts` 因此改回**原始 `ai/report.json`**，`views.verdicts_view`
+  已删除（它的存在本身就是把"怎么展示"放在服务端）。
 
-`tests/test_web_contract.py` 把这三条接进 `pytest`：所以 `python -m pytest -q` 一条命令
-同时覆盖 Python 与前端（Node 不可用时自动 skip）。
+菜单：Overview / Jobs / Bundles（含单包详情）/ Compare / AI verdicts / Projects / Traffic /
+Settings。其中三个值得记：
+
+* **Projects 是派生的**：后端没有 project 实体，project 就是 job 与 bundle 上记录的 workspace
+  路径，分组在 `format.ts` 里做。为它加端点等于发明一个不存在的注册表，页面就会声称比数据更多
+  的结构。
+* **Traffic** 读的是 gateway **进程内**的环形缓冲（500 条）：重启即空，多副本时只看得到自己那
+  一路。页面把 API 自己那句 note 原样显示，因为读错这个限制会从"空的日志"推出错误结论。
+* **Settings 只读**：配置来自环境变量，"改一个设置"等于改容器 env 并重启；可编辑的表单要么得
+  写 env（本项目没有控制面），要么就得假装。API key 只出现**变量名**与 `api_key_present`。
+
+`tests/test_frontend_contract.py` 把前端测试接进 `pytest`：`python -m pytest -q` 一条命令同时
+覆盖 Python 与前端（Node 或 `frontend/node_modules` 不可用时自动 skip）。它只做"转发 + 检查
+构建产物不含 API origin"两件事，**不读前端源码也不读后端源码**去互相比对。
+
+> 第一版的教训，仍然成立：一条不会失败的检查比没有检查更糟。旧控制台那条"前端不做算术"的静态
+> 检查自带**反向自检**（构造一个 `alpha - beta` 必须被抓到，而 `scripts/demo.py` 与
+> `Static-scan findings` 必须不被抓）。现在这条规则没了 —— 展示数字本来就归前端算 —— 取而代之
+> 的是 `frontend/test/format.test.ts`：把每个前端自算的值（counts、cache 比、token 合计、
+> project 分组、分母未知时的进度）钉在具体数字上。自算的代价就是，算错时后端不会替你发现。
 
 > 两条踩过的坑，写给下一个人：
 > * **`npm` 在 Windows 上是 `npm.cmd`**，Python 里直接 `subprocess.run(["npm", ...])` 会
@@ -782,8 +1397,9 @@ import **恰好 1 条**（`domain.py` 用 `estimate_tokens`，是已知的分层
 
 接手第一天建议按顺序做这几件事，用来确认环境与理解都到位：
 
-1. `python -m pytest -q` → 确认 **213 passed, 2 skipped**（两个 skip 是引擎探测，不是失败）。
-   不是这个数就先别改代码；`python -m pytest -q -m slow` 应额外得到 **6 passed**。
+1. `python -m pytest -q` → 确认 **395 passed, 12 skipped**（skip 分两种：引擎探测、
+   以及需要真 Redis 的用例，都不是失败）。不是这个数就先别改代码；
+   `python -m pytest -q -m slow` 应额外得到 **6 passed**。
 2. `python scripts/demo.py` → 看一遍完整流水线输出，读 `var/packages/<id>/summary.md`。
 
    > ⚠️ **这一步不能跳过**：`demo/repo` 是 `demo.py` 用 `tests/fixtures.py` **生成**的，

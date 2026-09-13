@@ -126,6 +126,33 @@ class CallGraphResolver:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def warm(self) -> int:
+        """Ask the language server about every file, and report how many it answered for.
+
+        Why this exists: the server analyses files **lazily**, so `callers(X)` before the file
+        containing `X`'s caller has been looked at returns **zero callers**. Measured on the demo
+        in one process, same method: `callers(query_user)` was empty until `service.py` had been
+        analysed, then returned `load_user`. Zero callers is also the evidence used to call a
+        method an entry point -- so on a cold server the walk does not merely get slower, it
+        silently produces the wrong answer (the sink's own method), which then returns a
+        non-empty flow containing no source at all.
+
+        Returns the number of files that produced symbols, so "no callers" can be told apart from
+        "we never looked": a caller that gets 0 here has warmed nothing and must not trust the
+        walk. Also records why any file failed, in `self.degradations`.
+        """
+        if self.lsp is None:
+            return 0
+        warmed = 0
+        for path in self.workspace.files():
+            rel = self.workspace.rel(path)
+            try:
+                if self.index.symbols(rel):
+                    warmed += 1
+            except Exception as exc:  # noqa: BLE001 - one bad file must not stop the warm-up
+                self.degradations.append(f"warm-up failed for {rel}: {type(exc).__name__}: {exc}")
+        return warmed
+
     def region_of(self, rel: str, rng: LspRange) -> CodeRegion:
         line_index = self.workspace.index(rel)
         end_line, end_char = self._trim_trailing_blank_lines(

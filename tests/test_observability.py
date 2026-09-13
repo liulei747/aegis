@@ -37,7 +37,7 @@ def _run(
         budget=budget or BudgetConfig(max_depth=2, max_nodes=30, max_contexts=10),
         lsp_enabled=False,
     ).resolve()
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     result = asyncio.run(
         AssemblyPipeline(settings).run(
             PipelineRequest(workspace=workspace, sarif_path=sarif, lsp=lsp, package_name=name)
@@ -66,7 +66,7 @@ def test_overview_reports_trust_mix_and_no_warnings_for_a_clean_run(
     assert overview.finding_count == 1
     assert overview.worst_trust == "guess"  # nothing here is a server fact
     assert set(overview.trust_mix) == {"guess"}
-    assert any("no language server" in flag for flag in overview.warning_flags)
+    assert any("语言服务器参与" in flag for flag in overview.warning_flags)
 
 
 def test_overview_flags_a_scan_that_returned_nothing(tmp_path: Path, workspace: Path) -> None:
@@ -86,7 +86,7 @@ def test_overview_flags_a_scan_that_returned_nothing(tmp_path: Path, workspace: 
     )
     overview = views.overview(_manifest(result))
     assert overview.context_count == 0
-    assert any("no findings" in flag for flag in overview.warning_flags)
+    assert any("完全没有命中" in flag for flag in overview.warning_flags)
 
 
 def test_funnel_counts_are_traceable_to_the_manifest(
@@ -147,11 +147,11 @@ def test_a_truncated_walk_cannot_look_complete(tmp_path: Path, workspace: Path) 
     assert manifest.stats.counts["methods_dropped_at_expand"] == 0
     assert funnel["kept"].count == 1  # only the sink
     # arithmetic cannot express the loss, so it is stated instead
-    assert funnel["kept"].note and "skipped" in funnel["kept"].note
+    assert funnel["kept"].note and "跳过" in funnel["kept"].note
     # and the prune names what is missing, not just that the walk stopped
     depth_prune = next(p for p in manifest.prunes if p.rule == "max_depth")
-    assert "never looked up" in depth_prune.detail
-    assert "absent" in depth_prune.detail
+    assert "从未被查找" in depth_prune.detail
+    assert "不在这个分析包里" in depth_prune.detail
 
 
 def test_prune_detail_names_the_affected_method_and_fanout_direction(
@@ -159,8 +159,8 @@ def test_prune_detail_names_the_affected_method_and_fanout_direction(
 ) -> None:
     result, _ = _run(tmp_path, workspace, budget=BudgetConfig(max_depth=0, max_nodes=10))
     details = [p.detail for p in _manifest(result).prunes if p.rule == "max_depth"]
-    assert any("callees of query_user" in d for d in details)
-    assert any("callers of query_user" in d for d in details)
+    assert any("query_user 的被调用方" in d for d in details)
+    assert any("query_user 的调用方" in d for d in details)
 
 
 def test_funnel_reports_merged_findings_as_deduped_not_lost(
@@ -350,7 +350,7 @@ def client(tmp_path: Path, workspace: Path, monkeypatch) -> TestClient:
 
 
 def _assemble(client: TestClient, workspace: Path, tmp_path: Path, name: str | None = None) -> str:
-    sarif = write_sarif(tmp_path / f"api-{name or 'x'}.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / f"api-{name or 'x'}.sarif", workspace=workspace)
     data = {"workspace": str(workspace), "lsp": "false"}
     if name:
         data["package_name"] = name
@@ -375,7 +375,7 @@ def test_observability_endpoint_returns_every_view(
     assert body["timeline"] and body["providers"]
     assert body["scan"]["engine"] == "sarif-input"
     assert body["provider_legend"]["syntax_regex"]["trust"] == "guess"
-    assert body["stage_labels"]["locate"] == "locate enclosing method"
+    assert body["stage_labels"]["locate"] == "定位所属方法"
     assert isinstance(body["counts"], dict)
     assert body["counts"]["findings_discovered"] == 1
 
@@ -414,6 +414,10 @@ def test_list_bundles_surfaces_trust_and_engine(
     assert row["providers"] == ["syntax_regex"]
     assert row["engine"] == "sarif-input"
     assert row["focus_count"] == 1
+    # Raw facts a project-management list needs per row, so it fetches one request, not one per
+    # bundle: which repository this is, and whether there is a report to open.
+    assert row["workspace"] == str(workspace.resolve())
+    assert row["has_ai_report"] is False
 
 
 def test_the_api_no_longer_serves_a_console(

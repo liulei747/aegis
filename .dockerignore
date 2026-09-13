@@ -33,6 +33,18 @@ docker/lsp.local.yaml
 # Compose consumes this on the host; the image does not need it.
 docker/docker-compose.yml
 
+# --- front-end build inputs that must not travel into an image ------------
+# `node_modules` and `dist` were reaching the build context, and because the frontend
+# Dockerfile copies the project *after* running `npm ci`, the host's `node_modules` silently
+# replaced the one installed from the lockfile -- so the image was built from whatever the
+# developer happened to have installed, while the log still said `npm ci`.
+**/node_modules
+**/dist
+# Vite reads `.env*` at build time. Excluding them guarantees that a production image carries
+# no API base and must be handed one at run time through `AEGIS_API_BASE`/`config.js`.
+**/.env
+**/.env.*
+
 # --- docs -----------------------------------------------------------------
 *.md
 !README.md

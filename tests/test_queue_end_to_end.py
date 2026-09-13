@@ -82,7 +82,7 @@ def wired(tmp_path: Path, monkeypatch, real_redis, workspace: Path):
 
 def test_submit_then_work_produces_a_bundle(wired) -> None:
     client, worker, store, tmp_path, workspace = wired
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
 
     accepted = client.post(
         "/v1/jobs",
@@ -127,7 +127,7 @@ def test_submit_then_work_produces_a_bundle(wired) -> None:
 def test_the_same_submission_after_success_returns_the_bundle(wired) -> None:
     """The idempotency promise, end to end: same request, same job, 200 with the result."""
     client, worker, store, tmp_path, workspace = wired
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     payload = {"workspace": str(workspace), "sarif_path": str(sarif), "lsp": False}
 
     first = client.post("/v1/jobs", json=payload)
@@ -154,7 +154,7 @@ def test_a_scan_job_returns_a_ledger_and_no_bundle(wired) -> None:
     worker routes the kind correctly and produces no bundle for it.
     """
     _, worker, store, tmp_path, workspace = wired
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
 
     from aegis_contracts.jobs import JobKind, JobRequest
 
@@ -212,7 +212,7 @@ def test_deleting_the_bundle_makes_the_next_submission_rerun(wired) -> None:
     import shutil
 
     client, worker, store, tmp_path, workspace = wired
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     payload = {"workspace": str(workspace), "sarif_path": str(sarif), "lsp": False}
 
     client.post("/v1/jobs", json=payload)

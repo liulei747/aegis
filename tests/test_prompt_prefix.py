@@ -61,11 +61,45 @@ def _prefix_doc(package_path: Path) -> dict:
     return json.loads((package_path / "ai" / "cache_prefix.json").read_text(encoding="utf-8"))
 
 
+SECOND_SINK = '''\
+"""A second sink, in its own file, so the bundle has two contexts."""
+
+
+def second_sink(value):
+    return execute("delete from t where id = " + value)
+'''
+
+
+def _two_sink_workspace(tmp_path: Path) -> Path:
+    """A workspace with a second tainted method: two findings, two contexts."""
+    root = tmp_path / "repo-two"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "second.py").write_text(SECOND_SINK, encoding="utf-8")
+    return root
+
+
+def _add_second_sink(sarif: Path) -> Path:
+    """Point a copy of the SARIF at the second method as well."""
+    doc = json.loads(sarif.read_text(encoding="utf-8"))
+    runs = doc["runs"][0]
+    second = json.loads(json.dumps(runs["results"][0]))
+    second["ruleId"] = "python.lang.security.sqli-second"
+    second["message"]["text"] = "second sink, different method"
+    location = second["locations"][0]["physicalLocation"]
+    location["artifactLocation"]["uri"] = location["artifactLocation"]["uri"].replace(
+        "repo.py", "second.py"
+    )
+    location["region"]["startLine"] = 5
+    location["region"]["startColumn"] = 12
+    runs["results"] = [runs["results"][0], second]
+    return sarif
+
+
 def test_cacheable_blocks_are_one_contiguous_run(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """The flags must describe a run, not a scatter: a non-contiguous run is unusable."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     result = _run(tmp_path, workspace, budget, sarif=sarif)
     meta = _meta(result.package_path)  # type: ignore[arg-type]
 
@@ -82,7 +116,7 @@ def test_cache_prefix_declares_where_the_reusable_run_starts(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """Document order is not prefix order: the prefix starts at the first cacheable run."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     result = _run(tmp_path, workspace, budget, sarif=sarif)
     package = result.package_path
     assert package is not None
@@ -106,7 +140,7 @@ def test_volatile_header_is_not_part_of_the_prefix(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """`bundle.header` carries the bundle id, so it can never be cached."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     result = _run(tmp_path, workspace, budget, sarif=sarif)
     meta = _meta(result.package_path)  # type: ignore[arg-type]
 
@@ -116,39 +150,118 @@ def test_volatile_header_is_not_part_of_the_prefix(
     assert "bundle.header" not in doc["prefix_blocks"]
 
 
-def test_prefix_bytes_are_identical_across_two_different_bundles(
+def test_the_declared_token_total_matches_the_blocks(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
-    """The claim that actually matters: a fan-out reuses one prefix across bundles.
+    """One number, one value: the prompt header, the block metadata and the manifest agree.
 
-    The two runs differ in bundle id and in how many contexts they carry, which is
-    exactly the difference a fan-out sees. Everything the prefix claims to contain
-    must still be byte-identical.
+    They used to disagree, twice over. The header first reported a figure re-estimated from the
+    method sources (1703) while the metadata beside it summed the blocks (1883). Fixing that by
+    summing the blocks exposed a self-reference: the sum included the header, whose own length
+    depends on the number it states, so the two answers stayed 31 apart -- exactly the header's
+    own token count. The header now states the size of the content blocks, which is both what a
+    caller sends and a value that does not depend on itself.
     """
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
-    wide = _run(tmp_path, workspace, budget, sarif=sarif, name="B-prefix-wide")
-    narrow = _run(
-        tmp_path,
-        workspace,
-        budget.model_copy(update={"max_contexts": 1, "max_depth": 1}),
-        sarif=sarif,
-        name="B-prefix-narrow",
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
+    result = _run(tmp_path, workspace, budget, sarif=sarif, name="B-tokens")
+    package = result.package_path
+    assert package is not None
+    assert result.bundle is not None
+
+    meta = _meta(package)
+    header_tokens = next(b["tokens"] for b in meta if b["block_id"] == "bundle.header")
+    content_total = sum(b["tokens"] for b in meta if b["block_id"] != "bundle.header")
+
+    head = (package / "ai" / "prompt.md").read_text(encoding="utf-8").splitlines()[:5]
+    declared = int(next(line.split(":")[1] for line in head if "approx tokens" in line))
+
+    assert declared == content_total, (
+        f"the header says {declared} tokens while its content blocks sum to {content_total}"
+    )
+    # And the manifest totals the whole prompt, header included -- stated rather than implied.
+    assert result.bundle.manifest.estimated_tokens == content_total + header_tokens
+
+
+def test_the_instruction_blocks_are_stable_across_any_two_bundles(
+    tmp_path: Path, workspace: Path, budget: BudgetConfig
+) -> None:
+    """The first tier: `instructions.*` holds still across *every* bundle of a version.
+
+    This is the strictest stability the layout can offer -- it does not depend on the
+    workspace, the rules or the findings -- so it is the tier a shared prefix can rely on
+    across unrelated runs. The second bundle here is assembled from a *different* workspace
+    with a different number of contexts, which is what makes it a real test: an earlier
+    version of this file produced its "second" bundle by narrowing `max_contexts`, leaving the
+    context set identical, and so it passed while a per-bundle table sat inside the declared
+    prefix (`fanout.plan` listed each context's id, focus and token count).
+
+    Note what is deliberately *not* asserted here: `method_catalog` is on the second tier
+    (stable across a re-run of the same input, not across different code), so requiring it to
+    match two different workspaces would be asserting something false.
+    """
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
+    one_sink = _run(tmp_path, workspace, budget, sarif=sarif, name="B-tier-one")
+
+    two_sinks = _two_sink_workspace(tmp_path)
+    wide_sarif = write_sarif(tmp_path / "scan2.sarif", workspace=two_sinks)
+    widened = _add_second_sink(wide_sarif)
+    many = _run(tmp_path, two_sinks, budget, sarif=widened, name="B-tier-many")
+
+    assert one_sink.bundle is not None and many.bundle is not None  # type: ignore[union-attr]
+    assert many.bundle.manifest.focus_count != one_sink.bundle.manifest.focus_count, (  # type: ignore[union-attr]
+        "the two bundles must differ in their context sets, or this test cannot detect a "
+        "per-bundle block hiding inside the prefix"
     )
 
-    assert wide.bundle is not None and narrow.bundle is not None  # type: ignore[union-attr]
-    assert wide.bundle.manifest.bundle_id != narrow.bundle.manifest.bundle_id  # type: ignore[union-attr]
+    one_blocks = {b.block_id: b.content for b in one_sink.bundle.prompts}  # type: ignore[union-attr]
+    many_blocks = {b.block_id: b.content for b in many.bundle.prompts}  # type: ignore[union-attr]
 
-    wide_blocks = {b.block_id: b.content for b in wide.bundle.prompts}  # type: ignore[union-attr]
-    narrow_blocks = {b.block_id: b.content for b in narrow.bundle.prompts}  # type: ignore[union-attr]
-
-    prefix = _prefix_doc(wide.package_path)["prefix_blocks"]  # type: ignore[arg-type]
-    assert prefix, "the prefix must not be empty"
-    for block_id in prefix:
-        assert block_id in narrow_blocks, f"{block_id} vanished from the second bundle"
-        assert wide_blocks[block_id] == narrow_blocks[block_id], (
-            f"{block_id} is declared cacheable but changed between bundles, "
-            "so a shared prefix would miss"
+    shared_prefix = [
+        block["block_id"]
+        for block in _meta(one_sink.package_path)  # type: ignore[arg-type]
+        if block["block_id"].startswith("instructions")
+    ]
+    assert shared_prefix, "there must be at least one always-stable block"
+    for block_id in shared_prefix:
+        assert block_id in many_blocks, f"{block_id} vanished from the second bundle"
+        assert one_blocks[block_id] == many_blocks[block_id], (
+            f"{block_id} is guaranteed to be byte-identical across every bundle but changed "
+            "when the workspace changed"
         )
 
-    # And the volatile blocks must actually differ, or the test proves nothing.
-    assert wide_blocks["bundle.header"] != narrow_blocks["bundle.header"]
+    # The volatile blocks must actually differ, or none of the above proves anything.
+    assert one_blocks["bundle.header"] != many_blocks["bundle.header"]
+
+
+def test_the_prefix_is_byte_identical_when_the_input_is_the_same(
+    tmp_path: Path, workspace: Path, budget: BudgetConfig
+) -> None:
+    """The second tier: same workspace and rules means the whole prefix repeats.
+
+    This is the tier a re-run or a fan-out over one codebase relies on, and it is the one
+    `ai/cache_prefix.json` describes.
+    """
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
+    first = _run(tmp_path, workspace, budget, sarif=sarif, name="B-tier-same")
+    again = _run(tmp_path, workspace, budget, sarif=sarif, name="B-tier-same")
+
+    assert first.bundle is not None and again.bundle is not None  # type: ignore[union-attr]
+    prefix = _prefix_doc(first.package_path)["prefix_blocks"]  # type: ignore[arg-type]
+    first_blocks = {b.block_id: b.content for b in first.bundle.prompts}  # type: ignore[union-attr]
+    again_blocks = {b.block_id: b.content for b in again.bundle.prompts}  # type: ignore[union-attr]
+
+    for block_id in prefix:
+        assert first_blocks[block_id] == again_blocks[block_id], (
+            f"{block_id} is in the declared prefix but changed between two identical runs"
+        )
+
+    # The chunking table is per-bundle by nature and must therefore be outside the prefix.
+    assert "fanout.plan" not in prefix, (
+        "the fan-out table lists this bundle's contexts; it cannot be part of a shared prefix"
+    )
+    meta = _meta(first.package_path)  # type: ignore[arg-type]
+    chunking = next(b for b in meta if b["block_id"] == "fanout.plan")
+    assert chunking["cacheable"] is False
+    assert any(b["block_id"] == "fanout.plan" for b in meta), (
+        "the table is still rendered, just not cached"
+    )

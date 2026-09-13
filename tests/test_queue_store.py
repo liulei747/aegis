@@ -169,6 +169,35 @@ def test_stage_progress_is_ignored_for_a_terminal_job(job_store) -> None:
     assert result.revision == before.revision
 
 
+def test_a_running_stage_reports_its_counters(job_store, fake_redis) -> None:
+    """A long stage reports progress *while it runs*; counters must not be dropped in that branch.
+
+    Measured on the first live audit: the job page showed `candidates: 0` for 37 minutes while the
+    run's trail already held thirty candidates, because `record_stage` only forwarded `counters` on
+    the not-running branch. The audit's progress mirror writes one running event per harness phase,
+    so every one of them lost its counts.
+    """
+    job = _submit(job_store)
+    job_store.set_running(job.job_id, worker_id="w-1")
+
+    job_store.record_stage(
+        job.job_id,
+        JobStage.AI,
+        state="running",
+        note="探索代码",
+        counters={"candidates": 12, "findings": 1},
+        units_done=5,
+        unit_label="scope",
+    )
+
+    after = job_store.get(job.job_id)
+    assert after is not None
+    assert after.progress.counters == {"candidates": 12, "findings": 1}
+    assert after.progress.units_done == 5
+    entry = next(stage for stage in after.progress.stages if stage.stage is JobStage.AI)
+    assert entry.counters["candidates"] == 12, "the stage's own counters carry it too"
+
+
 def test_heartbeat_does_not_bump_revision(job_store, fake_redis) -> None:
     job = _submit(job_store)
     job_store.set_running(job.job_id, worker_id="w-1")

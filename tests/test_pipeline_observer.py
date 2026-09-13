@@ -52,7 +52,7 @@ def test_observer_is_optional_and_changes_nothing(
     This is the guard for every existing caller. If emitting an event could alter timing
     counts or the bundle, the synchronous path would be observing a different pipeline.
     """
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     settings = _settings(tmp_path, workspace, budget)
 
     silent = asyncio.run(
@@ -88,7 +88,7 @@ def test_observer_events_arrive_in_stage_order(
     event emitted before the scan would be delivered after it. A consumer that needs to
     show "scanning" has to record that before calling `run()`.
     """
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     events: list[StageEvent] = []
     asyncio.run(
         AssemblyPipeline(_settings(tmp_path, workspace, budget)).run(
@@ -113,7 +113,7 @@ def test_observer_end_events_carry_the_funnel_counters(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """Which funnel steps are authoritative at which boundary -- the §3 mapping, executable."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     events: list[StageEvent] = []
     asyncio.run(
         AssemblyPipeline(_settings(tmp_path, workspace, budget)).run(
@@ -133,14 +133,14 @@ def test_observer_end_events_carry_the_funnel_counters(
     # `proposed` must not be reported before read: it is computed from expand's outputs.
     assert "proposed" not in by_stage["expand"].counters
     # The units are declared rather than guessed, so a progress bar can label itself.
-    assert by_stage["expand"].unit_label == "slices"
-    assert by_stage["read"].unit_label == "bodies"
+    assert by_stage["expand"].unit_label == "切片"
+    assert by_stage["read"].unit_label == "方法体"
 
 
 def test_scan_note_says_how_the_scan_happened(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     events: list[StageEvent] = []
     asyncio.run(
         AssemblyPipeline(_settings(tmp_path, workspace, budget)).run(
@@ -150,7 +150,7 @@ def test_scan_note_says_how_the_scan_happened(
     scan = next(event for event in events if event.stage == "scan")
     assert scan.note == "scan_transport=in-process"
     setup = next(event for event in events if event.stage == "setup")
-    assert setup.note == "lsp disabled by configuration"
+    assert setup.note == "LSP 已被配置禁用"
 
 
 # --- cancellation ------------------------------------------------------
@@ -160,7 +160,7 @@ def test_abort_before_the_run_stops_at_the_first_boundary(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """A cancel that arrives before any work does still stops, and says where."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     teardown = Teardown()
     teardown.request()  # already aborted when the pipeline starts
 
@@ -184,7 +184,7 @@ def test_reading_a_given_sarif_is_not_interruptible_mid_stage(
     Worth pinning because it is the shape most tests use: the abort lands at the stage
     boundary rather than inside a subprocess, so the bundle is never produced.
     """
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     teardown = Teardown()
     teardown.request()
     with pytest.raises(CanceledAbort):
@@ -204,7 +204,7 @@ def test_staging_write_leaves_nothing_in_the_way_on_cancel(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """A completed staging run lands in the final directory; a canceled one is cleaned up."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     settings = _settings(tmp_path, workspace, budget)
     teardown = Teardown()
 
@@ -241,7 +241,7 @@ def test_staging_true_and_false_produce_the_same_bundle(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     """Staging is a write strategy, not a different product."""
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     settings = _settings(tmp_path, workspace, budget)
 
     direct = asyncio.run(

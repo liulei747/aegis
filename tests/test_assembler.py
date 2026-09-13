@@ -48,7 +48,7 @@ def _settings(tmp_path: Path, workspace: Path, budget: BudgetConfig) -> Settings
 
 def _sarif_two_hits(tmp_path: Path, workspace: Path) -> Path:
     """Two findings inside the same method -> one merged context."""
-    base = json.loads(write_sarif(tmp_path / "scan.sarif", sink_line=5).read_text(encoding="utf-8"))
+    base = json.loads(write_sarif(tmp_path / "scan.sarif").read_text(encoding="utf-8"))
     first = base["runs"][0]["results"][0]
     second = json.loads(json.dumps(first))
     second["message"]["text"] = "same sink, second rule"
@@ -202,7 +202,7 @@ def test_max_chars_per_method_truncates_and_records_it(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     tiny = budget.model_copy(update={"max_lines_per_method": 2})
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     result = asyncio.run(
         AssemblyPipeline(_settings(tmp_path, workspace, tiny)).run(
             PipelineRequest(workspace=workspace, sarif_path=sarif, lsp=False)
@@ -232,7 +232,7 @@ def test_max_contexts_limits_expansion_and_is_auditable(
 
 
 def test_unreadable_file_is_reported_as_a_prune(tmp_path: Path, workspace: Path, budget: BudgetConfig) -> None:
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     (workspace / "repo.py").unlink()
     result = asyncio.run(
         AssemblyPipeline(_settings(tmp_path, workspace, budget)).run(

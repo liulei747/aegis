@@ -26,6 +26,9 @@ from pydantic import ValidationError
 from redis.exceptions import ResponseError
 
 from aegis_contracts.jobs import (
+    STAGE_DONE,
+    STAGE_PENDING,
+    STAGE_SKIPPED,
     TERMINAL_STATES,
     ArtifactRef,
     FailureMode,
@@ -40,6 +43,7 @@ from aegis_contracts.jobs import (
     JobState,
     JobSubmission,
     JobTiming,
+    first_stage,
     job_id_for,
     request_fingerprint,
 )
@@ -181,7 +185,9 @@ class JobStore:
         submitted_by: str = "gateway",
         lsp_config_fingerprint: str = "",
     ) -> JobSubmission:
-        fingerprint = request_fingerprint(request, lsp_config_fingerprint=lsp_config_fingerprint)
+        fingerprint = request_fingerprint(
+            request, lsp_config_fingerprint=lsp_config_fingerprint, kind=kind
+        )
         return JobSubmission(
             job_id=job_id_for(fingerprint),
             kind=kind,
@@ -206,7 +212,7 @@ class JobStore:
             state=JobState.QUEUED,
             submission=submission,
             timing=JobTiming(submitted_at=submission.submitted_at or now),
-            progress=JobProgress.fresh(),
+            progress=JobProgress.fresh(submission.kind),
         )
         stored = self.redis.set(
             self.keys.job(job.job_id), job.model_dump_json(), nx=True
@@ -321,8 +327,8 @@ class JobStore:
             job.timing.queue_wait_ms = max(
                 0, int((now - job.timing.submitted_at).total_seconds() * 1000)
             )
-        job.progress.stage = JobStage.SCAN
-        self._touch_stage(job, JobStage.SCAN, state="running", started_at=now)
+        job.progress.stage = first_stage(job.kind)
+        self._touch_stage(job, first_stage(job.kind), state="running", started_at=now)
         if self.compare_and_set(job, expected_state=was) < 0:
             pass
         # Read back rather than returning the local object: the stored revision is
@@ -416,7 +422,12 @@ class JobStore:
             return job
         now = self._now()
         if state == "running":
-            self._touch_stage(job, stage, state=state, started_at=now)
+            # `counters` here as well as below, and that is not symmetry for its own sake: a long
+            # stage reports progress *while running* -- the audit's mirror writes one running event
+            # per harness phase, and the counts of candidates and findings are the whole point of it.
+            # Dropping them in this branch left the job page showing zeros for the entire run while
+            # the trail held thirty candidates; measured on the first live audit.
+            self._touch_stage(job, stage, state=state, started_at=now, counters=counters)
             job.progress.stage = stage
             job.progress.stage_started_at = now
         else:
@@ -513,20 +524,40 @@ class JobStore:
             job.timing.duration_ms = int(
                 (now - job.timing.started_at).total_seconds() * 1000
             )
-        self._touch_stage(
-            job,
-            job.progress.stage,
-            state="done",
-            finished_at=now,
-            note=note,
-            duration_ms=(
-                int((now - job.progress.stage_started_at).total_seconds() * 1000)
-                if job.progress.stage_started_at
-                else None
-            ),
-        )
+        # Finish the stage that was in flight -- but do not overwrite one that already has an
+        # outcome. An AI job records its own stage as `skipped` when the model was never called
+        # (the stage is off), and `done` would then claim it ran.
+        in_flight = self._stage_entry(job, job.progress.stage)
+        if in_flight.state not in (STAGE_DONE, STAGE_SKIPPED, "failed"):
+            self._touch_stage(
+                job,
+                job.progress.stage,
+                state="done",
+                finished_at=now,
+                note=note,
+                duration_ms=(
+                    int((now - job.progress.stage_started_at).total_seconds() * 1000)
+                    if job.progress.stage_started_at
+                    else None
+                ),
+            )
         job.progress.stage = JobStage.DONE
         self._touch_stage(job, JobStage.DONE, state="done", finished_at=now)
+        # A finished job leaves no stage ambiguous. Stages this kind of job never reaches --
+        # `ai` for an assemble job, `scan`..`package` for an ai_fanout job -- are `skipped`,
+        # which says "this did not happen" rather than leaving a `pending` entry that reads as
+        # "still to come" on a job that is over.
+        for entry in job.progress.stages:
+            if entry.state == STAGE_PENDING:
+                entry.state = STAGE_SKIPPED
+                # The AI stage is not skipped-and-forgotten: it runs as its own job against the
+                # finished bundle (an assemble job cannot reach it, an ai_fanout job starts
+                # there). "不属于本次任务" was read -- fairly -- as "the AI analysis was
+                # ignored", so the one stage that has a home elsewhere says where that is.
+                if entry.stage is JobStage.AI and job.kind is not JobKind.AI_FANOUT:
+                    entry.note = entry.note or "由单独的 AI 研判任务执行（见该分析包的「AI 研判」）"
+                else:
+                    entry.note = entry.note or "不属于本次任务"
         self.compare_and_set(job, expected_state=was)
         return self.get(job_id)
 
@@ -597,7 +628,7 @@ class JobStore:
         if job.timing.started_at is not None:
             job.timing.duration_ms = int((now - job.timing.started_at).total_seconds() * 1000)
         self._touch_stage(
-            job, job.progress.stage, state="failed", finished_at=now, note=note or "canceled"
+            job, job.progress.stage, state="failed", finished_at=now, note=note or "已取消"
         )
         self.compare_and_set(job, expected_state=was)
         # Read back: the script owns the revision, so the local copy is one behind.
@@ -659,7 +690,7 @@ class JobStore:
         job.progress.attempt += 1
         job.progress.worker_id = None
         job.progress.worker_heartbeat_at = None
-        job.progress.stage = JobStage.SCAN
+        job.progress.stage = first_stage(job.kind)
         job.timing.started_at = None
         job.timing.finished_at = None
         job.timing.duration_ms = 0
@@ -675,7 +706,9 @@ class JobStore:
         job.progress.units_done = 0
         job.progress.units_total = 0
         if note:
-            job.progress.stages[0].note = note
+            # On the stage this job kind actually starts in -- `stages[0]` is `scan`, which an AI
+            # job never runs, so the reason for the re-run appeared on a stage that was skipped.
+            self._stage_entry(job, first_stage(job.kind)).note = note
         job.timing.submitted_at = now
         if self.compare_and_set(job, expected_state=was) < 0:
             return self.get(job_id)

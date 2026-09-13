@@ -32,7 +32,12 @@ docker/lsp.local.yaml
 # source. `package-lock.json` is deliberately NOT ignored: it is what makes that install
 # reproducible, and an unpinned front-end build is how a page starts failing on a Tuesday.
 node_modules/
-services/web/dist/
+frontend/dist/
+# A developer's own API address. `.env.development` IS committed, because `npm run dev` working
+# out of the box is worth more than each developer rediscovering the variable.
+frontend/.env.local
+frontend/.env.*.local
+benchamrk/
 
 # --- editor / os ---------------------------------------------------------
 .idea/

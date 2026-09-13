@@ -1,0 +1,3801 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Aegis",
+    "description": "Static-scan hits + LSP call graph -> AI-ready analysis bundles. First deliverable: the assembly stage.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "description": "Report the scanner that will actually be used.\n\nWhen scanning is delegated, the local binary is irrelevant, so the remote\nservice is probed instead — otherwise this endpoint answers a question nobody\nasked and hides an unreachable scan service behind a stale local version.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/settings": {
+      "get": {
+        "summary": "Settings View",
+        "description": "The effective configuration, read-only.\n\nEvery value here comes from an environment variable, so there is nothing to write back: the\nhonest answer to \"can I change this?\" is that it is a redeploy, and a PUT route would either\nlie or mutate a process-local copy that the next request re-reads from the environment.\n\nThe AI credential is the one field with a rule of its own. The *name* of the variable is part\nof the configuration a caller needs in order to diagnose \"the stage is enabled but has no\nkey\"; the key's *value* is not configuration and never appears -- not here, not in `/health`,\nnot in a bundle. `api_key_present` carries the only part a caller can act on.",
+        "operationId": "settings_view_v1_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Settings View V1 Settings Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects": {
+      "get": {
+        "summary": "List Projects",
+        "description": "Every registered project, newest first.\n\nRead straight off disk: the registry *is* the directories, so there is no index that can\ndisagree with what is there.",
+        "operationId": "list_projects_v1_projects_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response List Projects V1 Projects Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Project",
+        "description": "Create a project by shallow-cloning a public repository, then optionally analyse it.\n\nOrder matters here. The name and the queue are checked **before** the clone, because a\nfetch that is going to be rejected anyway costs a network round trip and a queue slot to\nfind that out. The clone itself runs in a thread: it is seconds to minutes of blocking\n`subprocess`, and the gateway must keep answering while it happens.",
+        "operationId": "create_project_v1_projects_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Create Project V1 Projects Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/{name}": {
+      "get": {
+        "summary": "Get Project",
+        "operationId": "get_project_v1_projects__name__get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Project V1 Projects  Name  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/projects/upload": {
+      "post": {
+        "summary": "Upload Project",
+        "description": "Create a project from an uploaded `.zip`, then optionally analyse it.\n\nThe archive is streamed to a temporary file rather than read into memory: the cap is\nhundreds of megabytes, and `await file.read()` on that is a way to take the gateway down\nwith a large upload.",
+        "operationId": "upload_project_v1_projects_upload_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_project_v1_projects_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Upload Project V1 Projects Upload Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/scan": {
+      "post": {
+        "summary": "Scan",
+        "operationId": "scan_v1_scan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanOnlyResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/scan/jobs": {
+      "post": {
+        "summary": "Scan Job",
+        "description": "The asynchronous form of `/v1/scan`. The synchronous route is unchanged.\n\nA separate path rather than a change to `/v1/scan`: that response is a documented\ncontract (`run_id`/`findings`/`sarif_path`/`engine`) with existing consumers, and\nquietly turning it into \"202 and an id\" would be a breaking change disguised as a\nfeature.",
+        "operationId": "scan_job_v1_scan_jobs_post",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Force"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/assemble": {
+      "post": {
+        "summary": "Assemble",
+        "description": "Assemble a bundle: synchronously, or as a queued job when a queue is configured.\n\nThe synchronous path is unchanged -- same request model, same response, same status --\nwhich is what keeps the CLI, the tests and a broker-free local setup working. With\n`AEGIS_QUEUE__REDIS_URL` set this returns 202 and an id instead, and the work happens in\na worker that can report progress and be cancelled.",
+        "operationId": "assemble_v1_assemble_post",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Run it again even though a previous attempt finished",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Run it again even though a previous attempt finished"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssembleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "the bundle, assembled synchronously",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssembleResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "accepted as a queued job",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/assemble/upload": {
+      "post": {
+        "summary": "Assemble Upload",
+        "operationId": "assemble_upload_v1_assemble_upload_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_assemble_upload_v1_assemble_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssembleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/analyze": {
+      "post": {
+        "summary": "Analyse a finished bundle with the model (queued when a queue is configured)",
+        "description": "Send a finished bundle to the model: queued when a queue is configured, synchronous when not.\n\nThe two shapes are the same contract as `/v1/assemble`: 202 + a job id when Redis is there, a\nfinished report when it is not. That keeps a broker-free local setup working, which is how\nthe stage is developed.\n\nA bundle that was never built is a 404 rather than an empty report -- \"there is nothing to\nanalyse\" and \"the model found nothing\" must not look alike.",
+        "operationId": "analyze_bundle_route_v1_bundles__bundle_id__analyze_post",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Run it again even though a previous attempt finished",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Run it again even though a previous attempt finished"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/AnalyzeRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/verdicts": {
+      "get": {
+        "summary": "Bundle Verdicts",
+        "description": "The raw report a previous AI run wrote, or a 404 explaining that none exists.\n\nServed as the *stored file* rather than as a view: the front-end is its own deployment and\ncomputes its own display numbers, so there is nothing a server-side aggregate could add that\nthe caller cannot derive from `calls[]` -- and there is everything to lose, because two\nimplementations of \"how many contexts answered\" drift apart silently. The failures\n(`parsed: false`) stay in the payload rather than being filtered out, because a context the\nmodel could not answer about is not a context with nothing to say.",
+        "operationId": "bundle_verdicts_v1_bundles__bundle_id__verdicts_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Bundle Verdicts V1 Bundles  Bundle Id  Verdicts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles": {
+      "get": {
+        "summary": "List Bundles",
+        "operationId": "list_bundles_v1_bundles_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response List Bundles V1 Bundles Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/observability": {
+      "get": {
+        "summary": "Bundle Observability",
+        "operationId": "bundle_observability_v1_bundles__bundle_id__observability_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Bundle Observability V1 Bundles  Bundle Id  Observability Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/contexts": {
+      "get": {
+        "summary": "Bundle Contexts",
+        "operationId": "bundle_contexts_v1_bundles__bundle_id__contexts_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Bundle Contexts V1 Bundles  Bundle Id  Contexts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/methods": {
+      "get": {
+        "summary": "Bundle Methods",
+        "operationId": "bundle_methods_v1_bundles__bundle_id__methods_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Bundle Methods V1 Bundles  Bundle Id  Methods Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/methods/{method_id}/body": {
+      "get": {
+        "summary": "Method Body",
+        "description": "One method's complete source, as stored in the package.",
+        "operationId": "method_body_v1_bundles__bundle_id__methods__method_id__body_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          },
+          {
+            "name": "method_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Method Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/diff/{other_id}": {
+      "get": {
+        "summary": "Bundle Diff",
+        "operationId": "bundle_diff_v1_bundles__bundle_id__diff__other_id__get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          },
+          {
+            "name": "other_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Other Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Bundle Diff V1 Bundles  Bundle Id  Diff  Other Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/manifest": {
+      "get": {
+        "summary": "Bundle Manifest",
+        "operationId": "bundle_manifest_v1_bundles__bundle_id__manifest_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/summary": {
+      "get": {
+        "summary": "Bundle Summary",
+        "operationId": "bundle_summary_v1_bundles__bundle_id__summary_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/blocks": {
+      "get": {
+        "summary": "Bundle Blocks",
+        "operationId": "bundle_blocks_v1_bundles__bundle_id__blocks_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/blocks/{block_id}": {
+      "get": {
+        "summary": "Bundle Block",
+        "operationId": "bundle_block_v1_bundles__bundle_id__blocks__block_id__get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Block Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/graph": {
+      "get": {
+        "summary": "Bundle Graph",
+        "operationId": "bundle_graph_v1_bundles__bundle_id__graph_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bundles/{bundle_id}/archive": {
+      "get": {
+        "summary": "Bundle Archive",
+        "operationId": "bundle_archive_v1_bundles__bundle_id__archive_get",
+        "parameters": [
+          {
+            "name": "bundle_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bundle Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/lsp/probe": {
+      "get": {
+        "summary": "Lsp Probe",
+        "operationId": "lsp_probe_v1_lsp_probe_get",
+        "parameters": [
+          {
+            "name": "workspace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Workspace"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LspProbeResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/traffic": {
+      "get": {
+        "summary": "Traffic",
+        "description": "The most recent requests, newest first.\n\nThis endpoint is never itself recorded (see :data:`TRAFFIC_PATH`), so it cannot list itself\nand `count` counts real traffic only.",
+        "operationId": "traffic_v1_traffic_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Traffic V1 Traffic Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/ai/traffic": {
+      "get": {
+        "summary": "Ai Traffic",
+        "description": "The model calls this deployment has made, newest first.\n\nA *different* kind of record from `/v1/traffic` above, and the reason it is a separate route\nrather than more rows in that one: this is written by whichever process talks to the provider\n(gateway, worker, extract), it lands in a file on the shared work volume, and it survives a\nrestart. The gateway's ring is per-process and empty after a restart, so folding them into one\npayload would have to describe two retention policies in one note -- and a reader would take the\nshorter-lived one for the whole answer.\n\nMetadata only, never the prompt or the answer: see `services.ai.traffic` for why. The content\nlives where it belongs -- an audit's conversation in the run trail, a verdict's raw answer in\nthe bundle's `ai/answers/`.",
+        "operationId": "ai_traffic_v1_ai_traffic_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Ai Traffic V1 Ai Traffic Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs": {
+      "post": {
+        "summary": "Submit an assemble job (the asynchronous form of POST /v1/assemble)",
+        "operationId": "submit_assemble_v1_jobs_post",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Run it again even though a previous attempt finished",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Run it again even though a previous attempt finished"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssembleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List Jobs",
+        "description": "The first screen's payload: what is running, what is queued, what just finished.",
+        "operationId": "list_jobs_v1_jobs_get",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/JobState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/JobKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "summary": "Get Job",
+        "description": "The whole job, including failures and cancellations: a terminal state is an answer.",
+        "operationId": "get_job_v1_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "summary": "Cancel Job",
+        "description": "Ask for a job to stop. Records intent only -- a worker holds the handles.",
+        "operationId": "cancel_job_v1_jobs__job_id__cancel_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audit": {
+      "post": {
+        "summary": "Submit an autonomous repository audit (the agent harness, as a queued job)",
+        "operationId": "submit_audit_v1_audit_post",
+        "parameters": [
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Run it again even though a previous attempt finished",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Run it again even though a previous attempt finished"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audit/{job_id}/trail": {
+      "get": {
+        "summary": "Audit Trail",
+        "description": "The run's events after `after_seq`, oldest first.\n\n`exists: false` with an empty list means \"this audit has not written a trail yet\" -- a queued\njob, or one that has not reached its first stage. `more: true` means the page filled up and the\ncaller should immediately ask again rather than wait for the next poll tick.\n\n`job.running` is included because the console needs to know whether to keep polling, and\nderiving it from `events[-1].kind == \"summary\"` would make a killed run look finished.",
+        "operationId": "audit_trail_v1_audit__job_id__trail_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "after_seq",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Return only events with a larger seq",
+              "default": 0,
+              "title": "After Seq"
+            },
+            "description": "Return only events with a larger seq"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5000,
+              "minimum": 1,
+              "default": 500,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audit/{job_id}/report": {
+      "get": {
+        "summary": "Audit Report",
+        "description": "The finished markdown report, or a 404 while the run is still going.\n\nReturned as JSON with the text in a field rather than as `text/markdown`, because the console\nrenders it in a pane with other metadata and a bare text body would leave it guessing which\nfields exist. The run directory is included so a reader can find the blackboard and the trail\nnext to it.",
+        "operationId": "audit_report_v1_audit__job_id__report_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AnalysisBundleManifest": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version",
+            "default": "1.0"
+          },
+          "bundle_id": {
+            "type": "string",
+            "title": "Bundle Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "workspace_root": {
+            "type": "string",
+            "title": "Workspace Root"
+          },
+          "focus_count": {
+            "type": "integer",
+            "title": "Focus Count",
+            "default": 0
+          },
+          "methods": {
+            "items": {
+              "$ref": "#/components/schemas/MethodSymbol"
+            },
+            "type": "array",
+            "title": "Methods"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            },
+            "type": "array",
+            "title": "Findings"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/CallEdge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "contexts": {
+            "items": {
+              "$ref": "#/components/schemas/MethodContext"
+            },
+            "type": "array",
+            "title": "Contexts"
+          },
+          "prunes": {
+            "items": {
+              "$ref": "#/components/schemas/PruneDecision"
+            },
+            "type": "array",
+            "title": "Prunes"
+          },
+          "degradations": {
+            "items": {
+              "$ref": "#/components/schemas/Degradation"
+            },
+            "type": "array",
+            "title": "Degradations"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/Coverage"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/RunStats"
+          },
+          "capabilities": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Capabilities"
+          },
+          "total_chars": {
+            "type": "integer",
+            "title": "Total Chars",
+            "default": 0
+          },
+          "estimated_tokens": {
+            "type": "integer",
+            "title": "Estimated Tokens",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "bundle_id",
+          "run_id",
+          "workspace_root"
+        ],
+        "title": "AnalysisBundleManifest"
+      },
+      "AnalyzeRequest": {
+        "properties": {
+          "bundle_id": {
+            "type": "string",
+            "title": "Bundle Id",
+            "description": "Which finished bundle under the output dir to analyse."
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace",
+            "description": "Provenance only; the bundle already says what was analysed."
+          }
+        },
+        "type": "object",
+        "required": [
+          "bundle_id"
+        ],
+        "title": "AnalyzeRequest",
+        "description": "Analyse an already-finished bundle with the model.\n\nOnly `bundle_id` is required: the AI stage *consumes* a bundle, so it needs no repository,\nand asking for one would invite a second, contradictory answer about which code the verdicts\ndescribe."
+      },
+      "ArtifactRef": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "ref": {
+            "type": "string",
+            "title": "Ref"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "available": {
+            "type": "boolean",
+            "title": "Available",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "ref"
+        ],
+        "title": "ArtifactRef"
+      },
+      "AssembleRequest": {
+        "properties": {
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace",
+            "description": "Repo path inside the container/workspace."
+          },
+          "sarif_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sarif Path",
+            "description": "Pre-computed SARIF JSON."
+          },
+          "rules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Rules",
+            "description": "opengrep --config values."
+          },
+          "rule_config": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Config",
+            "description": "opengrep config path or registry id (default: auto)."
+          },
+          "include_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Include Globs"
+          },
+          "exclude_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Exclude Globs"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BudgetConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "max_findings": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Findings"
+          },
+          "lsp": {
+            "type": "boolean",
+            "title": "Lsp",
+            "description": "Disable to run in syntax-only degraded mode.",
+            "default": true
+          },
+          "package_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Name"
+          }
+        },
+        "type": "object",
+        "title": "AssembleRequest",
+        "description": "Either point at a repo to scan, or hand over an existing SARIF file."
+      },
+      "AssembleResponse": {
+        "properties": {
+          "bundle_id": {
+            "type": "string",
+            "title": "Bundle Id"
+          },
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "package_path": {
+            "type": "string",
+            "title": "Package Path"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/AnalysisBundleManifest"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "bundle_id",
+          "run_id",
+          "package_path",
+          "manifest"
+        ],
+        "title": "AssembleResponse"
+      },
+      "AuditRequest": {
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "title": "Workspace",
+            "description": "Repo path inside the container/workspace, e.g. /data/projects/x."
+          }
+        },
+        "type": "object",
+        "required": [
+          "workspace"
+        ],
+        "title": "AuditRequest",
+        "description": "Ask the agent harness to review a whole repository.\n\nOnly `workspace` is required, and only `workspace` is accepted: the harness bounds\n(`max_rounds`, `steps_per_agent`, concurrency) are deliberately *not* per-request fields.\nThey are part of what the review produces, so letting a caller vary them would make two\nrequests for the same repository look identical while producing different findings -- and the\njob fingerprint, which is how a resubmission attaches instead of running twice, is built from\nexactly the fields here."
+      },
+      "Body_assemble_upload_v1_assemble_upload_post": {
+        "properties": {
+          "sarif": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Sarif",
+            "description": "SARIF produced by opengrep/semgrep"
+          },
+          "workspace": {
+            "type": "string",
+            "title": "Workspace"
+          },
+          "lsp": {
+            "type": "boolean",
+            "title": "Lsp",
+            "default": true
+          },
+          "max_findings": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Findings"
+          },
+          "budget_json": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Json"
+          },
+          "package_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Name",
+            "description": "explicit bundle id; reused ids overwrite the previous bundle"
+          }
+        },
+        "type": "object",
+        "required": [
+          "sarif",
+          "workspace"
+        ],
+        "title": "Body_assemble_upload_v1_assemble_upload_post"
+      },
+      "Body_upload_project_v1_projects_upload_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "description": "源码压缩包（.zip）"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "analyze": {
+            "type": "boolean",
+            "title": "Analyze",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_project_v1_projects_upload_post"
+      },
+      "BudgetConfig": {
+        "properties": {
+          "max_depth": {
+            "type": "integer",
+            "maximum": 6.0,
+            "minimum": 0.0,
+            "title": "Max Depth",
+            "description": "How many call-graph hops from the sink.",
+            "default": 2
+          },
+          "max_nodes": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Max Nodes",
+            "description": "Max distinct methods in one bundle.",
+            "default": 60
+          },
+          "max_callers_per_node": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Max Callers Per Node",
+            "default": 8
+          },
+          "max_callees_per_node": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Max Callees Per Node",
+            "default": 12
+          },
+          "max_implementations": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Max Implementations",
+            "default": 5
+          },
+          "max_lines_per_method": {
+            "type": "integer",
+            "minimum": 10.0,
+            "title": "Max Lines Per Method",
+            "default": 400
+          },
+          "max_chars_per_method": {
+            "type": "integer",
+            "minimum": 500.0,
+            "title": "Max Chars Per Method",
+            "default": 24000
+          },
+          "max_total_chars": {
+            "type": "integer",
+            "minimum": 1000.0,
+            "title": "Max Total Chars",
+            "default": 600000
+          },
+          "max_contexts": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Max Contexts",
+            "description": "Sinks per bundle (findings expanded).",
+            "default": 20
+          },
+          "expand_concurrency": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Expand Concurrency",
+            "default": 6
+          },
+          "lsp_timeout_s": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Lsp Timeout S",
+            "default": 20.0
+          },
+          "read_timeout_s": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Read Timeout S",
+            "default": 5.0
+          }
+        },
+        "type": "object",
+        "title": "BudgetConfig",
+        "description": "Hard caps for call-graph expansion and bundle size.\n\nNothing is ever silently dropped: every cap that bites is recorded in the\n``PruneDecision`` list of the bundle manifest."
+      },
+      "CallEdge": {
+        "properties": {
+          "caller_id": {
+            "type": "string",
+            "title": "Caller Id"
+          },
+          "callee_id": {
+            "type": "string",
+            "title": "Callee Id"
+          },
+          "direction": {
+            "$ref": "#/components/schemas/EdgeDirection"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          },
+          "confidence": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "default": 1.0
+          },
+          "call_site": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CodeRegion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "call_site_snippet": {
+            "type": "string",
+            "title": "Call Site Snippet",
+            "default": ""
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "caller_id",
+          "callee_id",
+          "direction",
+          "provider"
+        ],
+        "title": "CallEdge"
+      },
+      "CodeRegion": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "Path relative to the workspace root when possible."
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Start Line",
+            "default": 0
+          },
+          "start_char": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Start Char",
+            "default": 0
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "End Line",
+            "default": 0
+          },
+          "end_char": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "End Char",
+            "default": 0
+          },
+          "start_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Offset"
+          },
+          "end_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Offset"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "CodeRegion",
+        "description": "A 0-based LSP-style range plus absolute character offsets for cheap slicing."
+      },
+      "Coverage": {
+        "properties": {
+          "discoverable": {
+            "type": "integer",
+            "title": "Discoverable",
+            "default": 0
+          },
+          "bundled": {
+            "type": "integer",
+            "title": "Bundled",
+            "default": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "title": "Rejected",
+            "default": 0
+          },
+          "deduped": {
+            "type": "integer",
+            "title": "Deduped",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "Coverage"
+      },
+      "CreateProjectRequest": {
+        "properties": {
+          "git_url": {
+            "type": "string",
+            "title": "Git Url",
+            "description": "https:// URL of a public repository."
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ref",
+            "description": "Branch or tag; the default branch when empty."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Project name; derived from the URL when empty."
+          },
+          "analyze": {
+            "type": "boolean",
+            "title": "Analyze",
+            "description": "Submit one analysis job for the project once it is fetched.",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "git_url"
+        ],
+        "title": "CreateProjectRequest",
+        "description": "Create a project by cloning a public repository.\n\n`https://` only, and no credential field: a request that cannot carry a token is a request\nwhose token cannot end up in a log line. A private repository is brought in as an uploaded\narchive instead, which is why there is no `token` here to be tempted by."
+      },
+      "Degradation": {
+        "properties": {
+          "capability": {
+            "type": "string",
+            "title": "Capability"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          },
+          "impact": {
+            "type": "string",
+            "title": "Impact"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
+          }
+        },
+        "type": "object",
+        "required": [
+          "capability",
+          "reason",
+          "impact"
+        ],
+        "title": "Degradation",
+        "description": "A capability that was requested but unavailable. Never fail the run for it."
+      },
+      "EdgeDirection": {
+        "type": "string",
+        "enum": [
+          "caller",
+          "callee"
+        ],
+        "title": "EdgeDirection",
+        "description": "Which way the call graph was walked for a given edge."
+      },
+      "FailureMode": {
+        "type": "string",
+        "enum": [
+          "workspace_missing",
+          "sarif_missing",
+          "sarif_unreadable",
+          "scan_failed",
+          "scan_aborted",
+          "extraction_unavailable",
+          "pipeline_exception",
+          "ai_bundle_missing",
+          "ai_failed",
+          "worker_lost",
+          "attempts_exhausted",
+          "internal_error"
+        ],
+        "title": "FailureMode",
+        "description": "Named failures. The hard rule: a job never stays ``running`` because of one.\n\nDeliberately absent: any \"canceled\" member. See the module docstring."
+      },
+      "Finding": {
+        "properties": {
+          "finding_id": {
+            "type": "string",
+            "title": "Finding Id"
+          },
+          "rule_id": {
+            "type": "string",
+            "title": "Rule Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "default": ""
+          },
+          "severity": {
+            "$ref": "#/components/schemas/Severity",
+            "default": "warning"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "region": {
+            "$ref": "#/components/schemas/CodeRegion"
+          },
+          "snippet": {
+            "type": "string",
+            "title": "Snippet",
+            "default": ""
+          },
+          "properties": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Properties"
+          },
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider",
+            "default": "opengrep"
+          }
+        },
+        "type": "object",
+        "required": [
+          "finding_id",
+          "rule_id",
+          "path",
+          "region"
+        ],
+        "title": "Finding",
+        "description": "One opengrep/SARIF result."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          },
+          "opengrep": {
+            "type": "string",
+            "title": "Opengrep"
+          },
+          "lsp_enabled": {
+            "type": "boolean",
+            "title": "Lsp Enabled"
+          },
+          "capabilities": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Capabilities"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "version",
+          "opengrep",
+          "lsp_enabled"
+        ],
+        "title": "HealthResponse"
+      },
+      "Job": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version",
+            "default": "1.0"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind",
+            "default": "assemble"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "default": "queued"
+          },
+          "cancel_requested": {
+            "type": "boolean",
+            "title": "Cancel Requested",
+            "default": false
+          },
+          "cancel_requested_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel Requested At"
+          },
+          "submission": {
+            "$ref": "#/components/schemas/JobSubmission"
+          },
+          "timing": {
+            "$ref": "#/components/schemas/JobTiming"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/JobProgress"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "submission",
+          "timing"
+        ],
+        "title": "Job"
+      },
+      "JobAcceptedResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "deduplicated": {
+            "type": "boolean",
+            "title": "Deduplicated",
+            "default": false
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "state"
+        ],
+        "title": "JobAcceptedResponse",
+        "description": "The 202 body: something was started and the answer will change.\n\nDeliberately not the full `Job` -- the caller gets an id to poll and a flag telling it\nwhether this call did anything. `deduplicated=True` means \"this request was already in\nflight and you are attached to it\", which is the visible half of the idempotency\npromise: the caller learns its submission did not create a second run."
+      },
+      "JobChild": {
+        "properties": {
+          "child_id": {
+            "type": "string",
+            "title": "Child Id"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "default": "queued"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobStage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "result_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Ref"
+          }
+        },
+        "type": "object",
+        "required": [
+          "child_id",
+          "label"
+        ],
+        "title": "JobChild",
+        "description": "One unit of a future AI fan-out. Not produced in this build."
+      },
+      "JobFailure": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/FailureMode"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "default": 1
+          },
+          "recoverable": {
+            "type": "boolean",
+            "title": "Recoverable",
+            "default": false
+          },
+          "scan_record": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScanRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "mode",
+          "message"
+        ],
+        "title": "JobFailure"
+      },
+      "JobKind": {
+        "type": "string",
+        "enum": [
+          "assemble",
+          "scan",
+          "ai_fanout",
+          "audit"
+        ],
+        "title": "JobKind"
+      },
+      "JobListResponse": {
+        "properties": {
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/JobSummary"
+            },
+            "type": "array",
+            "title": "Jobs"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueStatus"
+          }
+        },
+        "type": "object",
+        "title": "JobListResponse"
+      },
+      "JobProgress": {
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/JobStage",
+            "default": "scan"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/JobStageProgress"
+            },
+            "type": "array",
+            "title": "Stages"
+          },
+          "counters": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Counters"
+          },
+          "units_done": {
+            "type": "integer",
+            "title": "Units Done",
+            "default": 0
+          },
+          "units_total": {
+            "type": "integer",
+            "title": "Units Total",
+            "default": 0
+          },
+          "unit_label": {
+            "type": "string",
+            "title": "Unit Label",
+            "default": ""
+          },
+          "worker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Id"
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "default": 1
+          },
+          "stage_started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Started At"
+          },
+          "worker_heartbeat_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Worker Heartbeat At"
+          }
+        },
+        "type": "object",
+        "title": "JobProgress"
+      },
+      "JobRequest": {
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "title": "Workspace"
+          },
+          "sarif_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sarif Path"
+          },
+          "rules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Rules"
+          },
+          "rule_config": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Config"
+          },
+          "include_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Include Globs"
+          },
+          "exclude_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Exclude Globs"
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget"
+          },
+          "max_findings": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Findings"
+          },
+          "lsp": {
+            "type": "boolean",
+            "title": "Lsp",
+            "default": true
+          },
+          "package_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Name"
+          },
+          "bundle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workspace"
+        ],
+        "title": "JobRequest",
+        "description": "What to run. Mirrors the HTTP request but does not import it."
+      },
+      "JobResult": {
+        "properties": {
+          "bundle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Id"
+          },
+          "package_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Path"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "sarif_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sarif Path"
+          },
+          "scan_record": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScanRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings"
+          },
+          "artifacts": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ArtifactRef"
+            },
+            "type": "object",
+            "title": "Artifacts"
+          }
+        },
+        "type": "object",
+        "title": "JobResult",
+        "description": "Pointers, not payloads: the bundle itself stays on disk."
+      },
+      "JobStage": {
+        "type": "string",
+        "enum": [
+          "scan",
+          "setup",
+          "locate",
+          "expand",
+          "read",
+          "assemble",
+          "package",
+          "ai",
+          "done"
+        ],
+        "title": "JobStage",
+        "description": "Execution stages, in lifecycle order.\n\nThe names line up with `RunStats.stage_ms` keys, so a stage's reported duration and\nthe bundle's own timing can be compared directly. ``DONE`` is a sentinel with no\ntiming of its own, used to mean \"the run finished, nothing is in flight\"."
+      },
+      "JobStageProgress": {
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/JobStage"
+          },
+          "state": {
+            "type": "string",
+            "title": "State",
+            "default": "pending"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "counters": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Counters"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stage"
+        ],
+        "title": "JobStageProgress"
+      },
+      "JobState": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "canceled"
+        ],
+        "title": "JobState"
+      },
+      "JobSubmission": {
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "title": "Schema Version",
+            "default": "1.0"
+          },
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind",
+            "default": "assemble"
+          },
+          "request": {
+            "$ref": "#/components/schemas/JobRequest"
+          },
+          "fingerprint": {
+            "type": "string",
+            "title": "Fingerprint"
+          },
+          "submitted_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Submitted At"
+          },
+          "submitted_by": {
+            "type": "string",
+            "title": "Submitted By",
+            "default": "gateway"
+          },
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/JobChild"
+            },
+            "type": "array",
+            "title": "Children"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "request",
+          "fingerprint"
+        ],
+        "title": "JobSubmission"
+      },
+      "JobSummary": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind",
+            "default": "assemble"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "default": "queued"
+          },
+          "cancel_requested": {
+            "type": "boolean",
+            "title": "Cancel Requested",
+            "default": false
+          },
+          "submitted_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Submitted At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "title": "Duration Ms",
+            "default": 0
+          },
+          "stage": {
+            "$ref": "#/components/schemas/JobStage",
+            "default": "scan"
+          },
+          "counters": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Counters"
+          },
+          "units_done": {
+            "type": "integer",
+            "title": "Units Done",
+            "default": 0
+          },
+          "units_total": {
+            "type": "integer",
+            "title": "Units Total",
+            "default": 0
+          },
+          "unit_label": {
+            "type": "string",
+            "title": "Unit Label",
+            "default": ""
+          },
+          "attempt": {
+            "type": "integer",
+            "title": "Attempt",
+            "default": 1
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          },
+          "bundle_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Id"
+          },
+          "failure_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "type": "integer",
+            "title": "Revision",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "submitted_at"
+        ],
+        "title": "JobSummary",
+        "description": "The list view: enough for a first screen, without the per-stage detail.\n\nSeven stage entries per job is the bulk of a `Job`, and a list page renders none of\nthem. Trimming here is not tidiness -- it is the difference between one request that\npaints a queue view and one that drags every job's full history across."
+      },
+      "JobTiming": {
+        "properties": {
+          "submitted_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Submitted At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "queue_wait_ms": {
+            "type": "integer",
+            "title": "Queue Wait Ms",
+            "default": 0
+          },
+          "duration_ms": {
+            "type": "integer",
+            "title": "Duration Ms",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "submitted_at"
+        ],
+        "title": "JobTiming"
+      },
+      "LspProbeResponse": {
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "title": "Workspace"
+          },
+          "available": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Available"
+          },
+          "missing": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Missing"
+          },
+          "degradations": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Degradations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workspace"
+        ],
+        "title": "LspProbeResponse"
+      },
+      "MethodContext": {
+        "properties": {
+          "context_id": {
+            "type": "string",
+            "title": "Context Id"
+          },
+          "finding_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Finding Ids"
+          },
+          "focus_id": {
+            "type": "string",
+            "title": "Focus Id"
+          },
+          "focus": {
+            "$ref": "#/components/schemas/MethodSymbol"
+          },
+          "methods": {
+            "items": {
+              "$ref": "#/components/schemas/MethodRef"
+            },
+            "type": "array",
+            "title": "Methods"
+          },
+          "edges": {
+            "items": {
+              "$ref": "#/components/schemas/CallEdge"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "total_chars": {
+            "type": "integer",
+            "title": "Total Chars",
+            "default": 0
+          },
+          "estimated_tokens": {
+            "type": "integer",
+            "title": "Estimated Tokens",
+            "default": 0
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "context_id",
+          "focus_id",
+          "focus"
+        ],
+        "title": "MethodContext",
+        "description": "One assembled analysis unit: sink + call-graph slice. This is the AI input atom."
+      },
+      "MethodRef": {
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/MethodSymbol"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider"
+          },
+          "depth": {
+            "type": "integer",
+            "title": "Depth",
+            "default": 0
+          },
+          "direction": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EdgeDirection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "via": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Via",
+            "description": "Call site snippet or edge evidence."
+          },
+          "origin_path": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Origin Path",
+            "description": "method_ids from the focus down to this method, inclusive of both ends. This is the provenance chain: it answers 'why is this method here?' without the reader having to re-walk the graph."
+          },
+          "is_focus": {
+            "type": "boolean",
+            "title": "Is Focus",
+            "description": "True for the sink-containing method.",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "method",
+          "provider"
+        ],
+        "title": "MethodRef",
+        "description": "A method plus why we believe it belongs in the bundle."
+      },
+      "MethodSymbol": {
+        "properties": {
+          "method_id": {
+            "type": "string",
+            "title": "Method Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "qualified_name": {
+            "type": "string",
+            "title": "Qualified Name"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SymbolKind",
+            "default": "function"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "region": {
+            "$ref": "#/components/schemas/CodeRegion"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Language"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent",
+            "description": "Enclosing class/module qualified name."
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider",
+            "default": "lsp_document_symbol"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "signature": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Signature"
+          }
+        },
+        "type": "object",
+        "required": [
+          "method_id",
+          "name",
+          "qualified_name",
+          "path",
+          "region"
+        ],
+        "title": "MethodSymbol",
+        "description": "A callable located in the workspace."
+      },
+      "Provider": {
+        "type": "string",
+        "enum": [
+          "opengrep",
+          "joern_dataflow",
+          "lsp_call_hierarchy",
+          "lsp_document_symbol",
+          "lsp_definition",
+          "lsp_references",
+          "lsp_implementation",
+          "syntax_regex",
+          "file_range",
+          "manual",
+          "none"
+        ],
+        "title": "Provider",
+        "description": "How a piece of information was obtained. Never lose this - it is the trust level."
+      },
+      "PruneDecision": {
+        "properties": {
+          "rule": {
+            "type": "string",
+            "title": "Rule"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          },
+          "method_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Method Id"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/Provider",
+            "default": "none"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rule",
+          "detail"
+        ],
+        "title": "PruneDecision",
+        "description": "Why something was cut. The AI and the human reviewer both need this."
+      },
+      "QueueStatus": {
+        "properties": {
+          "workers_alive": {
+            "type": "integer",
+            "title": "Workers Alive",
+            "default": 0
+          },
+          "pending": {
+            "type": "integer",
+            "title": "Pending",
+            "default": 0
+          },
+          "lag": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lag"
+          },
+          "stream_length": {
+            "type": "integer",
+            "title": "Stream Length",
+            "default": 0
+          },
+          "queued": {
+            "type": "integer",
+            "title": "Queued",
+            "default": 0
+          },
+          "degraded": {
+            "type": "boolean",
+            "title": "Degraded",
+            "default": false
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "QueueStatus",
+        "description": "What the queue itself is doing, alongside the jobs.\n\n`queued` climbing while `lag` stays flat is the signature of jobs that were submitted\nand never claimed -- the one failure mode that neither the reaper nor the running sweep\ncan see, because it happens before either has anything to look at."
+      },
+      "RunStats": {
+        "properties": {
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "title": "Duration Ms",
+            "default": 0
+          },
+          "stage_ms": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Stage Ms"
+          },
+          "counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Counts"
+          },
+          "scan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScanRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "title": "RunStats"
+      },
+      "ScanOnlyResponse": {
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "title": "Run Id"
+          },
+          "findings": {
+            "type": "integer",
+            "title": "Findings"
+          },
+          "sarif_path": {
+            "type": "string",
+            "title": "Sarif Path"
+          },
+          "engine": {
+            "type": "string",
+            "title": "Engine"
+          }
+        },
+        "type": "object",
+        "required": [
+          "run_id",
+          "findings",
+          "sarif_path",
+          "engine"
+        ],
+        "title": "ScanOnlyResponse"
+      },
+      "ScanRecord": {
+        "properties": {
+          "engine": {
+            "type": "string",
+            "title": "Engine"
+          },
+          "engine_version": {
+            "type": "string",
+            "title": "Engine Version",
+            "default": ""
+          },
+          "sarif_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sarif Path"
+          },
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Command"
+          },
+          "location": {
+            "type": "string",
+            "title": "Location",
+            "description": "'in-process' or 'remote'. A remote record's `command` and `sarif_path` are real but name paths inside the scan service's filesystem, so whoever reads the bundle must not try to open them.",
+            "default": "in-process"
+          },
+          "returncode": {
+            "type": "integer",
+            "title": "Returncode",
+            "default": 0
+          },
+          "configured": {
+            "type": "boolean",
+            "title": "Configured",
+            "default": false
+          },
+          "zero_findings_is_suspicious": {
+            "type": "boolean",
+            "title": "Zero Findings Is Suspicious",
+            "default": false
+          },
+          "failure_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Mode",
+            "description": "Set when the scan could not yield findings at all (bad exit code, missing or empty SARIF, unparseable SARIF). Distinguishes 'the scanner broke' from 'the repository is clean'."
+          },
+          "stderr_tail": {
+            "type": "string",
+            "title": "Stderr Tail",
+            "default": ""
+          },
+          "rule_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Rule Counts"
+          },
+          "severity_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Severity Counts"
+          },
+          "top_paths": {
+            "items": {
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ],
+              "type": "array",
+              "maxItems": 2,
+              "minItems": 2
+            },
+            "type": "array",
+            "title": "Top Paths"
+          }
+        },
+        "type": "object",
+        "required": [
+          "engine"
+        ],
+        "title": "ScanRecord",
+        "description": "What the scanner was actually asked to do. Observability needs the input, not just the output."
+      },
+      "ScanRequest": {
+        "properties": {
+          "workspace": {
+            "type": "string",
+            "title": "Workspace"
+          },
+          "rules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Rules"
+          },
+          "rule_config": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Config"
+          },
+          "include_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Include Globs"
+          },
+          "exclude_globs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Exclude Globs"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workspace"
+        ],
+        "title": "ScanRequest"
+      },
+      "Severity": {
+        "type": "string",
+        "enum": [
+          "error",
+          "warning",
+          "info",
+          "note"
+        ],
+        "title": "Severity"
+      },
+      "SymbolKind": {
+        "type": "string",
+        "enum": [
+          "function",
+          "method",
+          "constructor",
+          "class",
+          "module",
+          "unknown"
+        ],
+        "title": "SymbolKind"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

@@ -271,11 +271,19 @@ def render_summary(bundle: AnalysisBundle, result: AssemblyResult) -> str:
     ]
     for context in result.contexts:
         providers = sorted({ref.provider.value for ref in context.refs})
+        block_tokens = next(
+            (
+                b.estimated_tokens
+                for b in bundle.prompts
+                if b.block_id == f"context.{context.context_id}"
+            ),
+            context.estimated_tokens,
+        )
         lines.append(
             f"| `{context.context_id}` | {context.focus.method.qualified_name} "
             f"({context.focus.method.path}:{context.focus.method.region.start_line + 1}) "
             f"| {', '.join(providers)} | {context.worst_severity.value} "
-            f"| {len(context.refs)} | {context.estimated_tokens} |"
+            f"| {len(context.refs)} | {block_tokens} |"
         )
     if manifest.prunes:
         lines += ["", "## Pruned during assembly", ""]

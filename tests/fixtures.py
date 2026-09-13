@@ -100,9 +100,7 @@ def write_fixture(root: Path) -> Path:
 def write_two_hits_sarif(path: Path, *, workspace: Path | None = None) -> Path:
     """Two rules hitting the same method: exercises find-duplication, not loss."""
     base = json.loads(
-        write_sarif(path.with_name("_base.sarif"), sink_line=5, workspace=workspace).read_text(
-            encoding="utf-8"
-        )
+        write_sarif(path.with_name("_base.sarif"), workspace=workspace).read_text(encoding="utf-8")
     )
     first = base["runs"][0]["results"][0]
     second = json.loads(json.dumps(first))
@@ -114,11 +112,40 @@ def write_two_hits_sarif(path: Path, *, workspace: Path | None = None) -> Path:
     return path
 
 
-def write_sarif(path: Path, *, sink_line: int = 5, workspace: Path | None = None) -> Path:
-    """A SARIF file that points at repo.py:query_user's string concatenation."""
+def sink_line_in_fixture() -> int:
+    """1-based line of the fixture's concatenation sink, derived from the source.
+
+    This used to be a hardcoded `5` next to a hardcoded `snippet`. When the fixture's
+    leading docstring and blank lines were added, the snippet moved to line 6 and the
+    number did not, so `demo/scan.sarif` claimed a region on the `cursor = connect()`
+    line while quoting the statement below it. Every downstream line number was then
+    off by one -- the bundle looked self-consistent and the prompt still told the model
+    "at repo.py:5" about a line 6 finding. Deriving it means the two cannot drift.
+    """
+    lines = FILES["repo.py"].splitlines()
+    for index, line in enumerate(lines):
+        if "SELECT * FROM users" in line:
+            return index + 1
+    raise AssertionError("the fixture no longer contains its concatenation sink")
+
+
+def write_sarif(
+    path: Path,
+    *,
+    sink_line: int | None = None,
+    workspace: Path | None = None,
+    region_line: int | None = None,
+) -> Path:
+    """A SARIF file that points at repo.py:query_user's string concatenation.
+
+    `sink_line` only feeds the finding id; the *region* defaults to the real sink line, which
+    keeps the document pointing at the snippet it quotes. Tests that need a deliberate
+    position (a finding outside any method, say) pass `region_line` explicitly.
+    """
     uri = "repo.py"
     if workspace is not None:
         uri = (workspace / "repo.py").resolve().as_uri()
+    line = sink_line_in_fixture() if region_line is None else region_line
     doc = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -147,9 +174,9 @@ def write_sarif(path: Path, *, sink_line: int = 5, workspace: Path | None = None
                                 "physicalLocation": {
                                     "artifactLocation": {"uri": uri},
                                     "region": {
-                                        "startLine": sink_line,
+                                        "startLine": line,
                                         "startColumn": 12,
-                                        "endLine": sink_line,
+                                        "endLine": line,
                                         "endColumn": 60,
                                         "snippet": {
                                             "text": 'sql = "SELECT * FROM users WHERE id = \'" + user_id + "\'"'

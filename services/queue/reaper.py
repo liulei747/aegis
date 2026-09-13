@@ -109,22 +109,22 @@ class Reaper:
                 result=JobResult(
                     bundle_id=recovered.name,
                     package_path=str(recovered),
-                    warnings=["recovered: the artifact was already on disk"],
+                    warnings=["已恢复：产物已经在磁盘上"],
                 ),
-                note="recovered",
+                note="已恢复",
             )
             return "recovered"
 
         attempt = job.progress.attempt
         if attempt < self.settings.queue.max_attempts:
-            self.store.requeue(job_id, note=f"reclaimed after a silent claim (attempt {attempt})")
+            self.store.requeue(job_id, note=f"静默认领后已重新认领（第 {attempt} 次尝试）")
             self._requeue_message(job, attempt=attempt + 1)
             return "requeued"
 
         self.store.mark_failed(
             job_id,
             mode=FailureMode.WORKER_LOST,
-            message="the worker holding this job stopped reporting and its retries are spent",
+            message="持有此任务的 worker 已停止上报，且重试次数已用尽",
             detail=f"attempt={attempt} max_attempts={self.settings.queue.max_attempts}",
             recoverable=True,
         )
@@ -217,10 +217,36 @@ def reconcile_startup(store: JobStore, stream: JobStream, settings: Settings) ->
     return report
 
 
+def _worker_is_alive(store: JobStore, worker_id: str | None) -> bool:
+    """Is the worker that holds this job still reporting anywhere?
+
+    This is the right question for the startup sweep, and it is a *different* question from
+    "is this heartbeat fresh" (which is what the periodic reaper asks).
+
+    Why it matters: a slow job has an old heartbeat and a live worker; a crashed job has an old
+    heartbeat and a worker that is gone. The periodic reaper distinguishes them by waiting out
+    `visibility_timeout_s`, because it has no other way to tell "slow" from "dead". A worker
+    *starting up*, by contrast, can check whether the session that claimed the job still
+    exists at all -- its per-worker heartbeat key is refreshed on an interval and expires
+    shortly after the process stops. That is what makes this layer work within seconds of a
+    restart instead of after the visibility timeout (1800s by default, which is how a crashed
+    job was observed sitting in `running` for minutes while the sweep reported it and did
+    nothing).
+    """
+    if not worker_id:
+        return False
+    try:
+        return bool(store.redis.exists(f"aegis:queue:worker:{worker_id}"))
+    except Exception:  # pragma: no cover - Redis trouble; treat as gone
+        return False
+
+
 def _reconcile_running(store: JobStore, stream: JobStream, settings: Settings, job: Job) -> None:
     heartbeat_age = _seconds_since(job.progress.worker_heartbeat_at)
-    if heartbeat_age < settings.queue.visibility_timeout_s:
-        # Someone may still be working on it; the periodic reaper will decide later.
+    if _worker_is_alive(store, job.progress.worker_id):
+        # The holder is still out there. A peer that is merely slow must not be robbed -- that
+        # would invent a failure the user does not have -- so this one is left to the periodic
+        # reaper, which can wait out the visibility timeout before deciding.
         return
     recovered = recoverable_artifact(store, job, settings)
     if recovered is not None:
@@ -229,13 +255,13 @@ def _reconcile_running(store: JobStore, stream: JobStream, settings: Settings, j
             result=JobResult(
                 bundle_id=recovered.name,
                 package_path=str(recovered),
-                warnings=["recovered: the artifact was already on disk"],
+                warnings=["已恢复：产物已经在磁盘上"],
             ),
-            note="recovered",
+            note="已恢复",
         )
         return
     if job.progress.attempt < settings.queue.max_attempts:
-        store.requeue(job.job_id, note="reclaimed at startup: no worker was reporting")
+        store.requeue(job.job_id, note="启动时已重新认领：其 worker 已消失")
         try:
             stream.enqueue(
                 job.job_id,
@@ -246,12 +272,18 @@ def _reconcile_running(store: JobStore, stream: JobStream, settings: Settings, j
             )
         except Exception:  # pragma: no cover
             log.error("startup reconcile could not re-enqueue %s", job.job_id, exc_info=True)
+        log.info(
+            "reclaimed job %s at startup (worker %s gone, heartbeat age %.0fs)",
+            job.job_id,
+            job.progress.worker_id,
+            heartbeat_age,
+        )
         return
     store.mark_failed(
         job.job_id,
         mode=FailureMode.WORKER_LOST,
-        message="the worker holding this job never came back",
-        detail=f"heartbeat age {heartbeat_age:.0f}s",
+        message="持有此任务的 worker 从未回来",
+        detail=f"心跳距今 {heartbeat_age:.0f}s",
         recoverable=True,
     )
 

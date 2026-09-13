@@ -38,7 +38,7 @@ from aegis_contracts.jobs import (
 from aegis_core.config import Settings
 from aegis_core.logging import get_logger
 from app.api.deps import get_job_queue, get_settings, resolve_workspace
-from app.schemas.api import AssembleRequest, ScanRequest
+from app.schemas.api import AnalyzeRequest, AssembleRequest, ScanRequest
 from services.queue.jobs import JobStore
 from services.queue.streams import JobStream
 
@@ -56,29 +56,37 @@ def _queue_unavailable(exc: Exception) -> HTTPException:
     Distinguishing those matters to a caller deciding whether to retry, and it matches how
     the existing `/v1/assemble` route already answers an unreachable extraction service.
     """
-    return HTTPException(status_code=503, detail=f"queue unavailable: {exc}")
+    return HTTPException(status_code=503, detail=f"队列不可用：{exc}")
 
 
-def _job_request(payload: AssembleRequest | ScanRequest, workspace: Path) -> JobRequest:
-    """One job request from either HTTP shape.
+def _job_request(
+    payload: AssembleRequest | ScanRequest | AnalyzeRequest, workspace: Path
+) -> JobRequest:
+    """One job request from any of the HTTP shapes.
 
-    `ScanRequest` is the smaller of the two, so the fields it does not carry are read with
-    `getattr`: a scan job genuinely has no budget, no `max_findings` and no bundle name, and
-    inventing defaults for them here would put values in the fingerprint that the caller
-    never chose.
+    Every field is read with `getattr`, and that is not defensive style -- the payloads genuinely
+    differ. `ScanRequest` has no budget or bundle name; `AnalyzeRequest` has neither rules nor a
+    workspace of its own, because an AI job consumes a finished bundle and needs only its id.
+    Inventing defaults would put values in the fingerprint that the caller never chose, which is
+    what makes two different requests look identical.
+
+    This used to read `rules`/`rule_config`/`include_globs`/`exclude_globs` directly, which
+    crashed with a 500 the first time an `AnalyzeRequest` reached it -- the synchronous path never
+    calls this function, so the unit tests (which had no queue) never saw it.
     """
     budget = getattr(payload, "budget", None)
     return JobRequest(
         workspace=str(workspace),
         sarif_path=getattr(payload, "sarif_path", None) or None,
-        rules=list(payload.rules),
-        rule_config=payload.rule_config,
-        include_globs=list(payload.include_globs),
-        exclude_globs=list(payload.exclude_globs),
+        rules=list(getattr(payload, "rules", None) or []),
+        rule_config=getattr(payload, "rule_config", None),
+        include_globs=list(getattr(payload, "include_globs", None) or []),
+        exclude_globs=list(getattr(payload, "exclude_globs", None) or []),
         budget=budget.model_dump() if budget else None,
         max_findings=getattr(payload, "max_findings", None),
         lsp=getattr(payload, "lsp", True),
         package_name=getattr(payload, "package_name", None),
+        bundle_id=getattr(payload, "bundle_id", None),
     )
 
 
@@ -100,9 +108,20 @@ def _lsp_config_fingerprint(settings: Settings) -> str:
 
 
 def _artifact_available(job: Job) -> bool:
-    """Is a succeeded job's output still there? Cleaned-up output means "run it again"."""
+    """Is a succeeded job's output still there? Cleaned-up output means "run it again".
+
+    What "the output" is depends on the kind, and getting that wrong is not a cosmetic detail: a
+    resubmission of a finished job whose artifact is missing is *re-run*, so a kind whose marker is
+    misread is re-run every single time. An audit's result is the run directory holding the report
+    and the trail -- there is no bundle and therefore no `manifest.json`, and asking for one would
+    answer "gone" forever, turning every second click into another half-hour paid run.
+    """
     if job.result is None:
         return False
+    if job.kind is JobKind.AUDIT:
+        return bool(job.result.package_path) and (
+            Path(job.result.package_path) / "report.md"
+        ).is_file()
     if job.result.package_path:
         return (Path(job.result.package_path) / "manifest.json").is_file()
     return False
@@ -110,7 +129,7 @@ def _artifact_available(job: Job) -> bool:
 
 def submit(
     *,
-    payload: AssembleRequest | ScanRequest,
+    payload: AssembleRequest | ScanRequest | AnalyzeRequest,
     kind: JobKind,
     force: bool,
     store: JobStore,
@@ -118,7 +137,7 @@ def submit(
     settings: Settings,
     response: Response,
 ) -> JobAcceptedResponse | Job:
-    """Shared submission path for assemble and scan jobs.
+    """Shared submission path for assemble, scan and AI jobs.
 
     Returns either a 202 body (accepted, will change) or a full `Job` (already final), which
     the route turns into the matching status code.
@@ -130,7 +149,7 @@ def submit(
         if not path.exists():
             # Before enqueueing: a request that cannot work should not cost a queue slot
             # and a round trip to find out.
-            raise HTTPException(status_code=400, detail=f"sarif not found: {path}")
+            raise HTTPException(status_code=400, detail=f"未找到 SARIF：{path}")
 
     request = _job_request(payload, workspace)
     submission = store.new_submission(
@@ -143,14 +162,26 @@ def submit(
         existing = store.get_by_fingerprint(submission.fingerprint)
         if existing is not None:
             return _handle_duplicate(
-                existing, submission, force=force, store=store, stream=stream, response=response
+                existing,
+                submission,
+                force=force,
+                store=store,
+                stream=stream,
+                settings=settings,
+                response=response,
             )
 
         job, created = store.create(submission)
         if not created:
             # Lost a race with a concurrent submission of the same request: attach to theirs.
             return _handle_duplicate(
-                job, submission, force=False, store=store, stream=stream, response=response
+                job,
+                submission,
+                force=False,
+                store=store,
+                stream=stream,
+                settings=settings,
+                response=response,
             )
         stream.ensure_group()
         stream.enqueue_submission(submission)
@@ -165,6 +196,35 @@ def submit(
     )
 
 
+def _archive_previous_audit_attempt(existing: Job, settings: Settings) -> None:
+    """Move a finished audit attempt's artifacts aside, before the redrive is enqueued.
+
+    A redrive reuses the job id -- it is a fingerprint of the workspace -- and therefore the run
+    directory. Until the new attempt writes its first byte, `<work_dir>/audit/<job_id>/report.md`
+    and `trail.jsonl` still hold the previous attempt's bytes, and `GET /v1/audit/{id}/report`
+    serves them as this attempt's conclusion; the worker only truncates the trail once the harness
+    attaches, which is after a worker picks the job up. So the archiving happens here, at the
+    moment the request is accepted, which is the earliest instant the gateway can act.
+
+    Called at the two points where a duplicate actually *starts* a new attempt, never on the
+    "this is the answer" path: a 200 that returns the finished job must not touch its artifacts.
+
+    Only an audit has a run directory like this. The other kinds write a content-addressed bundle
+    under `output_dir`, whose files must not be moved or deleted by a resubmission.
+
+    Never raises: an archive that fails is a stale file, not a reason to refuse a valid re-run.
+    """
+    if existing.kind is not JobKind.AUDIT:
+        return
+    # Imported here, not at module scope: `app.api.audit` imports `submit` from this module, so a
+    # top-level import would be a cycle at import time.
+    from app.api.audit import archive_previous_attempt
+
+    # The number of the attempt being replaced. `store.redrive` increments the record's counter, so
+    # it is read here -- attempt N's report is archived as attempt N.
+    archive_previous_attempt(existing.job_id, existing.progress.attempt, settings)
+
+
 def _handle_duplicate(
     existing: Job,
     submission,
@@ -172,6 +232,7 @@ def _handle_duplicate(
     force: bool,
     store: JobStore,
     stream: JobStream,
+    settings: Settings,
     response: Response,
 ) -> JobAcceptedResponse | Job:
     """A request with this fingerprint already exists. Decide what that means."""
@@ -186,16 +247,22 @@ def _handle_duplicate(
         )
 
     if existing.state is JobState.SUCCEEDED:
-        if _artifact_available(existing):
+        if _artifact_available(existing) and not force:
             # 200: this is the final answer, not a promise to produce one.
             response.status_code = status.HTTP_200_OK
             return existing
-        # Succeeded but the bundle was cleaned up: the result is not usable, so redo it.
-        restarted = store.redrive(
-            existing.job_id,
-            note="re-running: the previous bundle is gone",
-            allow_success=True,
+        # Either the bundle was cleaned up (the result is a dangling reference), or the caller
+        # asked for it again. `force` has to reach a succeeded job too: for an AI job the answer
+        # is a model's opinion, so running it again is meaningful in a way that re-running a
+        # content-addressed bundle is not -- and without this the same request could never be
+        # re-run at all, because the fingerprint (and therefore the job id) does not change.
+        reason = (
+            "重新运行：先前的分析包已不存在"
+            if not _artifact_available(existing)
+            else "按请求重新运行"
         )
+        _archive_previous_audit_attempt(existing, settings)
+        restarted = store.redrive(existing.job_id, note=reason, allow_success=True)
         if restarted is not None:
             _reenqueue(stream, restarted)
         response.status_code = status.HTTP_202_ACCEPTED
@@ -220,9 +287,10 @@ def _handle_duplicate(
             detail["failure"] = existing.failure.model_dump(mode="json")
         raise HTTPException(status_code=409, detail=detail)
 
-    restarted = store.redrive(existing.job_id, note="re-running at the caller's request")
+    _archive_previous_audit_attempt(existing, settings)
+    restarted = store.redrive(existing.job_id, note="按调用方请求重新运行")
     if restarted is None:  # pragma: no cover - it existed a moment ago
-        raise HTTPException(status_code=409, detail="job disappeared before it could be retried")
+        raise HTTPException(status_code=409, detail="任务在重试前消失了")
     _reenqueue(stream, restarted)
     response.status_code = status.HTTP_202_ACCEPTED
     response.headers["Location"] = f"/v1/jobs/{restarted.job_id}"
@@ -260,7 +328,7 @@ def _reenqueue(stream: JobStream, job: Job) -> None:
 def submit_assemble(
     payload: AssembleRequest,
     response: Response,
-    force: bool = Query(False, description="Re-run even if a previous attempt failed"),
+    force: bool = Query(False, description="Run it again even though a previous attempt finished"),
     queue: tuple[JobStore, JobStream] = Depends(get_job_queue),
     settings: Settings = Depends(get_settings),
 ):
@@ -350,7 +418,7 @@ def get_job(
     except RedisError as exc:
         raise _queue_unavailable(exc) from exc
     if job is None:
-        raise HTTPException(status_code=404, detail="job not found or expired")
+        raise HTTPException(status_code=404, detail="未找到任务或任务已过期")
     return job
 
 
@@ -365,7 +433,7 @@ def cancel_job(
     try:
         job = store.get(job_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="job not found or expired")
+            raise HTTPException(status_code=404, detail="未找到任务或任务已过期")
 
         if job.state in TERMINAL_STATES:
             if job.state is JobState.CANCELED:
@@ -384,7 +452,7 @@ def cancel_job(
         if job.state is JobState.QUEUED:
             # Nobody has claimed it, so it can be finished off right here. If a worker does
             # claim it a moment later, `handle()` sees a terminal job and stops.
-            updated = store.mark_canceled(job.job_id, note="canceled before it started")
+            updated = store.mark_canceled(job.job_id, note="启动前已取消")
             response.status_code = status.HTTP_202_ACCEPTED
             return {
                 "job_id": job.job_id,

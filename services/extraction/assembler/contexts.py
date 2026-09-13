@@ -131,7 +131,7 @@ class ContextAssembler:
                 result.prunes.append(
                     PruneDecision(
                         rule="max_contexts",
-                        detail=f"context dropped: max_contexts={self.budget.max_contexts} reached",
+                        detail=f"上下文被丢弃：已达到 max_contexts={self.budget.max_contexts}",
                         method_id=group[0].focus.method_id,
                         path=group[0].focus.path,
                         line=group[0].focus.region.start_line,
@@ -200,9 +200,9 @@ class ContextAssembler:
                     PruneDecision(
                         rule="max_chars_per_method",
                         detail=(
-                            "body truncated to "
-                            f"{self.budget.max_lines_per_method} lines / "
-                            f"{self.budget.max_chars_per_method} chars"
+                            "正文被截断为 "
+                            f"{self.budget.max_lines_per_method} 行 / "
+                            f"{self.budget.max_chars_per_method} 字符"
                         ),
                         method_id=method_id,
                         path=ref.method.path,

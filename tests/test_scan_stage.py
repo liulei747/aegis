@@ -34,7 +34,7 @@ def _pipeline(tmp_path: Path, workspace: Path, **overrides) -> AssemblyPipeline:
 # Path A: an existing SARIF file
 # ----------------------------------------------------------------------
 def test_path_a_parses_sarif_and_records_the_invocation(tmp_path: Path, workspace: Path) -> None:
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     pipeline = _pipeline(tmp_path, workspace)
 
     findings, path, engine, warnings, record = pipeline._collect_findings(
@@ -56,7 +56,7 @@ def test_path_a_parses_sarif_and_records_the_invocation(tmp_path: Path, workspac
     finding = findings[0]
     assert finding.severity is Severity.ERROR
     assert finding.path == "repo.py"
-    assert finding.region.start_line == 4  # SARIF is 1-based, we store 0-based
+    assert finding.region.start_line == 5  # SARIF is 1-based, we store 0-based
     assert finding.snippet.startswith("sql =")
     assert finding.properties["rule_summary"] == "SQL injection"
     assert finding.fingerprint == "fixture-fingerprint-1"
@@ -241,7 +241,7 @@ def test_scan_outcome_without_cancel_keeps_the_four_failure_modes(
         assert result.canceled is False, label
         assert result.scan_record is not None
         assert result.scan_record.failure_mode is not None
-        assert result.scan_record.failure_mode.startswith("scanner exited with rc=")
+        assert result.scan_record.failure_mode.startswith("扫描器已退出（rc=")
 
 
 def test_opengrep_scan_uses_popen_and_exposes_the_handle(
@@ -333,6 +333,67 @@ def test_scanner_argv_is_untouched(monkeypatch, tmp_path: Path) -> None:
     assert captured["cmd"] == expected
 
 
+def test_terminating_a_scan_reaches_its_grandchildren(tmp_path: Path, monkeypatch) -> None:
+    """Killing only the direct child is not a cancel, and this is the measurement that says so.
+
+    `opengrep` is a launcher: the process we spawn runs `opengrep-core`, and the core is what
+    burns CPU. In the container stack a cancel once reported success, emptied the service's
+    running-scan list, and left `opengrep-core` at 640% CPU -- the worst kind of bug, because
+    every observable said it had worked.
+
+    So the test spawns a process that spawns a child of its own, cancels it, and then checks
+    that *nothing* is left: not the launcher, not the grandchild. An implementation that only
+    signals the direct child fails here.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+
+    from services.scan.opengrep import terminate_tree
+
+    marker = tmp_path / "grandchild-survived"
+    child_code = (
+        "import subprocess, sys, time;"
+        f"p = subprocess.Popen([sys.executable, '-c', \"import time; time.sleep(30); "
+        f"open(r'{marker}', 'w').close()\"]);"
+        "p.wait()"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        time.sleep(1.5)  # let the grandchild exist
+        terminate_tree(proc, grace_s=2.0)
+        time.sleep(2.5)  # long enough for a surviving grandchild to write its marker
+        assert proc.poll() is not None, "the launcher must be gone"
+        assert not marker.exists(), (
+            "a grandchild outlived the cancel: `terminate_tree` must signal the process "
+            "group, not just the direct child"
+        )
+    finally:
+        if proc.poll() is None:  # pragma: no cover - cleanup only
+            proc.kill()
+
+
+def test_terminate_tree_is_safe_on_an_already_dead_process() -> None:
+    """It never raises, so a cancel path can call it unconditionally."""
+    import subprocess
+    import sys
+
+    from services.scan.opengrep import terminate_tree
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    proc.wait(timeout=30)
+    terminate_tree(proc)  # must not raise
+    terminate_tree(proc)
+
+
 # ----------------------------------------------------------------------
 # Path B: the pipeline runs the scanner itself
 # ----------------------------------------------------------------------
@@ -359,9 +420,9 @@ def test_path_b_missing_binary_degrades_to_empty_result_not_an_exception(
     assert findings == []
     assert engine == "definitely-not-installed-opengrep"
     assert record.failure_mode is not None
-    assert "could not be started" in record.failure_mode
+    assert "无法启动" in record.failure_mode
     assert record.zero_findings_is_suspicious is True
-    assert warnings and "could not be started" in warnings[0]
+    assert warnings and "无法启动" in warnings[0]
 
 
 def test_scan_service_probe_reports_a_missing_engine() -> None:
@@ -430,7 +491,7 @@ def test_path_b_empty_sarif_is_a_failure_mode_not_a_clean_result(
         PipelineRequest(workspace=workspace, rule_config="auto"), "R-b"
     )
     assert findings == []
-    assert "empty SARIF" in (record.failure_mode or "")
+    assert "SARIF 文件为空" in (record.failure_mode or "")
     assert record.zero_findings_is_suspicious is True
 
 
@@ -454,7 +515,7 @@ def test_path_b_corrupt_sarif_is_a_failure_mode_not_a_crash(
         PipelineRequest(workspace=workspace, rule_config="auto"), "R-b"
     )
     assert findings == []
-    assert "not valid SARIF" in (record.failure_mode or "")
+    assert "不是有效的 SARIF" in (record.failure_mode or "")
     assert record.zero_findings_is_suspicious is True
 
 
@@ -476,8 +537,8 @@ def test_path_b_missing_sarif_file_is_a_failure_mode(
         PipelineRequest(workspace=workspace, rule_config="auto"), "R-b"
     )
     assert findings == []
-    assert "no SARIF output" in (record.failure_mode or "")
-    assert any("no SARIF output" in w for w in warnings)
+    assert "未产出 SARIF 输出" in (record.failure_mode or "")
+    assert any("未产出 SARIF 输出" in w for w in warnings)
 
 
 def test_path_b_zero_findings_without_explicit_rules_is_flagged(
@@ -514,11 +575,8 @@ def test_path_b_successful_scan_is_not_suspicious(
     from services.scan.opengrep import ScanOutcome
 
     sarif = tmp_path / "work" / "R-b" / "opengrep.sarif"
-    payload = json.loads(
-        write_sarif(tmp_path / "src.sarif", sink_line=5, workspace=workspace).read_text(
-            encoding="utf-8"
-        )
-    )
+    source = write_sarif(tmp_path / "src.sarif", workspace=workspace)
+    payload = json.loads(source.read_text(encoding="utf-8"))
 
     def fake_scan(self, target, **kwargs):
         sarif.parent.mkdir(parents=True, exist_ok=True)
@@ -587,7 +645,7 @@ def test_failed_scan_still_produces_a_bundle_that_says_why(
     from aegis_contracts import views
 
     overview = views.overview(manifest)
-    assert any("zero findings" in flag for flag in overview.warning_flags)
+    assert any("零命中" in flag for flag in overview.warning_flags)
     summary = views.scan_summary(manifest)
     assert summary and summary["failure_mode"]
 

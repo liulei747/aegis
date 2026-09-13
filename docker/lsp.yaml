@@ -45,9 +45,28 @@ servers:
   - language: rust
     command: ['rust-analyzer']
     extensions: ['.rs']
+    # Disabled, and this one stays disabled: the image does not install rust-analyzer. Leaving
+    # it enabled would add a "no language server for .rs" degradation per Rust file, which is
+    # noise rather than information.
     enabled: false
 
   - language: java
     command: ['jdtls']
     extensions: ['.java']
-    enabled: false
+    # Enabled as of the jdtls install. It was `false` while the image shipped no Java server,
+    # and that flag -- not the missing binary -- was the reason a Java project silently fell
+    # back to a heuristic call graph: the catalog entry is what `client_for` consults, so
+    # installing the server alone changed nothing.
+    init_options:
+      # The image has no Maven repository, so jdt.ls cannot resolve dependencies from the
+      # network. It still parses the local sources, which is what the call graph is built
+      # from; unresolved imports degrade symbol resolution inside those files.
+      settings:
+        java:
+          import:
+            maven:
+              enabled: false
+          configuration:
+            updateBuildConfiguration: interactive
+          autobuild:
+            enabled: false

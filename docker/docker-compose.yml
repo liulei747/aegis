@@ -1,16 +1,17 @@
 # Aegis - local development stack.
 #
-# Five services today, each with one job (see docs/SERVICE_TOPOLOGY.md):
+# Seven services by default, each with one job (see docs/SERVICE_TOPOLOGY.md):
 #
-#   scan      opengrep only              :8101 (internal only)  625 MB, CPU bound
-#   extract   LSP + graph + packaging    :8103 (internal only)  1.9 GB, memory bound
-#   worker    consumes the job queue     :8104 (internal only)  same image as gateway
-#   redis     job state + streams        :6379 (internal only)  no persistence
-#   gateway   orchestration + queries    :8100 (published)      thin, stateless
+#   scan       opengrep only             :8101 (internal only)  625 MB, CPU bound
+#   extract    LSP + graph + packaging   :8103 (internal only)  1.9 GB, memory bound
+#   worker     consumes the job queue    :8104 (internal only)  same image as gateway
+#   dataflow-N Joern taint flows         :8105 (internal only)  5.9 GB each, one JVM each
+#   redis      job state + streams       :6379 (internal only)  no persistence
+#   gateway    orchestration + queries   :8100 (published)      thin, stateless
 #
-#   web       the console                :8102 (published)      NOT BUILT YET
-#             planned as its own nginx + static service; the backend views it
-#             needs are already served, see services/web/README.md
+#   frontend   the console (static)       :8102 (published)      no API coupling
+#              its own image; it is told where the API is with AEGIS_API_BASE and calls it
+#              cross-origin, so it can also be deployed on its own, see frontend/README.md
 #
 # WHY THE WORKER RUNS EXTRACTION IN-PROCESS, AND WHY IT HAS NO EXTRACTION URL:
 # it would be simpler to have the worker POST to `extract`, and it is wrong, for three
@@ -83,6 +84,11 @@ services:
     volumes:
       # The code under analysis, read-only by design: Aegis never writes to a repo.
       - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      # Projects created from a repository or an uploaded archive. Read-only here: the scanner
+      # reads code and never writes to it. The container path must be identical in every
+      # service that analyses it -- a job names its project by that path, and the dataflow
+      # router hashes it to pick a worker.
+      - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects:ro
       # Raw SARIF, shared with the extractor via the same path.
       - ../var/work:/data/work
     healthcheck:
@@ -115,16 +121,29 @@ services:
       # built for it instead of in this one. Without this line extraction silently
       # scans for itself, so it is not optional here.
       AEGIS_SCAN_SERVICE_URL: http://scan:8101
+      # Taint flows from the worker fleet. WORKER_COUNT must equal the number of
+      # dataflow-N services actually started: affinity divides the project hash by it, so a
+      # larger number sends projects to a worker that is not there.
+      AEGIS_DATAFLOW__ENABLED: "true"
+      AEGIS_DATAFLOW__WORKER_COUNT: "2"
       AEGIS_BUDGET__MAX_DEPTH: "2"
       AEGIS_BUDGET__MAX_NODES: "60"
       AEGIS_BUDGET__MAX_CONTEXTS: "20"
+      # --- AI stage -------------------------------------------------------------
+      # This service is the synchronous extraction entry point (used when no queue is
+      # configured), so it needs the AI settings for the same reason the gateway does.
+      AEGIS_AI__ENABLED: "true"
+      AEGIS_AI__BASE_URL: ${API_URL:-}
+      AEGIS_AI__MODEL: ${MODEL:-}
+      AEGIS_AI__API_KEY_ENV: API_KEY
+      API_KEY: ${API_KEY:-}
     entrypoint:
       ["uvicorn", "services.extraction.app:app", "--host", "0.0.0.0", "--port", "8103", "--no-access-log"]
     volumes:
       - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects:ro
       - ../var/packages:/data/packages
       - ../var/work:/data/work
-      - ./lsp.local.yaml:/opt/aegis/lsp.yaml:ro
     healthcheck:
       test:
         ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8103/health', timeout=5).status == 200 else 1)"]
@@ -161,15 +180,28 @@ services:
       AEGIS_QUEUE__REDIS_URL: redis://redis:6379/0
       # Scanning stays delegated (small image, CPU bound).
       AEGIS_SCAN_SERVICE_URL: http://scan:8101
+      # Taint flows run here too -- this service is the other caller of the extraction code,
+      # so it needs the same fleet size as `extract` or a project would route differently
+      # depending on which path ran it.
+      AEGIS_DATAFLOW__ENABLED: "true"
+      AEGIS_DATAFLOW__WORKER_COUNT: "2"
       # Extraction deliberately NOT delegated: see the file header. An empty value here is
       # the assertion that nobody re-added it by habit.
       AEGIS_EXTRACTION_SERVICE_URL: ""
+      # --- AI stage -------------------------------------------------------------
+      # The queued path runs the fan-out here, so this container needs the same settings as the
+      # gateway. See the gateway's block for why `--env-file .env` is required.
+      AEGIS_AI__ENABLED: "true"
+      AEGIS_AI__BASE_URL: ${API_URL:-}
+      AEGIS_AI__MODEL: ${MODEL:-}
+      AEGIS_AI__API_KEY_ENV: API_KEY
+      API_KEY: ${API_KEY:-}
     entrypoint: ["aegis-worker"]
     volumes:
       - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects:ro
       - ../var/packages:/data/packages
       - ../var/work:/data/work
-      - ./lsp.local.yaml:/opt/aegis/lsp.yaml:ro
     healthcheck:
       # No HTTP surface: what a worker's health means is "Redis is reachable and my loop is
       # turning over", which is the same signal the reaper uses to tell slow from dead.
@@ -205,9 +237,37 @@ services:
       # The queue is what turns /v1/assemble into a 202 + job id. Unset it and the old
       # synchronous path is used, which is the supported way to run without a broker.
       AEGIS_QUEUE__REDIS_URL: redis://redis:6379/0
+      # --- AI stage -------------------------------------------------------------
+      # Both callers need this: the gateway runs it synchronously when there is no queue, and
+      # the worker runs it for an `ai_fanout` job. The credential is passed by *reference* --
+      # `API_KEY: ${API_KEY:-}` pulls the value from the environment compose was invoked with,
+      # so the key never appears in this file.
+      #
+      # compose does NOT read the checkout's `.env`: the project directory is this `docker/`
+      # folder, so the root `.env` is invisible to it. Invoke it explicitly:
+      #
+      #     docker compose -f docker/docker-compose.yml --env-file .env up -d
+      #
+      # Without that flag the stage is enabled with no credential, refuses to call, and says so
+      # in `/health` (`capabilities.ai.api_key_present`) and in the job's warnings.
+      AEGIS_AI__ENABLED: "true"
+      AEGIS_AI__BASE_URL: ${API_URL:-}
+      AEGIS_AI__MODEL: ${MODEL:-}
+      AEGIS_AI__API_KEY_ENV: API_KEY
+      API_KEY: ${API_KEY:-}
+      # --- dataflow fleet -------------------------------------------------------
+      # All three extraction callers get the same settings: a project must route to the same
+      # worker whichever path ran it, or its graph would be rebuilt per caller.
+      AEGIS_DATAFLOW__ENABLED: "true"
+      AEGIS_DATAFLOW__WORKER_COUNT: "2"
+      # AEGIS_DATAFLOW__WORKER_URL_TEMPLATE keeps its default (`http://dataflow-{index}:8105`),
+      # which is the compose service naming.
     volumes:
       # Same paths as the workers, because it hands paths between them.
       - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      # The ONLY writable mount of the projects root, and the only service that needs it:
+      # creating a project (clone or upload) happens here. Every reader gets it read-only.
+      - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects
       - ../var/packages:/data/packages
       - ../var/work:/data/work
     healthcheck:
@@ -218,23 +278,108 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # ── web: the review console. Published, static, and a pure renderer. ──────
+  # ── dataflow-N: the Joern worker fleet. Internal only. ────────────────────
+  #
+  # WHY A FLEET. Joern answers a taint question in ~1 s only while the project's graph is
+  # resident in its JVM. A session that has to load a project pays the server start (~11 s,
+  # measured) plus the CPG import, and a CPG that is not on disk pays a build as well. So each
+  # worker keeps projects loaded and `router.worker_for()` -- a pure function of the workspace
+  # content hash -- decides which worker owns a project. One worker serialises its queries by
+  # design (a single Joern session cannot answer two at once); N workers answer N projects
+  # concurrently. Measured with two workers on the demo: 2 parallel queries, 1.99x speedup.
+  #
+  # WHY EVERY WORKER MOUNTS THE SAME /workspace. This is not a demo shortcut. Affinity is a
+  # *policy* -- keep a graph hot -- and not a routing necessity: if each worker mounted a
+  # different project, a request routed to the "wrong" worker would 404 on a path it cannot
+  # see. Identical mounts make a wrong guess merely slower, and they preserve the shared-volume
+  # contract in the file header: the extractor sends the path it already has, no translation.
+  # To serve several repositories, mount their *parent* into a path every worker shares
+  # (`${AEGIS_DATAFLOW_WORKSPACES:-../var/workspaces}:/workspaces:ro`) and point
+  # AEGIS_SCAN_TARGET/AEGIS_WORKSPACE_ROOT at the same place in every service.
+  #
+  # THE CACHE IS SPLIT, NOT SHARED WHOLESALE. `/data/dataflow/cpg/<digest>/cpg.bin` is written
+  # once per project by whichever worker gets there first (atomically, via a staging file) and
+  # reused by the rest; each worker's own scratch (`/data/dataflow/worker-<index>/`) holds the
+  # project directories Joern materialises under its working directory, which must not collide.
+  #
+  # NOT A DEPENDENCY OF extract OR worker, deliberately. Both probe the owning worker's
+  # /health and, if it is down, record a warning on the bundle and fall back to the
+  # caller/callee crawl. Gating their startup on a 5.9 GB JVM would trade a degraded bundle
+  # for no bundle at all.
+  #
+  # Scaling: `docker compose up --scale dataflow-0=...` does not work here, because affinity
+  # divides by AEGIS_DATAFLOW__WORKER_COUNT and the service names must stay `dataflow-<index>`.
+  # Add `dataflow-2:` (copy the block, change the index) and raise the count in the two
+  # services that build the client.
+  #
+  # The YAML anchor is the only thing shared between the workers; their index is the only
+  # difference, and duplicating the block twice is how the two copies drift apart.
+  dataflow-0: &dataflow-worker
+    build:
+      context: ..
+      dockerfile: services/dataflow/Dockerfile
+      args:
+        # The official image is not anonymously pullable from every network. On a host that
+        # already has it locally, retag and point this at the local name.
+        JOERN_IMAGE: ${AEGIS_JOERN_IMAGE:-ghcr.io/joernio/joern}
+    image: aegis-dataflow:0.1.0
+    # No `container_name:` on purpose -- a fixed name is what would block a second replica
+    # later. Reach a worker by its service name, which is also what worker_url_template uses.
+    environment:
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_DATAFLOW__WORKER_INDEX: "0"
+    expose:
+      - "8105"
+    volumes:
+      - ${AEGIS_SCAN_TARGET:-../demo/repo}:/workspace:ro
+      # Joern is handed a project by *path*, so this mount is what makes a project created
+      # under /data/projects reachable from the taint analysis at all.
+      - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects:ro
+      - ${AEGIS_DATAFLOW_CACHE:-../var/dataflow}:/data/dataflow
+    healthcheck:
+      # The image reports `cold` until its Joern server is up, so `-f` on /health is a real
+      # readiness signal and not just "uvicorn answered".
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8105/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Long on purpose: this is the container paying the JVM start once, not a failing service.
+      start_period: 60s
+    restart: unless-stopped
+    shm_size: "512m"
+
+  dataflow-1:
+    <<: *dataflow-worker
+    environment:
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_DATAFLOW__WORKER_INDEX: "1"
+
+  # ── frontend: the console. Static files, deployed independently of the API. ──
   #
   # Its own image on purpose: editing a component must not rebuild the 2 GB Python image, and
-  # a route change must not rebuild this one. It proxies `/v1` to the gateway so the browser
-  # only ever talks to one origin -- no CORS, and no API host baked into the bundle.
+  # a route change must not rebuild this one.
+  #
+  # Unlike the console it replaces, it does NOT proxy `/v1` through its own origin. The browser
+  # calls the gateway directly, so the address below is the gateway *as the browser sees it* --
+  # a published host and port, not the compose service name -- and the request is cross-origin,
+  # which is why the gateway's AEGIS_CORS__ALLOW_ORIGINS has to include this origin. The payoff
+  # is that this image carries no knowledge of the deployment and can be put anywhere.
   #
   # It deliberately does *not* depend on the gateway being healthy: nginx starts, serves the
   # page, and the page reports the API being unreachable. Refusing to start would hide an
   # outage behind a blank browser error.
-  web:
+  frontend:
     build:
       context: ..
-      dockerfile: services/web/Dockerfile
-    image: aegis-web:0.1.0
-    container_name: aegis-web
+      dockerfile: docker/frontend.Dockerfile
+    image: aegis-frontend:0.1.0
+    container_name: aegis-frontend
     ports:
-      - "127.0.0.1:${AEGIS_WEB_PORT:-8102}:8102"
+      - "127.0.0.1:${AEGIS_FRONTEND_PORT:-8102}:8102"
+    environment:
+      # 127.0.0.1 because the browser runs on this host. A real deployment sets this to the
+      # gateway's public URL, and nothing else in the image changes.
+      AEGIS_API_BASE: ${AEGIS_FRONTEND_API_BASE:-http://127.0.0.1:${AEGIS_GATEWAY_PORT:-8100}}
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8102/healthz"]
       interval: 30s
@@ -242,3 +387,65 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+
+  # ── harness: the agent harness. A tool, not a service. ─────────────────────
+  #
+  # `profiles: ["tools"]` keeps it out of a plain `up`: nothing starts it, nothing depends on it,
+  # and it publishes no port. It is invoked explicitly, one run per workspace:
+  #
+  #     docker compose -f docker/docker-compose.yml --env-file .env run --rm harness \
+  #       run --workspace /data/projects/<name> --out /opt/aegis/var/harness/<name>
+  #
+  # THE SAME CODE ALSO RUNS AS A QUEUED JOB, which is the console's path: an `audit` job claimed by
+  # `worker` builds the same coordinator in-process and writes to `/data/work/audit/<job_id>/` --
+  # `trail.jsonl` (the live event log the audit screen polls), `blackboard.json` and `report.md`.
+  # Two consequences worth knowing before debugging either path:
+  #   * the worker runs the *installed* copy of `services/`, so a harness edit needs an image
+  #     rebuild to reach a queued audit, while this service sees the mounted checkout immediately;
+  #   * output location differs on purpose. A queued run must land where the gateway can read it,
+  #     and `/data/work` is the one path all three containers mount at the same place.
+  #
+  # Why it runs *in here* rather than on the host, which would be far more convenient: the
+  # `dataflow-N` fleet is `expose`-only, so the Joern workers are reachable by service name from
+  # this network and from nowhere else. A host-side run still gets `read`, `list_files` and
+  # `shell_command`, and gets a `dataflow_verify` that can never succeed -- which is the worst
+  # shape of all, because misses caused by the deployment would be reported as facts about the
+  # code.
+  #
+  # Two lines below are load-bearing, and both were measured rather than assumed:
+  #   * `../:/opt/aegis` -- the main image *pip-installs* `aegis_core`/`aegis_contracts`, so
+  #     without this mount the harness imports the snapshot baked at build time. Editing harness
+  #     code and re-running would silently do nothing at all.
+  #   * `PYTHONPATH: /opt/aegis` -- the main image does not set it (only the dataflow image
+  #     does), so the mount alone is invisible and `aegis_core` still resolves to site-packages.
+  #     With it the checkout wins, and no image rebuild is needed for a harness change.
+  #
+  # `/data/projects` is read-only on purpose: the harness reviews a repository it did not write,
+  # and its shell allow-list is only a believable guarantee if the mount agrees with it. Output
+  # belongs under the checkout, which is writable.
+  #
+  # No `depends_on:` on the workers. If the fleet is down the run must say so -- the tool layer
+  # reports `dataflow_verify` as unavailable rather than as "no flow found" -- and a harness that
+  # refuses to start without a 5.9 GB JVM would just be harder to use for the three tools that
+  # need nothing but files.
+  harness:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: aegis:0.1.0
+    profiles: ["tools"]
+    entrypoint: ["python", "-m", "services.harness"]
+    environment:
+      PYTHONPATH: /opt/aegis
+      AEGIS_LOG_LEVEL: INFO
+      AEGIS_DATAFLOW__ENABLED: "true"
+      AEGIS_DATAFLOW__WORKER_COUNT: "2"
+      AEGIS_AI__ENABLED: "true"
+      AEGIS_AI__BASE_URL: ${API_URL:-}
+      AEGIS_AI__MODEL: ${MODEL:-}
+      AEGIS_AI__API_KEY_ENV: API_KEY
+      API_KEY: ${API_KEY:-}
+    volumes:
+      - ../:/opt/aegis
+      - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects:ro
+    shm_size: "512m"

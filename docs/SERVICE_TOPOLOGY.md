@@ -38,8 +38,22 @@ fixed the *cost* of that, but not the *reason* it was necessary.
                   │  shared volumes        │
                   │  /workspace  /data/…   │  (paths must match across services)
                   └────────────────────────┘
+                      ▲                         ▲
+   aegis-scan / ──────┘                         └────── aegis-dataflow-0 / -1
+   aegis-extract                                        (one Joern server each,
+                                                         resident CPG per project,
+                                                         same /workspace mount)
+                      ▲                         ▲
+   aegis-scan / ──────┘                         └────── aegis-dataflow-0 / -1
+   aegis-extract                                        (one Joern server each,
+                                                         resident CPG per project,
+                                                         same /workspace mount)
 
-   browser ───────────►  aegis-web  127.0.0.1:8102 (published, static only)
+   browser ───────────►  aegis-frontend  127.0.0.1:8102 (published, static only)
+                              │
+                              └── cross-origin HTTP ──► gateway :8100
+                                  (the address comes from /config.js, written at start-up
+                                   from AEGIS_API_BASE; this image proxies nothing)
 ```
 
 ### Job flow
@@ -72,8 +86,17 @@ which on a laptop means the LAN:
 | --- | --- | --- |
 | `scan` | no (`expose: 8101`) | an endpoint that reads a mounted repository and runs a parser over it |
 | `extract` | no (`expose: 8103`) | the same, plus it starts language-server processes |
+| `dataflow-N` | no (`expose: 8105`) | a Joern server that reads the mounted repository and runs a taint query; the fleet is `dataflow-0`, `dataflow-1` (see `docs/DATAFLOW_CONTRACT.md` §8) |
+| `redis` | no (`expose: 6379`) | job state; the queue is not a public API |
+| `worker` | no (no HTTP surface at all) | its liveness is "Redis is reachable and my loop turns over" |
 | `gateway` | yes, `127.0.0.1:8100` | the browser talks to it |
 | `web` | yes, `127.0.0.1:8102` | the browser loads it |
+
+The dataflow fleet is the one place where a service is **replicated by hand** rather than
+scaled: affinity divides the project hash by `AEGIS_DATAFLOW__WORKER_COUNT`, so the number of
+containers, their indices and the configured count have to agree. `tests/test_compose_policy.py`
+asserts that they do, along with every worker mounting the same `/workspace` — a wrong affinity
+guess must be slower, never a 404.
 
 Bound explicitly to `127.0.0.1` rather than `0.0.0.0` for the same reason: a
 development stack should not be reachable from the coffee-shop network.
@@ -138,7 +161,7 @@ infra/
 | 3 | `services/extraction` (moved `graph/ lsp/ parsers/ assembler/ pipeline/`) | biggest chunk, no behaviour change | **done** |
 | 4 | `services/scan` (moved `scanner/`) | now trivially separable | **done** |
 | 5 | `services/api` (the gateway; the job layer is `services/queue/`) | the gateway becomes thin | **next** |
-| 6 | `services/web` (the console) | front-end changes stop touching a Python image | **done** (React + TS, own image, `127.0.0.1:8102`) |
+| 6 | `frontend/` (the console) | front-end changes stop touching a Python image, and a static client stops needing the gateway's origin | **done** (React + TS, own image, `127.0.0.1:8102`, API base injected at run time) |
 | 7 | queue: in-process → redis | keeps dev simple while making prod correct | **done** (`docs/QUEUE_PLAN.md`) |
 
 Steps 1–2 are pure moves; 3–6 keep every existing test passing by pointing the
@@ -185,8 +208,11 @@ aegis_core/config.py          <- app/core/config.py
   shared package can never import `app`, `services`, or one another, and that the
   contracts carry no I/O framework.
 * the review console was **removed from the API** (`app/api/static/` is gone,
-  `GET /` is 404) and its service scaffolded under `services/web/`. Its tests were
-  deleted rather than adapted, because the page is being rebuilt in that service;
+  `GET /` is 404) and its service later built under `frontend/` — first as
+  `services/web` (nginx proxying `/v1`), then rebuilt as an independently
+  deployable client that proxies nothing and is told the API's address at run
+  time. See `docs/HANDOVER.md` §11.3. Its early tests were deleted rather than
+  adapted, because the page was being rebuilt in that service;
   `tests/test_observability.py` keeps the API side honest by asserting the API is
   headless while still publishing every view the console consumes.
 * `docker/Dockerfile` copies all three packages as sources and the build asserts

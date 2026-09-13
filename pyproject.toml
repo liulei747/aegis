@@ -62,9 +62,10 @@ aegis-worker = "services.queue.worker:main"
 [tool.setuptools.packages.find]
 include = ["app*", "aegis_contracts*", "aegis_core*", "services*"]
 
-[tool.setuptools.package-data]
-"app.api" = ["static/*.html"]
-"services.web" = ["static/*.html", "static/*.css", "static/*.js"]
+# No `[tool.setuptools.package-data]` section: it packaged `app/api/static/*.html` and
+# `services/web/static/*`, and neither directory exists any more. The API stopped serving a page
+# when the console became its own service, and that service is now `frontend/`, which is not a
+# Python package and is not installed by this file.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

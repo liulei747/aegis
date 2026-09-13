@@ -12,6 +12,7 @@ entries portable between hosts and containers.
 
 from __future__ import annotations
 
+import shutil
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,6 +156,31 @@ class LanguageServerManager:
             return False
         return self._spec_key(spec) not in self._missing
 
+    def installable(self) -> tuple[list[str], list[str]]:
+        """(languages whose server binary exists on PATH, languages whose does not).
+
+        A PATH lookup and nothing else -- it starts no process, so a stage note can afford it.
+        This exists because the setup stage used to report ``self.catalog``: on an image that
+        ships pyright, typescript-language-server and clangd but no ``jdtls``, ``gopls`` or
+        ``rust-analyzer``, that note claimed six configured languages while every Java file
+        degraded with "no language server for .java". A note that names what is *configured*
+        rather than what is *usable* actively misleads -- it was read as "Java is supported",
+        and the reader had no way to see otherwise.
+        """
+        usable: set[str] = set()
+        missing: set[str] = set()
+        for spec in self.catalog:
+            if not spec.enabled:
+                continue
+            binary = spec.command[0] if spec.command else ""
+            # A language is usable when *any* of its entries is: python has both pyright and
+            # jedi in the catalog, and one of them being absent does not make python unusable.
+            if binary and shutil.which(binary):
+                usable.add(spec.language)
+            else:
+                missing.add(spec.language)
+        return sorted(usable), sorted(missing - usable)
+
     @staticmethod
     def _spec_key(spec: LanguageServerSpec) -> str:
         return f"{spec.language}:{' '.join(spec.command)}"
@@ -166,8 +192,8 @@ class LanguageServerManager:
                 f"no-language-server:{path.suffix}",
                 Degradation(
                     capability="lsp",
-                    reason=f"no language server configured for '{path.suffix or path.name}'",
-                    impact="method location and call graph fall back to syntax heuristics",
+                    reason=f"没有为 '{path.suffix or path.name}' 配置语言服务器",
+                    impact="方法位置与调用图回退到语法启发式",
                     path=str(path),
                     language=path.suffix.lstrip(".") or None,
                 ),
@@ -198,8 +224,8 @@ class LanguageServerManager:
                     f"server-failed:{key}",
                     Degradation(
                         capability="lsp",
-                        reason=f"language server '{' '.join(spec.command)}' failed to start: {exc}",
-                        impact="method location and call graph fall back to syntax heuristics",
+                        reason=f"语言服务器 '{' '.join(spec.command)}' 启动失败：{exc}",
+                        impact="方法位置与调用图回退到语法启发式",
                         language=spec.language,
                     ),
                 )

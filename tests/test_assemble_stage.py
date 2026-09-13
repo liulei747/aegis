@@ -33,7 +33,11 @@ def _duplicate_repo(root: Path) -> Path:
 
 
 def _sarif_with_two_contexts(tmp_path: Path, repo: Path) -> Path:
-    sarif = write_sarif(tmp_path / "s.sarif", sink_line=2, workspace=repo)
+    # `region_line=2` is deliberate and load-bearing: `a.py` is three lines long, so a hit on
+    # line 2 encloses no callable. That is what makes the first result a prune and the second
+    # the only context. The default (the fixture's real sink line) would land inside `validate`
+    # and this helper would silently stop testing what its name says.
+    sarif = write_sarif(tmp_path / "s.sarif", region_line=2, workspace=repo)
     doc = json.loads(sarif.read_text(encoding="utf-8"))
     first = doc["runs"][0]["results"][0]
     first["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] = "a.py"
@@ -112,7 +116,7 @@ def test_max_contexts_drops_whole_contexts_and_says_which(tmp_path: Path) -> Non
     # The finding is cut *before* a method is resolved, so there is no method id to
     # name — the location plus an actionable message are what identify it.
     assert prune.path and prune.line is not None
-    assert "raise max_contexts" in prune.detail
+    assert "提高 max_contexts" in prune.detail
 
 
 # ----------------------------------------------------------------------

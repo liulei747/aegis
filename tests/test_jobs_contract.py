@@ -32,8 +32,10 @@ from aegis_contracts.jobs import (
     JobStage,
     JobState,
     JobSubmission,
+    JobSummary,
     JobTiming,
     canonical_json,
+    first_stage,
     job_id_for,
     request_fingerprint,
 )
@@ -119,13 +121,14 @@ RUNNING_MIDWAY = {
             {"stage": "read", "state": "pending", "counters": {}},
             {"stage": "assemble", "state": "pending", "counters": {}},
             {"stage": "package", "state": "pending", "counters": {}},
+            {"stage": "ai", "state": "pending", "counters": {}},
             {"stage": "done", "state": "pending", "counters": {}},
         ],
         "counters": {"discovered": 37, "located": 34, "focus_methods": 19, "contexts": 19,
                      "slices": 18},
         "units_done": 11,
         "units_total": 19,
-        "unit_label": "slices",
+        "unit_label": "切片",
         "worker_id": "aegis-worker:4711:0f2a",
         "attempt": 1,
         "stage_started_at": "2025-01-14T09:12:16.402000Z",
@@ -168,13 +171,14 @@ SUCCEEDED = {
             {"stage": "assemble", "state": "done", "duration_ms": 3011,
              "counters": {"inlined": 176}},
             {"stage": "package", "state": "done", "duration_ms": 529, "counters": {}},
+            {"stage": "ai", "state": "pending", "counters": {}},
             {"stage": "done", "state": "done", "counters": {}},
         ],
         "counters": {"discovered": 37, "located": 34, "focus_methods": 19, "contexts": 19,
                      "slices": 18, "proposed": 143, "kept": 121, "read": 118, "inlined": 176},
         "units_done": 118,
         "units_total": 121,
-        "unit_label": "bodies",
+        "unit_label": "方法体",
         "worker_id": "aegis-worker:4711:0f2a",
         "attempt": 1,
         "stage_started_at": "2025-01-14T09:12:26.011000Z",
@@ -185,7 +189,9 @@ SUCCEEDED = {
         "package_path": "/data/packages/B-c7f830954f",
         "run_id": "R-1a2b3c4d5e",
         "sarif_path": "/data/work/R-1a2b3c4d5e/opengrep.sarif",
-        "warnings": ["scan ran in the scan service: its raw SARIF is not in this filesystem"],
+        "warnings": [
+            "扫描在扫描服务中运行：其原始 SARIF 不在本文件系统中，因此未附加到分析包"
+        ],
         "artifacts": {
             "bundle": {"kind": "bundle", "ref": "B-c7f830954f",
                        "path": "/data/packages/B-c7f830954f", "available": True}
@@ -278,11 +284,23 @@ def test_stage_order_is_the_lifecycle_order() -> None:
         JobStage.READ,
         JobStage.ASSEMBLE,
         JobStage.PACKAGE,
+        JobStage.AI,
         JobStage.DONE,
     ]
     # The sentinel is excluded from anything that measures elapsed time.
     assert JobStage.DONE not in TIMED_STAGES
-    assert len(TIMED_STAGES) == 7
+    assert len(TIMED_STAGES) == 8
+
+
+def test_the_first_stage_depends_on_what_the_job_does() -> None:
+    """An AI job never scans, so starting its clock at `scan` told a reader the wrong thing.
+
+    Measured on the live stack: `POST /v1/bundles/{id}/analyze` produced a job whose stage read
+    `scan` from start to finish.
+    """
+    assert first_stage(JobKind.AI_FANOUT) is JobStage.AI
+    assert first_stage(JobKind.ASSEMBLE) is JobStage.SCAN
+    assert first_stage(JobKind.SCAN) is JobStage.SCAN
 
 
 def test_funnel_steps_are_the_documented_nine() -> None:
@@ -296,7 +314,7 @@ def test_funnel_steps_are_the_documented_nine() -> None:
 def test_progress_stages_are_complete_and_ordered() -> None:
     fresh = JobProgress.fresh()
     assert [entry.stage for entry in fresh.stages] == list(JobStage)
-    assert len(fresh.stages) == 8
+    assert len(fresh.stages) == 9
     assert {entry.state for entry in fresh.stages} == {"pending"}
     assert fresh.counters == {} and fresh.units_total == 0
 
@@ -316,6 +334,8 @@ def test_stage_coverage_matches_the_plan() -> None:
         JobStage.READ: ("proposed", "kept", "read"),
         JobStage.ASSEMBLE: ("inlined",),
         JobStage.PACKAGE: (),
+        # The AI stage consumes a finished bundle; it produces verdicts, not funnel counts.
+        JobStage.AI: (),
         JobStage.DONE: (),
     }
     for stage, steps in mapping.items():
@@ -437,6 +457,33 @@ def test_fingerprint_ignores_key_order_in_the_budget() -> None:
     )
 
 
+def test_the_kind_is_part_of_the_fingerprint() -> None:
+    """Two jobs of different kinds are two different jobs, even with identical requests.
+
+    Omitting the kind produced a false success rather than a duplicate: an `ai_fanout` job for
+    the demo bundle fingerprinted the same as an earlier `scan` job on the same workspace, was
+    deduplicated onto it, and reported `succeeded` while doing nothing -- the report on disk was
+    25 minutes older than the job that claimed to have written it.
+    """
+    request = _request(workspace=str(Path.cwd()), rules=[])
+
+    assemble = request_fingerprint(request, kind=JobKind.ASSEMBLE)
+    scan = request_fingerprint(request, kind=JobKind.SCAN)
+    ai = request_fingerprint(request, kind=JobKind.AI_FANOUT)
+
+    assert len({assemble, scan, ai}) == 3
+    assert job_id_for(assemble) != job_id_for(ai)
+
+
+def test_the_bundle_id_is_part_of_the_fingerprint() -> None:
+    """Analysing bundle A and bundle B are different pieces of work sharing one workspace."""
+    first = request_fingerprint(_request(bundle_id="B-one"), kind=JobKind.AI_FANOUT)
+    second = request_fingerprint(_request(bundle_id="B-two"), kind=JobKind.AI_FANOUT)
+    empty = request_fingerprint(_request(), kind=JobKind.AI_FANOUT)
+
+    assert len({first, second, empty}) == 3
+
+
 def test_job_id_is_derived_from_the_fingerprint() -> None:
     fingerprint = request_fingerprint(_request())
     first, second = job_id_for(fingerprint), job_id_for(fingerprint)
@@ -480,6 +527,26 @@ def test_job_failure_keeps_the_scan_ledger() -> None:
     payload = json.loads(failure.model_dump_json())
     assert payload["mode"] == "scan_aborted"
     assert "scan_record" in payload
+
+
+def test_the_summary_carries_the_workspace_raw() -> None:
+    """A list view has to say what each job is about without fetching each job.
+
+    The workspace lives only in `submission.request`, so without this field a table of jobs needs
+    one `GET /v1/jobs/{id}` per row. It travels raw -- no resolved path, no counter -- because a
+    summary that paraphrases its source is worse than one that omits the field.
+    """
+    job = Job.model_validate(RUNNING_MIDWAY)
+    summary = JobSummary.of(job)
+
+    assert summary.workspace == "/workspace"
+    # Still a summary: the per-stage detail that makes a `Job` heavy is not dragged along.
+    assert "stages" not in json.loads(summary.model_dump_json())
+    assert "progress" not in summary.model_dump()
+
+    # Optional, so an embedder that builds a summary by hand keeps working.
+    assert JobSummary(job_id="J-x", submitted_at=job.timing.submitted_at).workspace is None
+
 
 
 # --- 8 ------------------------------------------------------------------------------

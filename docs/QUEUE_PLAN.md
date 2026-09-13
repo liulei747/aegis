@@ -12,9 +12,15 @@
 > | 5 `202`/`GET /v1/jobs` + 幂等边界 | ✅ | `app/api/jobs.py`、`tests/test_jobs_api.py`、`tests/test_queue_end_to_end.py` |
 > | 6 compose（`redis`/`worker`）+ 端口策略断言 | ✅ | `docker/docker-compose.yml`、`tests/test_compose_policy.py` |
 >
-> **基线：`284 collected`**。没有 Redis：`272 passed, 12 skipped`；
-> 起一个 Redis（`docker run --rm -d -p 127.0.0.1:6379:6379 redis:7-alpine`）：**282 passed, 2 skipped**。
+> **基线：`309 collected`**。没有 Redis：`297 passed, 12 skipped`；
+> 起一个 Redis（`docker run --rm -d -p 127.0.0.1:6379:6379 redis:7-alpine`）：**307 passed, 2 skipped**。
 > 本文所有 `124 passed` 的说法都是**迁移前的历史基线**，判据仍有效（"迁移/改造本身不改行为"）。
+>
+> **另有一条实测覆盖了本文的旧承诺**：§6.5.3 曾写「取消本端 ≤2s、对端继续跑完」，
+> 而第一版实现实测是 **131 秒**（`httpx.post` 是阻塞调用，worker 在整段扫描里回不到主循环）。
+> 后来改成**可轮询的扫描作业**（`POST /v1/scan/jobs` → 202 + `GET` 轮询 + `DELETE` 取消，
+> `services/scan/jobs.py`），实测 **0.85 秒**且**对端进程真的死了**（0 残留、CPU 0.12%）。
+> 所以 §6.5.3 那段关于"2 秒"的描述读作**已经过时的设计意图**；现状见 HANDOVER §10.18。
 >
 > 实施中与本文不同的决定，都是实读代码/实测之后的修正，已写进对应实现：
 > 1. **`CanceledAbort` 与 `TeardownHandle` 定义在 `aegis_core/cancel.py`**，不是
@@ -1794,7 +1800,7 @@ app.parsers   -> （只 import 自己）
 | gateway 路由 | `app/api/routes.py:33` `from app.observability import views`，用到 `views.overview/funnel/timeline/providers/scan_summary/context_views/method_index/diff`（L306–347）、`views.PROVIDER_NOTES`、`views.STAGE_LABELS` | 在**本进程**把 manifest 变成 JSON |
 | 测试 | `tests/test_observability.py:20`、`tests/test_scan_stage.py:371` | 直接调函数做断言 |
 | CLI 脚本 | `scripts/observe.py:15` | 在**本进程**打印视图 |
-| 将来的控制台服务 | `services/web/`（待建） | 只消费 HTTP JSON，不需要这个模块 |
+| 控制台服务 | `frontend/` | 只消费 HTTP JSON，不需要这个模块 |
 
 **四个候选，逐个判**：
 

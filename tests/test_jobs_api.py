@@ -72,6 +72,23 @@ def _store_stream(client) -> tuple[JobStore, JobStream]:
     return store, stream
 
 
+def test_assemble_through_the_queued_path_answers_202(queued_client, workspace: Path) -> None:
+    """`/v1/assemble` must behave like `/v1/jobs` once a queue is configured.
+
+    The route declares `response_model=AssembleResponse`, which describes the *synchronous*
+    answer, while the queued path returns a `JobAcceptedResponse` from `submit()`. Measured, that
+    mismatch made FastAPI answer 500 with a `ResponseValidationError` -- and nothing caught it,
+    because every queued test posts to `/v1/jobs` instead. The same shape broke the AI route the
+    first time it ran for real.
+    """
+    response = queued_client.post(
+        "/v1/assemble", json={"workspace": str(workspace), "lsp": False}
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["job_id"].startswith("J-")
+
+
 def test_submitting_a_job_returns_202_and_a_queued_job(queued_client, workspace: Path) -> None:
     response = queued_client.post("/v1/jobs", json=_body(workspace))
     assert response.status_code == 202, response.text
@@ -183,7 +200,7 @@ def test_get_job_returns_the_whole_record_including_failure(queued_client, works
 def test_get_job_is_404_when_unknown(queued_client) -> None:
     response = queued_client.get("/v1/jobs/J-does-not-exist")
     assert response.status_code == 404
-    assert "expired" in response.json()["detail"]
+    assert "已过期" in response.json()["detail"]
 
 
 def test_the_job_list_is_the_first_screen_payload(queued_client, workspace: Path) -> None:
@@ -203,6 +220,8 @@ def test_the_job_list_is_the_first_screen_payload(queued_client, workspace: Path
     summary = body["jobs"][0]
     assert "stages" not in summary["progress"] if "progress" in summary else True
     assert "job_id" in summary and "state" in summary and "submitted_at" in summary
+    # Which repository each row is about, published so the table needs no second request per job.
+    assert summary["workspace"] == str(workspace)
     assert "queue" in body and "stream_length" in body["queue"]
 
     filtered = queued_client.get("/v1/jobs?state=running").json()
@@ -236,6 +255,54 @@ def test_cancelling_a_running_job_only_records_the_intent(queued_client, workspa
     assert job is not None
     assert job.state is JobState.RUNNING
     assert job.cancel_requested is True, "the worker polls this flag"
+
+
+def _finished_job(queued_client, workspace: Path, *, bundle_id: str = "B-done"):
+    """Submit a job and mark it succeeded with output that is really on disk.
+
+    The output matters: `_artifact_available` re-runs a succeeded job whose bundle is gone, so a
+    fake path would exercise *that* branch and say nothing about `force`.
+    """
+    accepted = queued_client.post("/v1/jobs", json=_body(workspace)).json()
+    store, _stream = _store_stream(queued_client)
+    from aegis_core.config import get_settings
+
+    package = get_settings().output_dir / bundle_id
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "manifest.json").write_text("{}", encoding="utf-8")
+    store.mark_succeeded(
+        accepted["job_id"], result=JobResult(bundle_id=bundle_id, package_path=str(package))
+    )
+    return accepted, store
+
+
+def test_force_re_runs_a_succeeded_job(queued_client, workspace: Path) -> None:
+    """`force` has to reach a finished job, or the same request can never be run twice.
+
+    The fingerprint does not change, so neither does the job id: without this, a request whose
+    result is useless -- an AI answer thrown away by a parser bug, say -- is returned forever.
+    Measured on the live stack before the fix: `?force=true` answered 200 with the stored job.
+    """
+    accepted, store = _finished_job(queued_client, workspace)
+
+    again = queued_client.post("/v1/jobs?force=true", json=_body(workspace))
+
+    assert again.status_code == 202, again.text
+    body = again.json()
+    assert body["job_id"] == accepted["job_id"], "a re-run keeps the id: it comes from the fingerprint"
+    assert body["deduplicated"] is False
+    assert body["revision"] > accepted["revision"]
+    assert store.get(accepted["job_id"]).state is JobState.QUEUED
+
+
+def test_without_force_a_succeeded_job_is_still_the_answer(queued_client, workspace: Path) -> None:
+    """The ordinary duplicate case must not change: the same request is the same answer."""
+    accepted, _store = _finished_job(queued_client, workspace)
+
+    again = queued_client.post("/v1/jobs", json=_body(workspace))
+
+    assert again.status_code == 200, again.text
+    assert again.json()["state"] == JobState.SUCCEEDED.value
 
 
 def test_cancelling_a_finished_job_is_409_and_changes_nothing(queued_client, workspace: Path) -> None:
@@ -278,7 +345,7 @@ def test_a_broken_queue_is_503_not_500(queued_client, workspace: Path) -> None:
 
     response = queued_client.post("/v1/jobs", json=_body(workspace))
     assert response.status_code == 503
-    assert "queue unavailable" in response.json()["detail"]
+    assert "队列不可用" in response.json()["detail"]
 
 
 class _FailingClient:
@@ -352,7 +419,7 @@ def test_without_a_queue_the_old_synchronous_path_is_used(
     If queue-first had changed this response, every consumer of `/v1/assemble` would have
     broken silently -- and the CLI, the scripts and the Docker smoke test all use it.
     """
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     response = sync_client.post(
         "/v1/assemble",
         json={"workspace": str(workspace), "sarif_path": str(sarif), "lsp": False},
@@ -372,7 +439,7 @@ def test_the_job_routes_explain_themselves_when_no_queue_is_configured(
     """503 with a reason, not a 500 or an empty list that looks like "no jobs"."""
     response = sync_client.get("/v1/jobs")
     assert response.status_code == 503
-    assert "no Redis configured" in response.json()["detail"]
+    assert "未配置 Redis" in response.json()["detail"]
 
 
 def test_the_api_is_still_headless(sync_client: TestClient) -> None:

@@ -35,7 +35,7 @@ def test_health_reports_scanner_and_budget(client: TestClient) -> None:
 def test_assemble_from_sarif_upload(client: TestClient, tmp_path: Path, workspace: Path) -> None:
     from tests.fixtures import write_sarif
 
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(tmp_path / "scan.sarif", workspace=workspace)
     with sarif.open("rb") as handle:
         response = client.post(
             "/v1/assemble/upload",

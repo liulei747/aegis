@@ -28,16 +28,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from aegis_contracts.jobs import (
+    STAGE_DONE,
+    STAGE_SKIPPED,
     TERMINAL_STATES,
+    ArtifactRef,
     FailureMode,
     Job,
     JobKind,
     JobResult,
     JobStage,
+    first_stage,
 )
 from aegis_core.cancel import CanceledAbort
 from aegis_core.config import BudgetConfig, Settings, get_settings
 from aegis_core.logging import get_logger, setup_logging
+from services.ai.runner import analyse_bundle, write_report
 from services.extraction.pipeline.assemble import (
     AssemblyPipeline,
     PipelineRequest,
@@ -54,6 +59,22 @@ log = get_logger(__name__)
 #: A job's stage name is the pipeline's, so the observer's stage string maps 1:1 onto the
 #: contract's enum. Kept as a lookup rather than a cast so an unexpected name is visible.
 _STAGES = {stage.value: stage for stage in JobStage}
+
+#: The harness phases, in Chinese, for the job's single `ai` stage note. The job contract carries
+#: one AI stage -- an audit is that stage -- so these are what tell a reader *inside* it what is
+#: happening: "正在验证候选 12/56" is the difference between a job that is working and one that is
+#: stuck. Unknown names fall back to the raw id, so a new phase shows up rather than showing blank.
+_AUDIT_STAGE_LABEL = {
+    "prep": "确定性预扫描",
+    "recon": "勘察仓库",
+    "threat_model": "建立威胁模型",
+    "plan": "规划调查范围",
+    "discovery": "探索代码",
+    "validation": "验证候选",
+    "attack_path": "推导攻击路径",
+    "findings": "汇总发现",
+    "close": "收尾",
+}
 
 
 class Worker:
@@ -147,13 +168,13 @@ class Worker:
             return
         if job.cancel_requested:
             # Cancelled while queued: never start it.
-            self.store.mark_canceled(job_id, note="canceled before it started")
+            self.store.mark_canceled(job_id, note="启动前已取消")
             return
 
         attempt = entry.get("attempt") or 1
         with self._lock:
             self._current_job = job_id
-            self._current_stage = JobStage.SCAN.value
+            self._current_stage = first_stage(job.kind).value
         self._cancel_watch.clear()
 
         teardown = Teardown(reason="cancel")
@@ -166,8 +187,13 @@ class Worker:
                 return
 
             # Pin the stage before the first silent one: the scan emits nothing while it
-            # runs, so this snapshot is the only "it is scanning" the user can see.
-            self.store.pin_stage(job_id, JobStage.SCAN, note="scanning")
+            # runs, so this snapshot is the only "it is scanning" the user can see. An AI job
+            # has the same problem with its model calls, and the same answer.
+            opening = first_stage(claimed.kind)
+            self._current_stage = opening.value
+            self.store.pin_stage(
+                job_id, opening, note="扫描中" if opening is JobStage.SCAN else opening.value
+            )
             teardown.begin()
 
             result = self._run(claimed, teardown)
@@ -195,19 +221,18 @@ class Worker:
     def _run(self, job: Job, teardown: Teardown) -> JobResult:
         request = job.submission.request
         if job.kind is JobKind.AI_FANOUT:
-            # Refused loudly rather than accepted and ignored. The contract reserves the
-            # enum so the AI stage needs no schema change; a worker that silently did
-            # nothing with it would look like a hang.
-            raise NotImplementedError("ai fanout not implemented in this build")
+            return self._run_ai_fanout(job)
+        if job.kind is JobKind.AUDIT:
+            return self._run_audit(job)
 
         workspace = Path(request.workspace).expanduser()
         if not workspace.is_dir():
             raise _JobRefused(
-                FailureMode.WORKSPACE_MISSING, f"workspace is not a directory: {workspace}"
+                FailureMode.WORKSPACE_MISSING, f"工作区不是目录：{workspace}"
             )
         sarif_path = Path(request.sarif_path) if request.sarif_path else None
         if sarif_path is not None and not sarif_path.is_file():
-            raise _JobRefused(FailureMode.SARIF_MISSING, f"sarif not found: {sarif_path}")
+            raise _JobRefused(FailureMode.SARIF_MISSING, f"未找到 SARIF：{sarif_path}")
 
         budget = BudgetConfig(**request.budget) if request.budget else self.settings.budget
         pipeline_request = PipelineRequest(
@@ -237,7 +262,7 @@ class Worker:
             )
         )
         if outcome.bundle is None or outcome.package_path is None:  # pragma: no cover
-            raise RuntimeError("the pipeline produced no bundle")
+            raise RuntimeError("流水线未产出分析包")
         manifest = outcome.bundle.manifest
         return JobResult(
             bundle_id=manifest.bundle_id,
@@ -255,6 +280,264 @@ class Worker:
                 }
             },
         )
+
+    def _run_ai_fanout(self, job: Job) -> JobResult:
+        """Analyse an already-finished bundle with the model.
+
+        This job *consumes* a bundle instead of producing one, which is why it needs
+        `bundle_id`: `workspace` alone does not say which artifact to read.
+
+        A model failure never fails the job *on its own*: the verdicts are an addition to a bundle
+        that was already complete and already useful, so a partial result is reported through
+        `warnings` -- "1 of 3 contexts answered" belongs in the record, not in an exception that
+        would throw away the contexts that did answer.
+
+        But if **every** call failed, the job has produced nothing, and reporting `succeeded`
+        would be a false success twice over: the caller would believe the analysis ran, and
+        request deduplication would refuse to retry it. Measured on the live stack -- a job whose
+        only context failed to parse reported `succeeded`, and resubmitting returned that same
+        useless job with a 200 instead of doing the work.
+        """
+        request = job.submission.request
+        if not request.bundle_id:
+            raise _JobRefused(
+                FailureMode.AI_BUNDLE_MISSING,
+                "ai_fanout 任务需要 bundle_id：要分析的分析包",
+            )
+        bundle = self.settings.output_dir / request.bundle_id
+        if not (bundle / "ai" / "blocks.jsonl").is_file():
+            raise _JobRefused(
+                FailureMode.AI_BUNDLE_MISSING,
+                f"未找到包含 AI 块的分析包：{bundle}",
+            )
+
+        config = self.settings.ai
+        report = analyse_bundle(bundle, config)
+        warnings: list[str] = []
+        # Close the stage out with an outcome, not just the "running" pin set before the call:
+        # `pin_stage` says a stage is current, `record_stage` says what it produced. Without this
+        # the job's stage list would show `ai` stuck at running on a job that had succeeded.
+        #
+        # A disabled stage is `skipped`, not `running`: nothing is in flight, and the note says
+        # why -- the same vocabulary the rest of the job record uses.
+        self.store.record_stage(
+            job.job_id,
+            JobStage.AI,
+            state=STAGE_SKIPPED if report.skipped else STAGE_DONE,
+            note=(
+                f"已跳过：{report.skipped}"
+                if report.skipped
+                else f"已研判 {len(report.parsed_calls)}/{len(report.calls)} 个上下文"
+            ),
+            units_done=len(report.parsed_calls),
+            units_total=len(report.calls),
+            unit_label="上下文",
+        )
+        if report.skipped:
+            warnings.append(f"AI 阶段未运行：{report.skipped}")
+        else:
+            write_report(bundle, report)
+            failed = report.failed_calls
+            if failed and not report.parsed_calls:
+                reasons = "; ".join(
+                    f"{call.context_id or 'bundle'}: {call.error}" for call in failed[:3]
+                )
+                raise _JobRefused(
+                    FailureMode.AI_FAILED,
+                    f"全部 {len(failed)} 个上下文调用失败：{reasons}",
+                )
+            if failed:
+                warnings.append(
+                    f"{len(failed)}/{len(report.calls)} 个上下文调用未产出可用的研判结论；"
+                    "它们的原始回答在 ai/answers/ 中，原因在 ai/report.json 中"
+                )
+        return JobResult(
+            bundle_id=request.bundle_id,
+            package_path=str(bundle),
+            warnings=warnings,
+            artifacts={
+                "verdicts": {
+                    "kind": "ai_verdicts",
+                    "ref": request.bundle_id,
+                    "path": str(bundle / "ai" / "verdicts.jsonl"),
+                    "available": not report.skipped,
+                }
+            },
+        )
+
+    def _run_audit(self, job: Job) -> JobResult:
+        """Run the agent harness over a repository, as a job the console can watch.
+
+        Three decisions worth stating, because each one has a failure mode behind it:
+
+        * **The run directory is under `work_dir`, not under the workspace.** The workspace is
+          mounted read-only in every container, and the gateway has to be able to read the trail to
+          serve it. `work_dir` is the one path the gateway, the worker and the extractor all mount
+          at the same place, which is the same reason SARIF lives there.
+        * **The trail's second sink writes job progress.** The JSONL is the detailed record the
+          console polls; the callback mirror is what makes `/v1/jobs/{id}` show a moving stage
+          without the console having to parse the trail to render a progress bar. Every write goes
+          through `record_stage`, which already ignores terminal jobs and swallows Redis trouble --
+          a progress write must never sink a run.
+        * **The abort predicate is `_abort_check`.** Without it, cancelling an audit would do
+          nothing until the run ended by itself: the coordinator checks between agent runs, so a
+          cancel lands within one agent (measured at 1-3 minutes on the Java benchmark) instead of
+          in the 30 the whole run takes.
+        """
+        from services.ai.runner import AINotConfigured, client_from
+        from services.harness import trail as trail_mod
+        from services.harness.coordinator import HarnessCoordinator
+
+        request = job.submission.request
+        workspace = Path(request.workspace).expanduser()
+        if not workspace.is_dir():
+            raise _JobRefused(FailureMode.WORKSPACE_MISSING, f"工作区不是目录：{workspace}")
+        try:
+            client = client_from(self.settings.ai)
+        except AINotConfigured as exc:
+            # A refusal, not a crash: the operator has one environment variable to set, and the
+            # message has to name it rather than failing 40 minutes later with no findings.
+            raise _JobRefused(FailureMode.AI_FAILED, f"AI 审计未配置：{exc}") from exc
+
+        run_root = self.settings.work_dir / "audit"
+        coordinator = HarnessCoordinator(
+            workspace=workspace,
+            config=self._audit_config(),
+            client=client,
+            out_dir=run_root,
+            run_id=job.job_id,
+            abort=self._abort_check,
+        )
+        self.store.record_stage(
+            job.job_id, JobStage.AI, state="running", note="AI 审计：正在做仓库勘察",
+        )
+        trail = coordinator.attach_trail(
+            trail_mod.CallbackSink(lambda event: self._audit_event(job.job_id, event))
+        )
+        try:
+            result = coordinator.run()
+        finally:
+            # Closed on every path, including a cancel: the trail is the only record a killed run
+            # leaves, so the handle must not be skipped by the exception that made it matter.
+            trail.close()
+
+        run_dir = result.run_dir
+        trail_path = run_dir / trail_mod.TRAIL_NAME
+        report_path = result.report_path
+        warnings = list(result.notes)
+        if result.fatal:
+            warnings.append(result.fatal)
+        counts = trail.counters(result.blackboard)
+        # The terminal stage write is inside `_audit_event`/`_finish` already, but the *summary* is
+        # the one place that knows the run is over and what it produced, so it is written here
+        # rather than inferred from the last stage event.
+        self.store.record_stage(
+            job.job_id,
+            JobStage.AI,
+            state=STAGE_DONE if not result.fatal else "failed",
+            note=(
+                f"AI 审计结束：{counts.get('scopes', 0)} 个 scope、"
+                f"{counts.get('candidates', 0)} 个候选、{counts.get('findings', 0)} 条发现"
+            ),
+            units_done=counts.get("scopes", 0),
+            units_total=counts.get("scopes", 0),
+            unit_label="scope",
+            counters={
+                "candidates": counts.get("candidates", 0),
+                "verdicts": counts.get("verdicts", 0),
+                "confirmed": counts.get("confirmed", 0),
+                "findings": counts.get("findings", 0),
+                "agent_runs": counts.get("agent_runs", 0),
+                "rounds": counts.get("rounds", 0),
+            },
+        )
+        if result.fatal:
+            raise _JobRefused(FailureMode.AI_FAILED, result.fatal)
+        if not result.blackboard.closed:
+            warnings.append("审计没有正常收敛关闭；见报告里的关闭说明与覆盖表")
+
+        return JobResult(
+            run_id=result.blackboard.run_id,
+            package_path=str(run_dir),
+            warnings=warnings,
+            artifacts={
+                "audit_trail": ArtifactRef(
+                    kind="audit_trail",
+                    ref=job.job_id,
+                    path=str(trail_path),
+                    available=trail_path.is_file(),
+                ),
+                "audit_report": ArtifactRef(
+                    kind="audit_report",
+                    ref=job.job_id,
+                    path=str(report_path) if report_path else None,
+                    available=bool(report_path and report_path.is_file()),
+                ),
+            },
+        )
+
+    def _audit_config(self):
+        """The harness bounds for a queued audit.
+
+        Only the model concurrency is taken from settings; the rest keep the harness defaults,
+        because they are the bounds the Java benchmark was measured with and a job that quietly
+        used different ones would produce a different answer from the CLI run of the same command.
+        """
+        from services.harness.coordinator import HarnessConfig
+
+        return HarnessConfig(concurrency=max(1, self.settings.ai.concurrency))
+
+    def _audit_event(self, job_id: str, event: dict) -> None:
+        """Mirror one trail event into the job's record -- coarsely, on purpose.
+
+        The trail is where the detail lives; this is a progress bar. It writes only on the events
+        that change what a reader sees (`stage`, and the ledger counts when a stage ends), so a run
+        with 4000 tool calls does not become 4000 Redis writes.
+        """
+        kind = event.get("kind")
+        if kind == "stage":
+            stage = event.get("stage", "")
+            state = event.get("state", "")
+            counters = event.get("counters") or {}
+            self.store.record_stage(
+                job_id,
+                JobStage.AI,
+                state="running",
+                note=f"{_AUDIT_STAGE_LABEL.get(stage, stage)}"
+                + (f"（第 {event['round']} 轮）" if event.get("round") is not None else "")
+                + ("" if state != "start" else "…"),
+                # The counters ride along on every stage event, because this is what a reader
+                # watching `/v1/jobs/{id}` sees. Without them the job page showed zero candidates
+                # for the whole run while the trail already held thirty -- measured on the first
+                # real audit, which is the only way that gap was ever going to be noticed.
+                units_done=counters.get("scopes", 0),
+                unit_label="scope",
+                counters={
+                    key: counters.get(key, 0)
+                    for key in ("candidates", "verdicts", "confirmed", "findings", "agent_runs", "rounds")
+                },
+            )
+            return
+        if kind == "summary":
+            counters = event.get("counters") or {}
+            self.store.record_stage(
+                job_id,
+                JobStage.AI,
+                state="running",
+                note="AI 审计：正在写报告",
+                # No total here on purpose: the plan's scope count is not in the run's counters, and
+                # `units_done == units_total` would draw a progress bar that is always full -- a
+                # fabricated 100%. `formatUnits` says "总数未知" instead, which is true.
+                units_done=counters.get("scopes", 0),
+                unit_label="scope",
+                counters={
+                    key: counters.get(key, 0)
+                    for key in ("candidates", "verdicts", "confirmed", "findings", "agent_runs", "rounds")
+                },
+            )
+            return
+        if kind == "error":
+            log.warning("audit %s: %s", job_id, event.get("message") or event)
 
     def _run_scan_only(self, pipeline_request: PipelineRequest) -> JobResult:
         """A scan job: findings and a ledger, no bundle.
@@ -345,11 +628,11 @@ class Worker:
             kill_grace_s=self.settings.queue.cancel_kill_grace_s,
         )
         teardown.cleanup_partial()
-        detail = f"canceled during {exc.stage} ({exc.resource})" + (
-            f": {exc.detail}" if exc.detail else ""
+        detail = f"在 {exc.stage} 阶段已取消（{exc.resource}）" + (
+            f"：{exc.detail}" if exc.detail else ""
         )
         if self.stop_event.is_set():
-            self.store.requeue(job_id, note="worker restarting; job returned to the queue")
+            self.store.requeue(job_id, note="worker 正在重启；任务已退回队列")
             self._reenqueue(job_id)
             log.info("job %s returned to the queue for a restart", job_id)
             return

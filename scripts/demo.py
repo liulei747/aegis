@@ -48,7 +48,7 @@ def main() -> int:
     setup_logging("INFO")
     demo = Path(args.demo_dir).resolve()
     workspace = write_fixture(demo / "repo")
-    sarif = write_sarif(demo / "scan.sarif", sink_line=5, workspace=workspace)
+    sarif = write_sarif(demo / "scan.sarif", workspace=workspace)
     config = None if args.no_lsp else build_lsp_config(demo)
 
     settings = Settings(

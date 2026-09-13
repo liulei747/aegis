@@ -162,19 +162,34 @@ Two warning signals are computed rather than left for the reader to notice:
 
 ### Review console
 
-The console is **no longer served by the API service**. It is its own deployment
-unit (`services/web`, port `127.0.0.1:8102`), because a static read-only renderer
-and a CPU-bound assembler have nothing to do with each other and should not share
-a blast radius.
+The console is **a separate deployment**, and deliberately not same-origin with the
+API. It lives in `frontend/` (port `127.0.0.1:8102`), is built as its own image, and
+is told where the gateway is at **run time** through `AEGIS_API_BASE`, which the
+container writes into `/config.js` before nginx starts. One image therefore serves
+any number of deployments; nothing about the gateway is baked into the assets.
 
-It is planned but **not built yet**. The backend side of it is finished: every
-number the console needs is already computed by `aegis_contracts/views.py` and
-served as JSON, so the frontend is a pure renderer — it consumes the endpoints
-above, never re-derives a number and never reads raw artifact files, so the page
-and the JSON cannot disagree. The information architecture and the prototypes are
-in [`docs/VISUAL.md`](docs/VISUAL.md) and [`docs/prototype.html`](docs/prototype.html).
+That means the browser calls the gateway **cross-origin**, so the gateway's
+`AEGIS_CORS__ALLOW_ORIGINS` has to include the console's origin (it defaults to `*`).
+The older arrangement proxied `/v1` through the console's own nginx, which avoided
+CORS at the cost of welding the two together: the static files could only ever be
+served by that one proxy, and the API's host and port became part of the front-end's
+deployment. `GET /v1/bundles` on the console's origin now returns the page, not JSON,
+which is the structural difference.
 
-The design it will render: the bundle list with trust mix, the funnel, timings,
+The front-end shares **no source** with the backend. Its contract test reads the
+gateway's published `/openapi.json` over HTTP and compares the paths it calls against
+it, so a backend rename fails the front-end's suite rather than a screen nobody
+opened. It also computes its own display numbers (counts, shares, totals) from the
+raw payloads rather than asking the API for them.
+
+Screens: Overview, Jobs, Bundles and one bundle's detail, Compare, AI verdicts,
+Projects (grouped from the workspace recorded on jobs and bundles — there is no
+project registry), Traffic (the gateway's in-process request log), and Settings (the
+effective configuration, read-only, with the API key's variable *name* but never its
+value). The information architecture and the prototypes are in
+[`docs/VISUAL.md`](docs/VISUAL.md) and [`docs/prototype.html`](docs/prototype.html).
+
+The design it renders: the bundle list with trust mix, the funnel, timings,
 providers, the scanner invocation, the call chain with provenance per method, the
 edges with their evidence, all prunes and degradations, and a diff against another
 run.
@@ -275,7 +290,7 @@ AEGIS_SCAN_TARGET=/path/to/repo docker compose -f docker/docker-compose.yml up -
 #   http://127.0.0.1:8100/health    the API (probes both workers)
 #   http://127.0.0.1:8100/docs      OpenAPI
 #   http://127.0.0.1:8102           the console
-# set AEGIS_GATEWAY_PORT / AEGIS_WEB_PORT in .env to change them
+# set AEGIS_GATEWAY_PORT / AEGIS_FRONTEND_PORT in .env to change them
 ```
 
 **`cp docker/lsp.yaml docker/lsp.local.yaml` is not optional.** `extract` and `worker`
@@ -513,8 +528,8 @@ chain while the model pays for the source once.
 
 1. **Task queue** — `POST /v1/assemble` is synchronous today (~11.5 s). Target is
    `202 {job_id}` + `GET /v1/jobs/{id}`. Technology not yet chosen.
-2. **The console as its own service** — `services/web` (nginx + static assets
-   proxying `/v1` to the gateway, `127.0.0.1:8102`). Backend views are done.
+2. ~~**The console as its own service**~~ — **done**: `frontend/`, its own image,
+   port `127.0.0.1:8102`, told where the gateway is at run time (`AEGIS_API_BASE`).
 3. **Move `app/` under `services/extraction/`** — cosmetic; the deployment
    boundary already works.
 4. **Byte transfer instead of shared volumes** — removes the constraint that the

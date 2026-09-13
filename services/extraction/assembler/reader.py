@@ -81,7 +81,7 @@ class MethodReader:
                 body_set.prunes.append(
                     PruneDecision(
                         rule="unreadable",
-                        detail="method body could not be read from disk",
+                        detail="方法正文无法从磁盘读取",
                         method_id=method.method_id,
                         path=method.path,
                         line=method.region.start_line,
@@ -159,8 +159,8 @@ class MethodReader:
                 PruneDecision(
                     rule="max_total_chars",
                     detail=(
-                        "method body dropped to respect max_total_chars="
-                        f"{self.budget.max_total_chars}"
+                        "为满足 max_total_chars="
+                        f"{self.budget.max_total_chars} 而丢弃了方法正文"
                     ),
                     method_id=body.method.method_id,
                     path=body.method.path,
@@ -173,9 +173,9 @@ class MethodReader:
                 PruneDecision(
                     rule="max_total_chars_exceeded",
                     detail=(
-                        f"focus bodies alone total {body_set.total_chars} chars, above "
-                        f"max_total_chars={self.budget.max_total_chars}; raise the budget or "
-                        "split the run"
+                        f"仅焦点方法的正文就有 {body_set.total_chars} 个字符，超过 "
+                        f"max_total_chars={self.budget.max_total_chars}；"
+                        "请提高预算或拆分这次运行"
                     ),
                     provider=Provider.NONE,
                 )

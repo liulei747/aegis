@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Aegis 分析控制台</title>
+    <!--
+      主题必须在首屏之前定下来，否则会先按 CSS 默认值画一帧再跳到用户的选择上（暗色用户
+      尤其明显，会闪一下白屏）。
+
+      这段脚本因此是**自包含**的：它不可能 import `src/theme.ts`，那个模块要等 bundle 加载
+      完。键名 `aegis-theme` 与"跟随系统"的判定规则在两处各写了一份 —— 那是必要的重复，
+      `test/theme.test.ts` 有一条用例专门盯住两处一致。
+    -->
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("aegis-theme");
+          var theme =
+            stored === "dark" || stored === "light"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (error) {
+          // 隐私模式下 localStorage 会抛异常。此时不回退到任何主题：CSS 里的亮色默认值
+          // 仍然可用，比因为读不到偏好而白屏好。
+        }
+      })();
+    </script>
+    <!--
+      Runtime configuration, loaded before the app bundle so the very first request already
+      knows where the API is. In the container this file is rewritten at start-up from
+      `AEGIS_API_BASE`; in development it is absent and Vite serves the public/ copy, whose
+      empty base is overridden by VITE_API_BASE at build time.
+
+      It is a separate file rather than a build-time variable so that one image can be
+      deployed against several gateways without being rebuilt.
+    -->
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

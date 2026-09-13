@@ -76,7 +76,7 @@ def test_bundle_from_lsp_has_full_call_chain(
     tmp_path: Path, workspace: Path, fake_lsp_config: Path, budget: BudgetConfig
 ) -> None:
     settings = _settings(tmp_path, workspace, fake_lsp_config, budget)
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     pipeline = AssemblyPipeline(settings)
 
     result = asyncio.run(
@@ -112,13 +112,32 @@ def test_bundle_from_lsp_has_full_call_chain(
     assert "query_user" in prompt
     assert "Required output" in prompt
 
+    # The answer contract is machine-read by `scripts/feed_ai.py`, so it must actually be
+    # stated as JSON. The first live run proved this the hard way: the model answered in
+    # Markdown prose with `**verdict**: ...` labels -- a perfectly reasonable reading of a
+    # bullet list of field names -- and the parse failed with nothing to fall back on.
+    assert "one JSON object and nothing else" in prompt
+    assert "The first character of your answer must be `{`" in prompt
+    for key in (
+        '"verdict"',
+        '"severity"',
+        '"confidence"',
+        '"reachability"',
+        '"chain"',
+        '"data_flow"',
+        '"evidence"',
+        '"missing"',
+        '"fix"',
+    ):
+        assert key in prompt, f"the output contract no longer names {key}"
+
 
 def test_bundle_depth_limit_emits_prune(
     tmp_path: Path, workspace: Path, fake_lsp_config: Path
 ) -> None:
     budget = BudgetConfig(max_depth=1, max_nodes=30, max_contexts=10)
     settings = _settings(tmp_path, workspace, fake_lsp_config, budget)
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     pipeline = AssemblyPipeline(settings)
 
     result = asyncio.run(
@@ -134,7 +153,7 @@ def test_syntax_only_mode_still_assembles(
     tmp_path: Path, workspace: Path, budget: BudgetConfig
 ) -> None:
     settings = _settings(tmp_path, workspace, None, budget)
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     pipeline = AssemblyPipeline(settings)
 
     result = asyncio.run(
@@ -157,7 +176,7 @@ def test_max_nodes_prunes_and_is_auditable(
 ) -> None:
     budget = BudgetConfig(max_depth=3, max_nodes=3, max_contexts=10)
     settings = _settings(tmp_path, workspace, fake_lsp_config, budget)
-    sarif = write_sarif(tmp_path / "scan.sarif", sink_line=5)
+    sarif = write_sarif(tmp_path / "scan.sarif")
     pipeline = AssemblyPipeline(settings)
 
     result = asyncio.run(

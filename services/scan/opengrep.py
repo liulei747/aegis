@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -45,16 +46,27 @@ def _as_text(value: bytes | str | None) -> str:
 
 
 def terminate_tree(proc: subprocess.Popen, *, grace_s: float = 1.0) -> None:
-    """Stop a scanner process and anything it spawned. Never raises.
+    """Stop a scanner process *and everything it spawned*. Never raises.
 
-    Windows gives no signal that a child can ignore but also does not reap grandchildren,
-    so ``taskkill /T`` is tried first there; POSIX gets ``terminate`` then ``kill``. We do
-    *not* put the child in a new process group: on Windows that turns ``terminate()`` from
-    ``TerminateProcess`` into a ``CTRL_BREAK_EVENT``, which a child is free to ignore --
-    the opposite of what a cancel needs.
+    Why this is not just ``terminate()``: opengrep is a launcher. The process we spawn runs
+    ``opengrep-core`` as a child, and killing only the launcher leaves the core working. That
+    was measured, not theorised: after a cancel the scan service reported the job cancelled
+    and ``running_scans`` was empty, while ``opengrep-core`` was still consuming 640% CPU in
+    that container. A cancel that reports success and leaves the CPU burning is worse than one
+    that reports it could not stop -- the user is told the work stopped when it did not.
+
+    So on POSIX the child is put in its own session (``start_new_session=True`` at spawn) and
+    the whole *process group* is signalled, which reaches grandchildren. On Windows
+    ``taskkill /T`` does the same job. Both fall back to signalling the direct child, so a
+    caller that spawned the process without a new session still gets the old behaviour.
+
+    Windows note: ``start_new_session`` is ignored there, and deliberately so --
+    ``CREATE_NEW_PROCESS_GROUP`` would turn ``terminate()`` into a ``CTRL_BREAK_EVENT`` that a
+    child may ignore, which is the opposite of what a cancel needs.
     """
     if proc.poll() is not None:
         return
+
     if os.name == "nt":  # pragma: no cover - exercised on Windows only
         try:
             subprocess.run(
@@ -65,6 +77,16 @@ def terminate_tree(proc: subprocess.Popen, *, grace_s: float = 1.0) -> None:
             )
         except Exception:
             log.debug("taskkill failed for pid=%s", proc.pid, exc_info=True)
+    else:
+        # Negative pid addresses the process group. Only valid because the scanner is spawned
+        # with `start_new_session=True`; if it was not, this raises and we fall through to the
+        # direct-child path below rather than killing an unrelated group.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            log.info("sent SIGTERM to process group of pid=%s", proc.pid)
+        except Exception:
+            log.debug("killpg failed for pid=%s", proc.pid, exc_info=True)
+
     try:
         proc.terminate()
     except Exception:
@@ -74,6 +96,12 @@ def terminate_tree(proc: subprocess.Popen, *, grace_s: float = 1.0) -> None:
         return
     except subprocess.TimeoutExpired:
         pass
+
+    if os.name != "nt":  # pragma: no cover - the child ignored SIGTERM
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            log.debug("killpg(SIGKILL) failed for pid=%s", proc.pid, exc_info=True)
     try:
         proc.kill()
     except Exception:
@@ -118,7 +146,7 @@ class OpengrepRunner:
                 )
                 return alt, True
         raise OpengrepNotFound(
-            f"neither '{self.binary}' nor '{self.fallback_binary}' is on PATH"
+            f"PATH 上既没有 '{self.binary}' 也没有 '{self.fallback_binary}'"
         )
 
     def version(self) -> str:
@@ -202,7 +230,13 @@ class OpengrepRunner:
         exe, degraded = self.resolve_binary()
         target = target.resolve()
         if not target.exists():
-            raise FileNotFoundError(f"scan target does not exist: {target}")
+            raise FileNotFoundError(f"扫描目标不存在：{target}")
+
+        if abort is not None and abort():
+            # Cancelled before we started. Checked here rather than relying on the poll loop,
+            # because everything between this point and the first poll is work done on behalf
+            # of a scan nobody wants -- including spawning a process we would immediately kill.
+            raise CanceledAbort(stage="scan", resource="scan_process", detail="cancelled before start")
 
         holder = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="aegis-scan-"))
         holder.mkdir(parents=True, exist_ok=True)
@@ -230,6 +264,11 @@ class OpengrepRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # Its own session, so a cancel can signal the whole process group. opengrep runs
+            # `opengrep-core` as a child, and signalling only the launcher leaves the core
+            # running -- measured: 640% CPU still burning after a cancel reported success.
+            # Ignored on Windows, where `taskkill /T` does the same job.
+            start_new_session=(os.name != "nt"),
         )
         if process_sink is not None:
             process_sink(proc)
@@ -257,7 +296,7 @@ class OpengrepRunner:
                     if time.monotonic() >= deadline:
                         terminate_tree(proc, grace_s=1.0)
                         err = (err or "") + (
-                            f"\nscanner exceeded {self.timeout_s}s and was terminated"
+                            f"\n扫描器超过 {self.timeout_s}s 未完成，已被终止"
                         )
                         break
         finally:
@@ -277,7 +316,7 @@ class OpengrepRunner:
             stderr_tail=tail,
             degraded=degraded,
             degrade_reason=(
-                f"'{self.binary}' not found on PATH; used '{Path(exe).stem}' instead"
+                f"PATH 上未找到 '{self.binary}'；已改用 '{Path(exe).stem}'"
                 if degraded
                 else None
             ),

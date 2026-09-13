@@ -53,6 +53,10 @@ class Provider(str, Enum):
     """How a piece of information was obtained. Never lose this - it is the trust level."""
 
     OPENGREP = "opengrep"
+    #: A real inter-procedural dataflow engine (Joern), not a call-graph walk. This is the
+    #: strongest evidence the bundle can carry: it follows the *value*, across files, and it
+    #: cannot silently drop a hop the way a direction-frozen BFS can.
+    JOERN_DATAFLOW = "joern_dataflow"
     LSP_CALL_HIERARCHY = "lsp_call_hierarchy"
     LSP_DOCUMENT_SYMBOL = "lsp_document_symbol"
     LSP_DEFINITION = "lsp_definition"

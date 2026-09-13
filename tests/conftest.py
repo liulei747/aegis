@@ -59,6 +59,23 @@ def fake_lsp_config(tmp_path: Path) -> Path:
 # fake of our own would only assert that we agree with ourselves.
 
 
+@pytest.fixture(autouse=True)
+def ai_traffic_into_tmp(tmp_path, monkeypatch):
+    """Send every test's model traffic to its own file.
+
+    The recorder sits in the real retry wrappers -- that is deliberate, because a harness test then
+    exercises the same code production does -- so a scripted client still writes a row per call. Left
+    alone, the suite appends a few hundred rows to the deployment's `var/work/ai-traffic.jsonl` on
+    every run, and the traffic screen shows test traffic next to real traffic with nothing to tell
+    them apart. Measured: 292 rows, all from one scripted smoke run.
+
+    Redirecting the path (rather than disabling the recorder) keeps the code under test identical.
+    """
+    from services.ai import traffic
+
+    monkeypatch.setattr(traffic, "traffic_path", lambda: tmp_path / "ai-traffic.jsonl")
+
+
 @pytest.fixture()
 def fake_redis():
     import fakeredis

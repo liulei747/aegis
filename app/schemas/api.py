@@ -44,6 +44,20 @@ class ScanOnlyResponse(BaseModel):
     engine: str
 
 
+class AnalyzeRequest(BaseModel):
+    """Analyse an already-finished bundle with the model.
+
+    Only `bundle_id` is required: the AI stage *consumes* a bundle, so it needs no repository,
+    and asking for one would invite a second, contradictory answer about which code the verdicts
+    describe.
+    """
+
+    bundle_id: str = Field(description="Which finished bundle under the output dir to analyse.")
+    workspace: str | None = Field(
+        default=None, description="Provenance only; the bundle already says what was analysed."
+    )
+
+
 class ScanRequest(BaseModel):
     workspace: str
     rules: list[str] = Field(default_factory=list)
@@ -52,11 +66,42 @@ class ScanRequest(BaseModel):
     exclude_globs: list[str] = Field(default_factory=list)
 
 
+class AuditRequest(BaseModel):
+    """Ask the agent harness to review a whole repository.
+
+    Only `workspace` is required, and only `workspace` is accepted: the harness bounds
+    (`max_rounds`, `steps_per_agent`, concurrency) are deliberately *not* per-request fields.
+    They are part of what the review produces, so letting a caller vary them would make two
+    requests for the same repository look identical while producing different findings -- and the
+    job fingerprint, which is how a resubmission attaches instead of running twice, is built from
+    exactly the fields here.
+    """
+
+    workspace: str = Field(description="Repo path inside the container/workspace, e.g. /data/projects/x.")
+
+
 class LspProbeResponse(BaseModel):
     workspace: str
     available: dict[str, Any] = Field(default_factory=dict)
     missing: dict[str, Any] = Field(default_factory=dict)
     degradations: list[str] = Field(default_factory=list)
+
+
+class CreateProjectRequest(BaseModel):
+    """Create a project by cloning a public repository.
+
+    `https://` only, and no credential field: a request that cannot carry a token is a request
+    whose token cannot end up in a log line. A private repository is brought in as an uploaded
+    archive instead, which is why there is no `token` here to be tempted by.
+    """
+
+    git_url: str = Field(description="https:// URL of a public repository.")
+    ref: str | None = Field(default=None, description="Branch or tag; the default branch when empty.")
+    name: str | None = Field(default=None, description="Project name; derived from the URL when empty.")
+    analyze: bool = Field(
+        default=True,
+        description="Submit one analysis job for the project once it is fetched.",
+    )
 
 
 class HealthResponse(BaseModel):

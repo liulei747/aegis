@@ -36,7 +36,31 @@ ARG INSTALL_TYPESCRIPT_LSP=true
 ARG TYPESCRIPT_VERSION=5.9.3
 ARG INSTALL_CLANGD=true
 ARG INSTALL_GOPLS=false
+# jdt.ls needs a JDK of its own (`openjdk-17` has no candidate on trixie, 21 does), and recent
+# snapshots require 21. Installed because a Java project on an image without `jdtls` still
+# "succeeds" -- it just silently falls back to a heuristic call graph, which is the difference
+# between a usable bundle and a thin one.
+ARG INSTALL_JDTLS=true
+ARG JDTLS_JAVA_MAJOR=21
 ARG INSTALL_SEMGREP_FALLBACK=true
+
+# ---------------------------------------------------------------------------
+# Package mirrors.
+#
+# The default registries are the bottleneck on a slow international link, and the
+# measurements from this project's machine are not close: `pip install semgrep` through the
+# default index took **362 s**, while a Chinese mirror moved 13 MB at **7.7 MB/s** on a
+# comparable file. The host's own HTTP proxy was measured *slower* than direct for
+# download.eclipse.org (37 kB/s vs 70 kB/s), so a proxy is not the answer here -- a mirror is.
+#
+# Overridable so a build outside China uses the upstream registries:
+#   docker compose build --build-arg PIP_INDEX_URL=https://pypi.org/simple ...
+# An empty value means "leave the default alone", which is what the upstream path expects.
+# ---------------------------------------------------------------------------
+ARG DEBIAN_MIRROR=https://mirrors.aliyun.com/debian
+ARG DEBIAN_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -52,9 +76,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     AEGIS_LSP_CONFIG_FILE=/opt/aegis/lsp.yaml \
     PATH="/home/aegis/.local/bin:/usr/local/bin:${PATH}"
 
-RUN set -eux; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    set -eux; \
+    mkdir -p /var/cache/apt/archives/partial; \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "120";\nAcquire::https::Timeout "120";\n' \
         > /etc/apt/apt.conf.d/99aegis-retries; \
+    if [ -n "$DEBIAN_MIRROR" ]; then \
+        sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+            || sed -i "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" /etc/apt/sources.list; \
+        if [ -n "$DEBIAN_SECURITY_MIRROR" ]; then \
+            sed -i "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+                || sed -i "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" /etc/apt/sources.list; \
+        fi; \
+    fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl git gnupg; \
     rm -rf /var/lib/apt/lists/*
@@ -104,20 +138,29 @@ WORKDIR /opt/aegis
 # wheel downloads too, which is what makes a dependency change tolerable.
 RUN --mount=type=cache,target=/root/.cache/pip \
     set -eux; \
+    pip_flags=""; \
+    if [ -n "$PIP_INDEX_URL" ]; then pip_flags="-i $PIP_INDEX_URL"; fi; \
     if [ "$INSTALL_SEMGREP_FALLBACK" = "true" ]; then \
-        pip install semgrep || echo "WARN: semgrep fallback unavailable"; \
+        pip install $pip_flags semgrep || echo "WARN: semgrep fallback unavailable"; \
     fi
 
 # Language servers, also independent of our source. Best-effort by design: a
 # server that will not install degrades the bundle (lower-confidence syntax
 # edges, recorded as a Degradation) instead of failing the image build.
+# A fresh cache mount over /var/cache/apt is EMPTY, and apt needs `archives/partial` to exist
+# inside it. Without the mkdir below every `apt-get install` in this layer fails -- and because
+# each one ends in `|| echo "WARN: ..."` the failure is a log line rather than a build error,
+# which is exactly how clangd disappeared from the image unnoticed.
 RUN --mount=type=cache,target=/root/.npm \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/cache/jdtls \
     set -eux; \
+    mkdir -p /var/cache/apt/archives/partial; \
     if [ "$INSTALL_PYRIGHT" = "true" ]; then \
-        npm install -g --no-fund --no-audit pyright || echo "WARN: pyright unavailable"; \
+        npm install -g --no-fund --no-audit --registry="$NPM_REGISTRY" pyright || echo "WARN: pyright unavailable"; \
     fi; \
     if [ "$INSTALL_TYPESCRIPT_LSP" = "true" ]; then \
-        npm install -g --no-fund --no-audit "typescript@${TYPESCRIPT_VERSION}" typescript-language-server; \
+        npm install -g --no-fund --no-audit --registry="$NPM_REGISTRY" "typescript@${TYPESCRIPT_VERSION}" typescript-language-server; \
         node -e "const p=require('/usr/lib/node_modules/typescript/package.json'); \
                  if(!p.version.startsWith('5.')) { console.error('unexpected typescript '+p.version); process.exit(1); }"; \
     fi; \
@@ -134,7 +177,27 @@ RUN --mount=type=cache,target=/root/.npm \
           && GOBIN=/usr/local/bin /usr/local/go/bin/go install golang.org/x/tools/gopls@latest \
           && rm -rf /tmp/go.tgz /usr/local/go ) \
           || echo "WARN: gopls unavailable"; \
+    fi; \
+    if [ "$INSTALL_JDTLS" = "true" ]; then \
+        ( apt-get update \
+          && apt-get install -y --no-install-recommends "openjdk-${JDTLS_JAVA_MAJOR}-jre-headless" \
+          && rm -rf /var/lib/apt/lists/* \
+          && mkdir -p /opt/jdtls \
+          && if [ ! -s /var/cache/jdtls/jdt-language-server.tar.gz ]; then \
+                 curl -fsSL --retry 4 --retry-delay 3 --retry-all-errors \
+                      "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz" \
+                      -o /var/cache/jdtls/jdt-language-server.tar.gz; \
+             fi \
+          && tar -C /opt/jdtls -xzf /var/cache/jdtls/jdt-language-server.tar.gz \
+          && java -version ) \
+          || echo "WARN: jdtls unavailable"; \
     fi
+
+# The launcher is a file rather than a `printf` inside the RUN above: it is long enough that
+# quoting it into a shell string is a bug waiting to happen (it was one), and a COPY is cached
+# independently of whether the JDK was already installed.
+COPY docker/jdtls.sh /usr/local/bin/jdtls
+RUN chmod 0755 /usr/local/bin/jdtls
 
 # ---------------------------------------------------------------------------
 # Aegis itself. Everything from here down is invalidated by a source edit, and
@@ -153,7 +216,10 @@ COPY pyproject.toml README.md MANIFEST.in ./
 # extraction stack). A bare `pip install .` would ship an image without a web
 # framework — which is exactly how this line broke once.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip && pip install ".[all]"
+    set -eux; \
+    pip_flags=""; \
+    if [ -n "$PIP_INDEX_URL" ]; then pip_flags="-i $PIP_INDEX_URL"; fi; \
+    pip install $pip_flags --upgrade pip && pip install $pip_flags ".[all]"
 
 # The shared layers are copied as sources, like the app: they change as often and
 # rebuilding a wheel for them on every edit is what made the loop slow.

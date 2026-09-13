@@ -103,11 +103,31 @@ class JobStage(str, Enum):
     READ = "read"
     ASSEMBLE = "assemble"
     PACKAGE = "package"
+    #: The AI stage. Last before `DONE` because that is when it runs: it reads a *finished*
+    #: bundle. It exists as its own member rather than borrowing `SCAN` because a job that is
+    #: asking a model about a bundle is not scanning anything -- measured, an `ai_fanout` job
+    #: reported `stage=scan` from start to finish, which tells a reader the wrong thing about
+    #: what the process is doing.
+    AI = "ai"
     DONE = "done"
 
 
 #: The stages a run actually spends time in -- everything except the ``DONE`` sentinel.
 TIMED_STAGES: tuple[JobStage, ...] = tuple(stage for stage in JobStage if stage is not JobStage.DONE)
+
+
+def first_stage(kind: JobKind) -> JobStage:
+    """The stage a job of this kind starts in.
+
+    A fresh job, and a re-run, both begin somewhere, and "somewhere" is not the same for every
+    kind: an assemble job's first act is to scan, while an AI job never scans at all. Hardcoding
+    `JobStage.SCAN` at those call sites is what made an AI job report `scan`.
+    """
+    return (
+        JobStage.AI
+        if kind in (JobKind.AI_FANOUT, JobKind.AUDIT)
+        else JobStage.SCAN
+    )
 
 #: One in-flight unit inside a stage. ``SKIPPED`` exists so that a stage which cannot
 #: report detail says so, instead of looking like a stage that never ran.
@@ -124,6 +144,12 @@ class JobKind(str, Enum):
     #: Accepted by the contract so the AI stage does not need a schema change. A worker
     #: in this build refuses it loudly rather than accepting work it will not do.
     AI_FANOUT = "ai_fanout"
+    #: The autonomous audit: the agent harness over a whole repository. Its own kind rather than an
+    #: `ai_fanout` with a flag, because the two share nothing but the word "AI": an audit consumes
+    #: no bundle, produces findings instead of per-context verdicts, runs for half an hour instead
+    #: of two minutes, and needs its own dedup key -- sharing one with a bundle analysis of the same
+    #: workspace would make a resubmission attach to the wrong job.
+    AUDIT = "audit"
 
 
 class FailureMode(str, Enum):
@@ -143,6 +169,13 @@ class FailureMode(str, Enum):
     SCAN_ABORTED = "scan_aborted"
     EXTRACTION_UNAVAILABLE = "extraction_unavailable"
     PIPELINE_EXCEPTION = "pipeline_exception"
+    #: An `ai_fanout` job that named no bundle, or one that is not there. Distinct from
+    #: `pipeline_exception` because nothing ran: the request did not identify any work.
+    AI_BUNDLE_MISSING = "ai_bundle_missing"
+    #: Every model call failed. The bundle is untouched either way, but a job that produced no
+    #: verdict must not report success: it would tell the caller the analysis happened, and
+    #: request deduplication would then refuse to retry it.
+    AI_FAILED = "ai_failed"
     #: Claimed by a worker that then stopped heartbeating.
     WORKER_LOST = "worker_lost"
     ATTEMPTS_EXHAUSTED = "attempts_exhausted"
@@ -201,8 +234,22 @@ class JobProgress(BaseModel):
     worker_heartbeat_at: datetime | None = None
 
     @classmethod
-    def fresh(cls) -> JobProgress:
-        return cls(stages=[JobStageProgress(stage=stage) for stage in JobStage])
+    def fresh(cls, kind: JobKind = JobKind.ASSEMBLE) -> JobProgress:
+        """Every stage, with the ones this kind of job will never run marked `skipped`.
+
+        The eight-stage track is fixed for a reason -- a consumer renders it without inferring
+        which stages apply -- so an audit job shows the six bundle-building stages as `skipped`
+        with a note, rather than as `pending` rows that will never move. "This job does not use
+        that stage" and "that stage has not started" are different facts, and a reader who could
+        not tell them apart would wait for a packaging stage that is never coming.
+        """
+        stages = [JobStageProgress(stage=stage) for stage in JobStage]
+        if kind is JobKind.AUDIT:
+            for entry in stages:
+                if entry.stage not in (JobStage.AI, JobStage.DONE):
+                    entry.state = STAGE_SKIPPED
+                    entry.note = "AI 审计不使用这个阶段"
+        return cls(stages=stages)
 
 
 class JobRequest(BaseModel):
@@ -220,6 +267,9 @@ class JobRequest(BaseModel):
     max_findings: int | None = None
     lsp: bool = True
     package_name: str | None = None
+    #: Which finished bundle to act on. Only the AI stage uses it: that job consumes a bundle
+    #: instead of producing one, so `workspace` alone does not identify the work.
+    bundle_id: str | None = None
 
 
 class JobSubmission(BaseModel):
@@ -319,6 +369,12 @@ class JobSummary(BaseModel):
     units_total: int = 0
     unit_label: str = ""
     attempt: int = 1
+    #: Which repository the job runs against, raw. A list view has to answer "what is this job
+    #: about?" and the only other place that string lives is the full `Job`; fetching one job per
+    #: row to render a table is the fan-out this field exists to avoid. It stays a raw path -- no
+    #: derived counters and no resolved/rebased form, because a summary that paraphrases is worse
+    #: than one that omits.
+    workspace: str | None = None
     bundle_id: str | None = None
     failure_mode: FailureMode | None = None
     revision: int = 0
@@ -340,6 +396,7 @@ class JobSummary(BaseModel):
             units_total=job.progress.units_total,
             unit_label=job.progress.unit_label,
             attempt=job.progress.attempt,
+            workspace=job.submission.request.workspace,
             bundle_id=(job.result.bundle_id if job.result else None),
             failure_mode=(job.failure.mode if job.failure else None),
             revision=job.revision,
@@ -389,14 +446,22 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def request_fingerprint(request: JobRequest, *, lsp_config_fingerprint: str = "") -> str:
-    """A digest of everything that can change the resulting bundle.
+def request_fingerprint(
+    request: JobRequest, *, lsp_config_fingerprint: str = "", kind: JobKind = JobKind.ASSEMBLE
+) -> str:
+    """A digest of everything that can change what a job produces.
 
     Two submissions with the same fingerprint are the same request, so the second one is
     attached to the first job instead of doing the work twice. That makes every omitted
     field a correctness bug rather than a missed optimisation: the tests assert that
     ``lsp``, ``max_findings``, ``package_name``, the globs and the *contents* of a SARIF
     file all separate two fingerprints.
+
+    ``kind`` and ``bundle_id`` were both missing, and the symptom was not a missed optimisation
+    but a false success: an `ai_fanout` job for one bundle produced the same fingerprint as an
+    earlier `scan` job on the same workspace, so it was deduplicated onto that job, reused its
+    id, and "succeeded" without analysing anything at all. Measured on the live stack -- the
+    report on disk was 25 minutes older than the job that claimed to have written it.
 
     ``lsp_config_fingerprint`` is the sha1 of the language-server catalog, passed in by
     the caller (the contract may not read files). Two catalogs at the same path with
@@ -417,6 +482,8 @@ def request_fingerprint(request: JobRequest, *, lsp_config_fingerprint: str = ""
         artifact = f"rule_config:{request.rule_config or ''}"
 
     extra = [
+        f"kind:{kind.value}",
+        f"bundle_id:{request.bundle_id or ''}",
         f"include:{','.join(sorted(request.include_globs))}",
         f"exclude:{','.join(sorted(request.exclude_globs))}",
         f"lsp:{int(request.lsp)}",

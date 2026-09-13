@@ -111,13 +111,44 @@ def _absolute_from_parts(raw: str) -> Path:
     return Path(raw)
 
 
-def _candidate_suffixes(path: Path) -> list[str]:
-    """Directory-anchored suffixes of an absolute path, most specific first."""
+def _candidate_suffixes(path: Path, *, include_name: bool = False) -> list[str]:
+    """Anchored suffixes of an absolute path, most specific first.
+
+    The bare file name is **off by default**: `utils.py` on its own identifies nothing. It is
+    available as a last resort, and the caller is expected to demand that it be unique under the
+    root before trusting it.
+    """
     parts = [part for part in path.parts if part not in ("/", "\\")]
     out: list[str] = []
-    for start in range(1, len(parts) - 1):  # skip the anchor and the file name
+    last = len(parts) if include_name else len(parts) - 1  # skip the anchor, keep the file name
+    for start in range(1, last):
         out.append("/".join(parts[start:]))
     return out
+
+
+def _unique_bare_name(name: str, root: Path, *, budget: int = 20_000) -> Path | None:
+    """The one file under ``root`` with this name, or None when there are none or several.
+
+    Bounded on purpose: it returns as soon as a second match appears (an ambiguous name is
+    refused immediately rather than resolved to an arbitrary file), and gives up after `budget`
+    entries instead of walking a huge tree to no purpose. Only reached when a foreign path could
+    not be rebased any other way, so it is not on the hot path.
+    """
+    if not name or name in ("/", "\\"):
+        return None
+    matches: list[Path] = []
+    seen = 0
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SCAFFOLD_DIRS and not d.startswith(".")]
+        for filename in files:
+            seen += 1
+            if seen > budget:
+                return None
+            if filename == name:
+                matches.append(Path(current) / filename)
+                if len(matches) > 1:
+                    return None
+    return matches[0] if len(matches) == 1 else None
 
 
 def strip_foreign_prefix(path: Path, root: Path) -> Path | None:
@@ -140,6 +171,15 @@ def strip_foreign_prefix(path: Path, root: Path) -> Path | None:
             continue
         if root.joinpath(*parts).exists():
             return Path(*parts)
+
+    # Last resort: the bare file name, and only when it is unambiguous. Without this, a
+    # workspace whose root *is* the file's own directory could never be matched: every candidate
+    # above keeps at least one directory, so `file:///E:/.../demo/repo/repo.py` against a root
+    # holding `repo.py` matched nothing and every finding failed to locate -- while the run still
+    # reported success (measured, three times, via /v1/assemble/upload).
+    unique = _unique_bare_name(path.name, root)
+    if unique is not None:
+        return unique.relative_to(root)
     return None
 
 
@@ -173,7 +213,7 @@ def rebase_path(rel: str, root: Path) -> str:
     if existed is not None:
         return existed.as_posix()
 
-    for candidate in _candidate_suffixes(resolved):
+    for candidate in _candidate_suffixes(resolved, include_name=True):
         parts = [part for part in candidate.split("/") if part]
         if parts and parts[0] not in SCAFFOLD_DIRS:
             return candidate

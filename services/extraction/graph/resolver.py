@@ -308,8 +308,8 @@ class SymbolIndex:
                     self._record(
                         Degradation(
                             capability="documentSymbol",
-                            reason=f"language server returned no symbols for {rel}",
-                            impact="method location falls back to syntax heuristics",
+                            reason=f"语言服务器没有为 {rel} 返回任何符号",
+                            impact="方法位置回退到语法启发式",
                             path=rel,
                             language=path.suffix.lstrip("."),
                         )
@@ -318,8 +318,8 @@ class SymbolIndex:
                 self._record(
                     Degradation(
                         capability="lsp",
-                        reason=f"no usable language server for {rel}",
-                        impact="method location falls back to syntax heuristics",
+                        reason=f"没有可用于 {rel} 的语言服务器",
+                        impact="方法位置回退到语法启发式",
                         path=rel,
                         language=Path(rel).suffix.lstrip("."),
                     )
