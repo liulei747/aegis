@@ -991,6 +991,21 @@ class HarnessCoordinator:
             ),
         )
 
+    def _opening_reuse(self) -> list[AgentStep]:
+        """Complete reads this run already has, to seed an opening re-dispatch with.
+
+        Pass 1 is the reader: it is the only pass allowed to fetch from disk, and its reads are the
+        evidence the coverage ledger rests on. Pass 2 onwards is a *re-read* by construction (see
+        `_run_recon`), so the bytes come out of the blackboard instead -- measured on a four-file
+        project, the re-dispatches re-read the same four files once per pass.
+        """
+        steps, _reused, _missing = agents.replayable_reads(
+            self.blackboard,
+            coverage.inventory(self.workspace),
+            budget=self.config.material_budget,
+        )
+        return steps
+
     def _run_recon(self, index: int = 1, backlog: list[dict] | None = None) -> AgentRun | None:
         """One recon run. `backlog` is what the peer published since this agent last read the board.
 
@@ -1012,6 +1027,7 @@ class HarnessCoordinator:
             client=self.client,
             max_steps=self.config.steps_per_agent,
             blackboard=self.blackboard,
+            initial_steps=self._opening_reuse() if index >= 2 else None,
         )
         if outcome.parsed is None:
             log.warning("harness: recon produced nothing usable (%s)", outcome.error)
@@ -1049,6 +1065,7 @@ class HarnessCoordinator:
             client=self.client,
             max_steps=self.config.steps_per_agent,
             blackboard=self.blackboard,
+            initial_steps=self._opening_reuse() if index >= 2 else None,
         )
         if outcome.parsed is None:
             log.warning("harness: threat model produced nothing usable (%s)", outcome.error)
@@ -1216,6 +1233,9 @@ class HarnessCoordinator:
         Failure is not fatal and is not silent: the survey plan is used, and the ledger's rationale
         prefix is what tells a reader that the scopes were derived from directory names rather than
         from the model reading the repository.
+
+        The planner's `files` answer is written back into `_scope_files`, so a planner-created scope
+        is held to the same "read every file you own" coverage rule as a survey scope.
         """
         components = [
             {
@@ -1239,6 +1259,13 @@ class HarnessCoordinator:
                 "each with its reason.",
             ]
         )
+        # The opening stage has already read part of this repository, and the planner's second turn is
+        # otherwise spent re-fetching it (measured: one pure-read turn on the four-file project).
+        reuse, _reused_files, _missing_files = agents.replayable_reads(
+            self.blackboard,
+            sorted({name for scope in scopes for name in scope.files}),
+            budget=self.config.material_budget,
+        )
         outcome = self._agent(
             agent=agents.PLANNER,
             scope_id="plan",
@@ -1247,6 +1274,7 @@ class HarnessCoordinator:
             client=self.client,
             max_steps=self.config.steps_per_agent,
             blackboard=self.blackboard,
+            initial_steps=reuse or None,
         )
         if outcome.parsed is None:
             log.warning("harness: planner produced nothing usable (%s); using the survey plan",
@@ -1263,6 +1291,23 @@ class HarnessCoordinator:
             for scope in planned.get("scopes", [])
             if isinstance(scope, dict) and scope.get("scope_id")
         ]
+        # The planner is asked for each scope's `files` and the list was being dropped. Two things
+        # depended on that list and both were silently dead for a planner-created scope: the prefetch
+        # above had nothing to reuse (measured: `scope-data-access` carried `files=0` and its
+        # re-dispatch prefetch seeded nothing), and `_close_coverage`'s "N files never read end to end"
+        # clause never fired for it because `_unread_in` returned empty.
+        #
+        # Filtered against the real inventory, not trusted: the same rule as `docs/HANDOVER.md` §14.12
+        # item 1 -- a path a model wrote is a string, and nobody has checked it against the workspace.
+        inventory = set(coverage.inventory(self.workspace))
+        for scope in planned.get("scopes", []):
+            if not isinstance(scope, dict) or not scope.get("scope_id"):
+                continue
+            named = [
+                str(name) for name in (scope.get("files") or []) if str(name) in inventory
+            ]
+            if named:
+                self._scope_files.setdefault(str(scope["scope_id"]), named)
         for scope_id in planned.get("excluded", []):
             # An excluded scope is decided, not forgotten: it gets a coverage row in EXCLUDED with
             # the planner's reason, which is a different claim from `unseen` and must stay so.
@@ -1367,6 +1412,9 @@ class HarnessCoordinator:
         loop burned its whole round budget re-dispatching to nobody while still reporting
         `INSUFFICIENT`. `round_index` is what says whether this is a first pass or a re-dispatch;
         the callers pass exactly the scopes they mean to spend on.
+
+        Reuse happens in **every** round, round 0 included: a file another scope already read
+        completely is the same bytes, and re-fetching it costs a round trip per scope.
         """
         items = {item.scope_id: item for item in self.blackboard.work}
         work = [items[scope_id] for scope_id in scope_ids if scope_id in items]
@@ -1383,27 +1431,33 @@ class HarnessCoordinator:
             prefetched_files: list[str] = []
             skipped_files: list[str] = []
             reused_files: list[str] = []
-            if round_index and owned:
+            if round_index:
                 # A re-dispatch is handed only what is still unread: starting the whole group again
                 # spends the budget re-reading files the previous agent already finished.
                 assigned = self._unread_in(item.scope_id) or None
-                # ...and it is handed the files themselves -- **out of the blackboard when the run has
-                # already read them**, off the disk otherwise -- because a fresh agent has never seen
-                # this code and cannot be told to remember it. Measured: rounds 1-3 read *more* per run
-                # than round 0 (5.9 vs 4.7 files), 110 of the 143 discovery reads.
+            else:
+                assigned = owned or None
+            # Reuse happens in **every** round, round 0 included: a file another scope already read
+            # completely is the same bytes, and re-fetching it costs a round trip per scope -- measured
+            # on a four-file project, five scopes each spent a turn reading the same four files.
+            #
+            # A scope that owns no files shares nothing rather than everything (`replayable_reads`
+            # treats an empty list as a no-op): a planner-created scope with no `files` has no
+            # assignment to base the reuse on, and handing it the whole repository would be a scope
+            # whose context is the workspace.
+            if owned:
+                wanted = (self._unread_in(item.scope_id) or owned) if round_index else owned
                 (
                     prefetched_steps,
                     reused_files,
                     prefetched_files,
                     skipped_files,
                 ) = agents.prefetch_scope_files(
-                    self._unread_in(item.scope_id) or owned,
+                    wanted,
                     self.context,
                     budget=self.config.material_budget,
                     blackboard=self.blackboard,
                 )
-            else:
-                assigned = owned or None
             outcome = self._agent(
                 agent=agents.DISCOVERY,
                 scope_id=item.scope_id,
@@ -1412,6 +1466,7 @@ class HarnessCoordinator:
                     item,
                     attempt=round_index + 1,
                     files=assigned,
+                    reused=reused_files,
                     prefetched=prefetched_files,
                     skipped=skipped_files,
                 ),

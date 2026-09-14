@@ -154,6 +154,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.npm \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/cache/jdtls \
+    --mount=type=bind,from=jdtls,src=/,target=/jdtls-local,readonly \
     set -eux; \
     mkdir -p /var/cache/apt/archives/partial; \
     if [ "$INSTALL_PYRIGHT" = "true" ]; then \
@@ -184,9 +185,13 @@ RUN --mount=type=cache,target=/root/.npm \
           && rm -rf /var/lib/apt/lists/* \
           && mkdir -p /opt/jdtls \
           && if [ ! -s /var/cache/jdtls/jdt-language-server.tar.gz ]; then \
-                 curl -fsSL --retry 4 --retry-delay 3 --retry-all-errors \
-                      "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz" \
-                      -o /var/cache/jdtls/jdt-language-server.tar.gz; \
+                 if [ -f /jdtls-local/jdt-language-server.tar.gz ]; then \
+                     cp /jdtls-local/jdt-language-server.tar.gz /var/cache/jdtls/jdt-language-server.tar.gz; \
+                 else \
+                     curl -fsSL --retry 4 --retry-delay 3 --retry-all-errors \
+                          "https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz" \
+                          -o /var/cache/jdtls/jdt-language-server.tar.gz; \
+                 fi; \
              fi \
           && tar -C /opt/jdtls -xzf /var/cache/jdtls/jdt-language-server.tar.gz \
           && java -version ) \

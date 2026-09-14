@@ -960,7 +960,14 @@ def test_the_round_bound_stops_the_closure_loop(tmp_path: Path) -> None:
     client.script(agents.ATTACK_PATH, WEB_SCOPE, final(reachable=False, impact="x", confidence=0.5))
 
     max_rounds = 2
-    coordinator = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=max_rounds))
+    # `concurrency=1` serialises the discovery threads. The assertion `by_round["0"] == planned`
+    # compares completion order with plan order, and with concurrent threads that order is
+    # scheduling-dependent -- which made this test flaky. Serialising makes the order deterministic
+    # without changing what is being verified (the round bound still stops the loop).
+    coordinator = pipeline(
+        tmp_path, client,
+        config=HarnessConfig(max_rounds=max_rounds, concurrency=1),
+    )
     result = coordinator.run()
 
     board = result.blackboard
@@ -1466,12 +1473,15 @@ def test_the_pipeline_runs_against_the_real_tool_layer_with_a_scripted_model(tmp
         for run in board.runs
         if run.agent == agents.DISCOVERY and run.scope_id == SERVICE_SCOPE
     )
-    read_step = discovery_run.steps[0]
+    read_step = next(step for step in discovery_run.steps if step.call is not None)
     assert read_step.result is not None and read_step.result.ok, (
         "the real `read` tool must succeed through the real context"
     )
     assert "UserService" in read_step.result.summary
     assert read_step.result.data["path"].endswith("UserService.java")
+    assert discovery_run.reused_files == [], (
+        "this run is the first reader, so nothing came out of the blackboard for it"
+    )
 
     # `dataflow_verify` has no verifier here, so it must report unavailable -- and the verdict must
     # carry that failure rather than an empty path that reads like "the engine proved no flow".
@@ -2029,7 +2039,9 @@ def test_a_redispatched_scope_is_handed_its_files_instead_of_refetching_them(
     counter = CallCounter()
     client = two_scope_client(counter)
     # Round 0 finds a candidate; round 1 finds nothing new, so the scope closes there.
+    # Round 0 first `read`s the file so a complete read lands on the blackboard for round 1 to reuse.
     client.by_agent[(agents.DISCOVERY, SERVICE_SCOPE)] = [
+        turn("read", path=service_file),
         discovery_answer(),
         final(candidates=[], notes=["没有新的"]),
     ]
@@ -2047,12 +2059,17 @@ def test_a_redispatched_scope_is_handed_its_files_instead_of_refetching_them(
     prompts = [call[2] for call in counter.calls if call[0] == agents.DISCOVERY]
     round_one = [prompt for prompt in prompts if "discovery round 2" in prompt]
     assert round_one, "the scope was re-dispatched, which is the case under test"
-    assert "已读入" in round_one[0], "the files are named as already read"
-    assert "do not read them again" in round_one[0]
-    assert "Your job is the second look" in round_one[0], (
+    service_round_one = [p for p in round_one if SERVICE_SCOPE in p]
+    assert service_round_one, (
+        "SERVICE_SCOPE is the case under test -- a scope another round already read the file for"
+    )
+    prompt = service_round_one[0]
+    assert "已读入" in prompt, "the files are named as already read"
+    assert "do not read them again" in prompt
+    assert "Your job is the second look" in prompt, (
         "and the pass is given a job other than re-reading"
     )
-    assert "1\tpublic class UserService" in round_one[0], (
+    assert "1\tpublic class UserService" in prompt, (
         "the content itself is in the transcript as a seeded step"
     )
 
@@ -2104,6 +2121,14 @@ def test_the_prefetch_is_off_at_budget_zero_and_skips_what_does_not_fit(
     )
 
     steps, _reused, read, skipped = prefetch_scope_files([service_file], context, budget=20_000)
+    assert steps == [] and read == [] and skipped == [service_file], (
+        "the default is blackboard-only: without a blackboard that has the file, it is named as skipped"
+        "and the agent reads it itself"
+    )
+
+    steps, _reused, read, skipped = prefetch_scope_files(
+        [service_file], context, budget=20_000, from_disk=True
+    )
     assert len(steps) == 1 and read == [service_file] and skipped == []
 
 
@@ -2146,7 +2171,9 @@ def test_a_file_the_run_already_read_is_taken_from_the_blackboard_not_the_disk(
     context = ToolContext(workspace=root, limits=ToolLimits())
 
     board = bb.new_blackboard("run-reuse", root)
-    first, _reused, read, _skipped = prefetch_scope_files([service_file], context, budget=20_000)
+    first, _reused, read, _skipped = prefetch_scope_files(
+        [service_file], context, budget=20_000, from_disk=True
+    )
     assert read == [service_file] and len(module.recorded) == 1
     for step in first:  # what a real run does with them
         run = AgentRun(run_id="discovery:s:r0", agent="discovery", scope_id="s")
@@ -2200,6 +2227,240 @@ def test_an_incomplete_read_is_not_reused_as_if_it_were_the_file(tmp_path: Path)
     bb.add_run(board, run)
 
     assert stored_read(board, "big.py") is None
+
+
+def test_replayable_reads_only_looks_at_the_blackboard(tmp_path: Path, monkeypatch) -> None:
+    """`replayable_reads` never touches the tool layer: it only reads what the board already holds."""
+    from services.harness.agents import replayable_reads
+
+    module = make_fake_tools()
+    monkeypatch.setitem(sys.modules, "services.harness.tools", module)
+    react.clear_tool_layer_cache()
+    board = bb.new_blackboard("run-empty", tmp_path)
+    steps, reused, missing = replayable_reads(board, ["a.py", "b.py"], budget=10_000)
+    assert steps == [] and reused == [] and missing == ["a.py", "b.py"]
+    assert module.recorded == [], "replayable_reads makes no tool calls at all"
+
+
+def test_replayable_reads_returns_what_the_board_has_and_names_what_it_does_not(
+    tmp_path: Path,
+) -> None:
+    """A file with a complete read on the board is replayed; a file without one is named missing."""
+    from services.harness.agents import replayable_reads
+
+    board = bb.new_blackboard("run-replay", tmp_path)
+    run = AgentRun(run_id="discovery:s:r0", agent="discovery", scope_id="s")
+    run.steps.append(
+        AgentStep(
+            index=1,
+            thought="读到了",
+            call=ToolCall(tool=ToolName.READ, arguments={"path": "a.py"}),
+            result=ToolResult(
+                tool=ToolName.READ, ok=True, summary="a.py 全文",
+                data={
+                    "path": "a.py", "offset": 1, "total_lines": 5,
+                    "returned_lines": 5, "next_offset": None, "lines": ["x"] * 5,
+                },
+            ),
+        )
+    )
+    bb.add_run(board, run)
+
+    steps, reused, missing = replayable_reads(board, ["a.py", "b.py"], budget=10_000)
+    assert len(steps) == 1 and reused == ["a.py"] and missing == ["b.py"]
+    assert steps[0].thought == agents.SCOPE_REUSE_THOUGHT
+
+
+def test_replayable_reads_is_a_no_op_for_an_empty_file_list(tmp_path: Path) -> None:
+    """An empty list shares nothing -- an agent with no files is handed nothing (decision D2)."""
+    from services.harness.agents import replayable_reads
+
+    board = bb.new_blackboard("run-noop", tmp_path)
+    steps, reused, missing = replayable_reads(board, [], budget=10_000)
+    assert steps == [] and reused == [] and missing == []
+
+
+def test_a_partially_read_file_is_not_replayable(tmp_path: Path) -> None:
+    """`returned_lines == total_lines` or nothing: a half-read file is named missing, not reused."""
+    from services.harness.agents import replayable_reads
+
+    board = bb.new_blackboard("run-partial-replay", tmp_path)
+    run = AgentRun(run_id="discovery:s:r0", agent="discovery", scope_id="s")
+    run.steps.append(
+        AgentStep(
+            index=1, thought="读了一半",
+            call=ToolCall(tool=ToolName.READ, arguments={"path": "big.py"}),
+            result=ToolResult(
+                tool=ToolName.READ, ok=True, summary="前 200 行",
+                data={
+                    "path": "big.py", "offset": 1, "total_lines": 900,
+                    "returned_lines": 200, "next_offset": 201,
+                    "lines": ["x"] * 200, "truncated": True,
+                },
+            ),
+        )
+    )
+    bb.add_run(board, run)
+
+    steps, reused, missing = replayable_reads(board, ["big.py"], budget=10_000)
+    assert steps == [] and reused == [] and missing == ["big.py"]
+
+
+def test_discovery_round_zero_reuses_a_file_another_scope_already_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Round 0 now reuses: a file another scope read completely is not re-read from disk."""
+    from services.harness.agents import prefetch_scope_files
+
+    root = workspace(tmp_path / "round0")
+    service_file = "src/main/java/com/example/service/UserService.java"
+    lines = (root / service_file).read_text(encoding="utf-8").splitlines()
+    module = make_fake_tools(
+        answers={
+            "read": ToolResult(
+                tool=ToolName.READ, ok=True, summary="\n".join(lines),
+                data={
+                    "path": service_file, "offset": 1, "total_lines": len(lines),
+                    "returned_lines": len(lines), "next_offset": None, "lines": lines,
+                    "truncated": False,
+                },
+            )
+        }
+    )
+    monkeypatch.setitem(sys.modules, "services.harness.tools", module)
+    react.clear_tool_layer_cache()
+    context = FakeToolContext(tmp_path)
+
+    board = bb.new_blackboard("run-reuse-r0", root)
+    # Scope A reads the file first (from_disk=True model the old path).
+    first, _reused, read, _skipped = prefetch_scope_files(
+        [service_file], context, budget=20_000, from_disk=True
+    )
+    assert read == [service_file]
+    for step in first:
+        run = AgentRun(run_id="discovery:a:r0", agent="discovery", scope_id="a")
+        run.steps.append(step)
+        bb.add_run(board, run)
+
+    module.recorded.clear()
+    # Scope B owns the same file: round 0 now reuses it out of the board instead of reading the disk.
+    second, reused, read2, _skipped2 = prefetch_scope_files(
+        [service_file], context, budget=20_000, blackboard=board
+    )
+    assert reused == [service_file], "round 0 reuses what another scope already read"
+    assert read2 == [] and module.recorded == [], "no disk read for the second scope's same file"
+    # The run that received the reused step carries its file in `reused_files`.
+    run_b = AgentRun(run_id="discovery:b:r0", agent="discovery", scope_id="b")
+    run_b.steps.extend(second)
+    run_b.reused_files = agents._reused_files(second)
+    assert run_b.reused_files == [service_file]
+
+
+def test_opening_pass_two_does_not_re_read_what_pass_one_read(tmp_path: Path) -> None:
+    """A pass-2 recon gets its files out of the blackboard, not off the disk."""
+    from services.harness.agents import replayable_reads
+
+    root = workspace(tmp_path / "opening")
+    inventory = coverage.inventory(root)
+    board = bb.new_blackboard("run-opening", root)
+    # Pretend pass 1 read every file: put a complete read on the board for each.
+    run = AgentRun(run_id="recon:workspace:p1", agent="recon", scope_id="workspace")
+    for i, f in enumerate(inventory):
+        run.steps.append(
+            AgentStep(
+                index=i + 1, thought="pass1",
+                call=ToolCall(tool=ToolName.READ, arguments={"path": f}),
+                result=ToolResult(
+                    tool=ToolName.READ, ok=True, summary=f"读到 {f}",
+                    data={
+                        "path": f, "offset": 1, "total_lines": 10,
+                        "returned_lines": 10, "next_offset": None, "lines": ["x"] * 10,
+                    },
+                ),
+            )
+        )
+    bb.add_run(board, run)
+
+    steps, reused, _missing = replayable_reads(board, inventory, budget=10_000_000)
+    assert len(steps) == len(inventory), "pass 2 reuses every file pass 1 read"
+    assert len(reused) == len(inventory)
+
+
+def test_a_planner_created_scope_carries_the_files_the_planner_named(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The planner's `files` answer is written back into `_scope_files` (before: silently dropped)."""
+    from services.harness.tools.base import ToolContext, ToolLimits
+
+    root = workspace(tmp_path / "plannerfiles")
+    service_file = "src/main/java/com/example/service/UserService.java"
+    module = make_fake_tools(
+        answers={
+            "read": ToolResult(
+                tool=ToolName.READ, ok=True, summary="stub", data={"stub": True},
+            )
+        }
+    )
+    monkeypatch.setitem(sys.modules, "services.harness.tools", module)
+    react.clear_tool_layer_cache()
+    context = ToolContext(workspace=root, limits=ToolLimits())
+
+    scopes = [
+        survey.Scope(
+            scope_id="scope-survey-1", title="survey", kind="service-layer",
+            path="src/main/java/com/example/service", rationale="survey",
+            files=[service_file],
+        )
+    ]
+    client = ScriptedClient()
+    client.script(
+        agents.PLANNER, "plan",
+        final(
+            scopes=[
+                {
+                    "scope_id": "scope-planner-1",
+                    "title": "planner scope",
+                    "kind": "service-layer",
+                    "rationale": "created by the planner",
+                    "files": [service_file, "nonexistent.py"],
+                }
+            ],
+            excluded=[],
+        ),
+    )
+    coordinator = HarnessCoordinator(
+        workspace=root,
+        config=HarnessConfig(),
+        client=client,
+        out_dir=tmp_path / "out",
+        run_id="run-planner",
+        context=context,
+    )
+    coordinator._planner_call(scopes)
+    assert coordinator._scope_files.get("scope-planner-1") == [service_file], (
+        "the planner's files are written back, filtered against the real inventory"
+    )
+
+
+def test_the_round_zero_reuse_text_asks_for_a_first_look_not_a_second(tmp_path: Path) -> None:
+    """Round-0 reuse says \"first analysis\", not \"second look\": the agent is not suppressing findings."""
+    board = bb.new_blackboard("run-text1", tmp_path)
+    item = WorkItem(work_id="W-1", scope_id="scope-x", title="x", rationale="test")
+    first = agents.discovery_task(board, item, attempt=1, files=["a.py"], reused=["a.py"])
+    assert "*first* analysis" in first
+    assert "second look" not in first
+    second = agents.discovery_task(board, item, attempt=2, files=["a.py"], reused=["a.py"])
+    assert "second look" in second
+
+
+def test_the_round_zero_reuse_text_does_not_also_demand_a_read(tmp_path: Path) -> None:
+    """When every owned file is already in the transcript, the text does not also say \"read them\"."""
+    board = bb.new_blackboard("run-text2", tmp_path)
+    item = WorkItem(work_id="W-2", scope_id="scope-y", title="y", rationale="test")
+    text = agents.discovery_task(board, item, attempt=1, files=["a.py"], reused=["a.py"])
+    assert "read each one end to end" not in text, (
+        "the same task text must not both say \"already read\" and \"read each one\""
+    )
 
 
 def test_reading_a_trail_is_incremental_and_survives_a_damaged_line(tmp_path: Path) -> None:

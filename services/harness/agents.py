@@ -962,12 +962,69 @@ def stored_read(blackboard: Blackboard, file: str) -> AgentStep | None:
     return best
 
 
+def replayable_reads(
+    blackboard: Blackboard,
+    files: list[str],
+    *,
+    budget: int,
+) -> tuple[list[AgentStep], list[str], list[str]]:
+    """`(steps, reused, missing)`: complete reads this run has already done, ready to be seeded.
+
+    The sharing this harness was missing was not data, it was a reader: the blackboard already holds
+    every `read` result -- 471 of them on the audit that found this, 220 KB of file text with `repo.py`
+    alone stored 88 times -- and `coverage.from_runs` was the only thing that ever looked. This is the
+    reader, and it is deliberately the *only* one: it never touches the tool layer and never reads the
+    disk. A file with no complete read on the board is reported in `missing`, and the caller names it
+    in the agent's task text so the agent reads it itself.
+
+    Three properties make this honest rather than a trick:
+
+    * **Real `read` results.** The replayed step carries the original call and result verbatim, so the
+      coverage ledger counts it exactly as it counted the model's own read -- no new accounting rule
+      and no synthetic "pretend it was read" record.
+    * **Complete only.** `returned_lines == total_lines`, or nothing (see `stored_read`). Handing over
+      a partial read as if it were the file is exactly the false-coverage claim the ledger exists to
+      prevent.
+    * **Bounded, and it skips rather than truncates.** A file is seeded only if it fits what is left of
+      `budget`; anything larger is named in `missing` and the agent reads it itself. Sending half a
+      file while the ledger calls it covered is the worst outcome available here.
+
+    `files` is required, and an empty list is a no-op. It is not optional on purpose: a caller with no
+    file list would be asking for "everything this run has read", and an agent handed files that are
+    not its business is how one scope's context ends up being the whole repository. A planner-created
+    scope can own no files at all (see `_planner_call`); those share nothing rather than everything.
+
+    Cross-agent reuse is the point and is always allowed: the workspace is mounted read-only for an
+    audit, so a complete read cannot be stale, and two agents reading one file get the same bytes.
+    """
+    if budget <= 0 or not files:
+        return [], [], []
+    steps: list[AgentStep] = []
+    reused: list[str] = []
+    missing: list[str] = []
+    used = 0
+    for name in files:
+        step = stored_read(blackboard, name)
+        if step is None or step.result is None:
+            missing.append(name)
+            continue
+        size = len(step.result.summary or "")
+        if used + size > budget:
+            missing.append(name)
+            continue
+        steps.append(step)
+        reused.append(name)
+        used += size
+    return steps, reused, missing
+
+
 def prefetch_scope_files(
     files: list[str],
     context: Any,
     *,
     budget: int,
     blackboard: Blackboard | None = None,
+    from_disk: bool = False,
 ) -> tuple[list[AgentStep], list[str], list[str], list[str]]:
     """Read a scope's files for a *re-dispatched* discovery run, reusing what the run already read.
 
@@ -996,39 +1053,41 @@ def prefetch_scope_files(
       files a scope does not own are not its business.
     * **`budget = 0` switches it off**, so the cost can be measured against a run without it.
 
+    **The default is blackboard-only.** A complete read this run already performed is the same bytes, so
+    the agent is *seeded* with it instead of spending a turn fetching it, and no file is read off the
+    disk for a scope whose bytes are already in the run's transcript. The disk branch sits behind
+    `from_disk=True` and is off by default for two reasons: it puts a full copy of the file in the
+    prompt even when the agent would not have chosen to read it, and on a scope larger than `budget` it
+    skips whole files *after* having read them. The switch is kept so the measurement above stays
+    reproducible and the choice stays reversible.
+
     Returns `(steps, from_ledger, from_disk, skipped)`.
     """
     if budget <= 0 or not files:
         return [], [], [], []
+    if blackboard is None:
+        steps: list[AgentStep] = []
+        reused: list[str] = []
+        missing = list(files)
+    else:
+        steps, reused, missing = replayable_reads(blackboard, files, budget=budget)
+    if not from_disk:
+        # Blackboard only. A file with no complete read on the board is named in the last slot so the
+        # agent reads it itself -- which is also what the coverage ledger wants for a re-dispatch.
+        return steps, reused, [], list(missing)
 
     from services.harness import react
 
     try:
         _, _, _, invoke, _ = react.tool_layer()
     except react.ToolLayerUnavailable:
-        return [], [], [], []
+        # The reuse above needed no tool layer, so it survives; only the disk half is lost.
+        return steps, reused, [], list(missing)
 
-    steps: list[AgentStep] = []
-    reused: list[str] = []
+    used = sum(len(step.result.summary or "") for step in steps if step.result is not None)
     read: list[str] = []
     skipped: list[str] = []
-    used = 0
-    for name in files:
-        replayed: list[AgentStep] = []
-        if blackboard is not None:
-            step = stored_read(blackboard, name)
-            if step is not None:
-                replayed = [step]
-        if replayed:
-            size = len(replayed[0].result.summary or "")
-            if used + size <= budget:
-                steps.extend(replayed)
-                reused.append(name)
-                used += size
-                continue
-            skipped.append(name)
-            continue
-
+    for name in missing:
         offset = 1
         pending: list[AgentStep] = []
         size = 0
@@ -1072,6 +1131,7 @@ def discovery_task(
     *,
     attempt: int = 1,
     files: list[str] | None = None,
+    reused: list[str] | None = None,
     prefetched: list[str] | None = None,
     skipped: list[str] | None = None,
 ) -> str:
@@ -1080,32 +1140,42 @@ def discovery_task(
         f"Why this scope was opened: {item.rationale}",
         f"Workspace root: {blackboard.workspace}",
     ]
-    if prefetched:
-        # The files are already in the transcript as turn-0 steps, so the instruction is not "read
-        # them" but "do not read them again" -- and, because a second pass that only re-reads is
-        # worthless, what to do instead.
-        lines.append(
-            "These files are already read for you and their contents are in this transcript as the "
-            "first steps -- do not read them again, and do not re-report what they obviously contain. "
-            "Your job is the second look: a path you have not followed, a caller you have not checked, "
-            "a control whose absence matters here.\n"
-            + "\n".join(f"  - {name}（已读入）" for name in prefetched)
-        )
+    already = [*(reused or []), *(prefetched or [])]
+    if already:
+        if attempt > 1:
+            lines.append(
+                "These files are already read for you and their contents are in this transcript as the "
+                "first steps -- do not read them again, and do not re-report what they obviously contain. "
+                "Your job is the second look: a path you have not followed, a caller you have not checked, "
+                "a control whose absence matters here.\n"
+                + "\n".join(f"  - {name}（已读入）" for name in already)
+            )
+        else:
+            lines.append(
+                "These files are already in this transcript as the first steps -- another scope read "
+                "them completely, so do not read them again. Your job is the *first* analysis of this "
+                "scope: report what is wrong with the code you can already see, and read anything else "
+                "you own yourself.\n"
+                + "\n".join(f"  - {name}（已读入，不要重读）" for name in already)
+            )
     if skipped:
         lines.append(
-            "These files were too large to read ahead for you, so read them yourself:\n"
+            "These files are not in this transcript, so read them yourself:\n"
             + "\n".join(f"  - {name}" for name in skipped)
         )
-    if files:
-        # The list is the assignment. Handing it over is what makes coverage measurable: the run
-        # counts a file as reviewed only when `read` returned all of its lines, so an agent that is
-        # not told which files it owns cannot be held to having read them.
+    owned = [name for name in (files or []) if name not in set(already)]
+    if owned:
         lines.append(
             "Files you own -- read each one end to end, and report which of them you finished. "
             "These files are independent of one another, so put several `read` calls in ONE turn "
             "rather than one per turn: a turn is a round trip, and spending one per file is how the "
             "group fails to finish inside its budget.\n"
-            + "\n".join(f"  - {name}" for name in files)
+            + "\n".join(f"  - {name}" for name in owned)
+        )
+    elif files:
+        lines.append(
+            "Every file you own is already in this transcript (listed above). Do not read them again; "
+            "report which of them you finished, based on what you have."
         )
     if attempt > 1:
         lines.append(
@@ -1153,6 +1223,8 @@ HARNESS_PREFETCH_THOUGHT = (
 )
 
 #: The same convention for a re-dispatched scope's files: the harness read them, not the agent.
+#: The disk branch of `prefetch_scope_files` is now off by default (`from_disk=False`); this marker
+#: survives for the `from_disk=True` reproducibility path.
 SCOPE_PREFETCH_THOUGHT = (
     "harness（不是模型）：本 scope 被重派发，编排层先把这些文件读进来，"
     "免得每个新 agent 都把同一批文件重读一遍"
@@ -1164,6 +1236,23 @@ SCOPE_REUSE_THOUGHT = (
     "harness（不是模型）：本文件本次运行已经完整读过，直接复用当时的 read 结果（黑板上就有），"
     "没有重复读盘"
 )
+
+
+def _reused_files(initial_steps: list[AgentStep] | None) -> list[str]:
+    """The files a run was handed out of the blackboard, read off the seeded steps.
+
+    Derived rather than passed in as a parameter, for the same reason the coverage ledger is derived
+    from real `read` calls: a separate argument is a second source of truth that can drift from the
+    transcript it describes. The `thought` marker is what separates a reused read from a read the
+    harness performed itself (`SCOPE_PREFETCH_THOUGHT`) or a forced dataflow trace
+    (`HARNESS_PREFETCH_THOUGHT`).
+    """
+    found = [
+        str((step.result.data or {}).get("path") or "")
+        for step in (initial_steps or [])
+        if step.thought == SCOPE_REUSE_THOUGHT and step.result is not None and step.result.ok
+    ]
+    return [name for name in dict.fromkeys(found) if name]
 
 
 def is_taint_candidate(candidate: Candidate) -> bool:
@@ -1381,6 +1470,7 @@ def run(
         initial_steps=initial_steps,
         on_step=on_step,
     )
+    run_result.reused_files = _reused_files(initial_steps)
     parsed, error = parse_output(chosen.name, run_result, blackboard=blackboard, scope_id=scope_id)
     return AgentOutcome(run=run_result, parsed=parsed, error=error)
 

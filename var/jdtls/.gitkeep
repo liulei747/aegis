@@ -1,0 +1,5 @@
+# Keeps this directory in git so `docker compose build` can always resolve the `jdtls`
+# additional build context (docker/Dockerfile mounts it as /jdtls-local).
+# Download the actual snapshot here, through the system proxy:
+#   var/jdtls/jdt-language-server.tar.gz   (from download.eclipse.org /jdtls/snapshots/...)
+# The tarball is git-ignored; only this placeholder is tracked.

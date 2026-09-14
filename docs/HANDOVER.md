@@ -25,16 +25,20 @@ opengrep 命中位置
   → 组装分析包交给 AI
 ```
 
-**当前状态一句话**：上面这条流水线**端到端可跑、有 338 个测试、有 Docker 本地部署、有可观测台接口**；
-AI 部分（威胁建模子代理、prompt 前缀缓存）**刻意没做**，但 bundle 的排版已经按「前缀可复用」设计好了。
+**当前状态一句话**：上面这条流水线**端到端可跑、有 674 个测试、有 Docker 本地部署、有可观测台接口**；
+它之后那半条——**AI 自主审计**（agent 读代码、共享黑板、自我收敛、出报告）——**也已经建成并在基准项目上跑通**
+（51 个 Java 文件、3 小时 8 分、并集口径召回 30/30、误报 0、配置项 5/5），见 **§14**。
 
-**新人第一天该跑的三条命令**（详见 §4）：
+**新人第一天该跑的三条命令**（详见 §4 与 §14.8）：
 
 ```powershell
-python -m pytest -q                                  # 395 passed, 12 skipped（见 §8 的构成说明）
-python scripts/demo.py                               # 本地跑一遍完整流水线（**先跑它，见下**）
-docker compose -f docker/docker-compose.yml up --build
+python -m ruff check . && python -m pytest -q          # 门禁：674 passed / 13 skipped
+python scripts/demo.py                                 # 本地跑一遍扫描→组装流水线（**先跑它，见下**）
+docker compose -f docker/docker-compose.yml up --build  # 完整拓扑
 ```
+
+> **如果你接的是 AI 审计那一层**，直接跳到 **§14**：它有本层的代码地图、三条硬规则、开场收敛循环的
+> 取值依据、粒度规则、解析恢复、部署与评分命令，以及一轮真实基准的对账和已知问题。
 
 ---
 
@@ -681,9 +685,11 @@ findings→method（context 合并）、同一 context 内相同方法体（`ali
 | `extract`/`worker`/`gateway` 全部不起，`runc create failed: ... not a directory: Are you trying to mount a directory onto a file` | **`docker/lsp.local.yaml` 不存在**，而 Docker 对缺失的 bind-mount 源会**创建一个目录**，然后试图把目录挂到文件上 | 先 `cp docker/lsp.yaml docker/lsp.local.yaml`（README 已标注为必需） |
 | `gateway` 反复重启，`exit 127`，日志 `env: 'bash\r': No such file or directory` | `docker/entrypoint.sh` 在工作区是 **CRLF**（`git ls-files --eol` 显示 `i/lf w/crlf`），`COPY` 进镜像后 shebang 变成 `#!/usr/bin/env bash\r`。**这个文件此前从未被执行过**，所以这个坑一直没被发现 | 已把工作区文件规范化为 LF，并新增 **`.gitattributes`**（`*.sh text eol=lf` 等）防止 checkout 再转换回来 |
 
-> **教训**：`exit 127` 且日志里出现 `\r`，就是行尾问题，不是缺二进制。另外注意
-> `docker compose build gateway` 会报 `No services to build` —— `gateway` 与 `worker`
-> 复用 `aegis:0.1.0` 镜像，它的构建定义在 `extract` 服务上，要重建就 build `extract`。
+> **教训**：`exit 127` 且日志里出现 `\r`，就是行尾问题，不是缺二进制。另外
+> `gateway`/`worker`/`extract`/`harness` 现在各有各的镜像 tag（都基于同一个
+> `docker/Dockerfile`），要单独重建某个服务直接 `docker compose build <service>` 即可
+> （BuildKit 会复用共享层缓存）。这条坑是镜像还没拆开时踩的：当时它们共用
+> `aegis:0.1.0`，构建定义只在 `extract` 上，所以 build `gateway` 会报 `No services to build`。
 
 ### 10.17 实测链路日志（2026-09-11，六个容器全部 healthy）
 
@@ -1163,9 +1169,11 @@ severity 里"，而解析器却在等一个精确的枚举值。真调用回了
 `unknown severity` 丢掉。现在从前缀读类别（最长匹配 + 词边界），余下文字留在
 `severity_qualifier`，模型对自己结论的限定语不再丢失。
 
-**运维坑（值得单独记）**：**重建 `aegis:0.1.0` 不会重建容器** —— compose 比的是服务配置，
+**运维坑（值得单独记）**：**重建镜像不会重建容器** —— compose 比的是服务配置，
 不是镜像内容，所以 `docker compose up -d` 会让旧进程继续跑内存里的旧代码。必须
-`--force-recreate`。这一条让我误诊了一小时。
+`--force-recreate`（或 `up -d --no-deps <service>` 单独重发那一个）。这一条让我误诊了一小时。
+现在镜像按服务拆开了，单独重发某个服务：`docker compose build <svc>` 之后
+`docker compose up -d --no-deps <svc>`。
 
 端到端实测（真模型、走队列）：`POST /v1/bundles/B-9a5317fb78/analyze` → 202 →
 `GET .../verdicts` → `true_positive / critical / 0.85`，并且模型指出 `sql_quote` 是
@@ -1397,7 +1405,7 @@ import **恰好 1 条**（`domain.py` 用 `estimate_tokens`，是已知的分层
 
 接手第一天建议按顺序做这几件事，用来确认环境与理解都到位：
 
-1. `python -m pytest -q` → 确认 **395 passed, 12 skipped**（skip 分两种：引擎探测、
+1. `python -m ruff check . && python -m pytest -q` → 确认 **674 passed, 13 skipped**（skip 分两种：引擎探测、
    以及需要真 Redis 的用例，都不是失败）。不是这个数就先别改代码；
    `python -m pytest -q -m slow` 应额外得到 **6 passed**。
 2. `python scripts/demo.py` → 看一遍完整流水线输出，读 `var/packages/<id>/summary.md`。
@@ -1415,7 +1423,20 @@ import **恰好 1 条**（`domain.py` 用 `estimate_tokens`，是已知的分层
    并且 `scan_transport` 是 **remote**（如果是 in-process，说明 §3 那个环境变量漏了）。
 7. 从宿主 `curl http://127.0.0.1:8101/health` → **应该连不上**。连得上说明端口策略被破坏了。
 
-**改代码前请先读完 §10。** 那一节里几乎每一条都对应一次「看起来正常、其实是错的」的静默故障。
+**如果接的是 AI 审计那一层（§14），上面第 1、6 步之后再加这四条**（前三条零模型成本）：
+
+8. `python -m pytest -q` → **674 passed / 13 skipped**；`python -m ruff check .` 干净。
+9. `python var\joern\show_prescan.py var\projects\<name>` → 看清预扫描到底贡献了什么（语言、scope、文件清单）。
+   注意：它的**路由标记不进黑板**，只进 recon 的任务文本（§14.3）。
+10. `docker exec aegis-worker python /data/work/smoke_opening.py` → 部署镜像内的开场冒烟：应打印
+    `OK: prep first, opening agents overlapped, records landed, the peer read them back, and the pair
+    converged in two passes`。这条不需要 API key，用的是 stub 模型。
+11. `python var\joern\probe_model.py` → 一次真调用，确认新 key/模型通、多慢；然后 `POST /v1/audit?force=true`
+    起一轮真审计，用 `python var\joern\watch_audit.py <job_id>` 盯，结束后用
+    `python var\joern\score_harness.py var\work\audit\<job_id>` 对账（§14.9）。
+
+**改代码前请先读完 §10 与 §14.12。** §10 的每一条对应一次静默故障；§14.12 是 AI 审计这一层
+已知的、有实测证据的问题清单。
 
 ---
 
@@ -1437,6 +1458,15 @@ import **恰好 1 条**（`domain.py` 用 `estimate_tokens`，是已知的分层
 | 架构与设计取舍 | `docs/ARCHITECTURE.md` |
 | 前端信息架构与原型 | `docs/VISUAL.md`、`docs/prototype.html` |
 | 假 LSP server | `tests/fake_lsp_server.py` |
+| **AI 审计：编排与阶段** | `services/harness/coordinator.py`（先读 `_recon_and_threat_model` 与 `_prepare`） |
+| **AI 审计：ReAct 循环与解析恢复** | `services/harness/react.py` |
+| **AI 审计：黑板与合并规则** | `services/harness/blackboard.py` |
+| **AI 审计：agent 定义与任务构造** | `services/harness/agents.py` |
+| **AI 审计：工具层（读/写能力的边界）** | `services/harness/tools/`（`record.py`、`board.py`） |
+| **AI 审计：报告渲染** | `services/harness/report.py` |
+| **AI 审计：队列入口** | `services/queue/worker.py::_run_audit` |
+| **AI 审计：HTTP 入口** | `app/api/audit.py`、`app/api/traffic.py` |
+| **基准评分** | `var/joern/score_harness.py`（标准结果：`benchamrk/sinkspring_expected(1).json`） |
 
 ---
 
@@ -1447,3 +1477,379 @@ import **恰好 1 条**（`domain.py` 用 `estimate_tokens`，是已知的分层
 - semgrep 作为可选兜底引擎（`AEGIS_OPENGREP_FALLBACK_BIN`）。
 - 语言服务器：pyright（Python）、clangd（C/C++）；Node 22 来自 NodeSource，TypeScript 固定 5.9.3
   （带主版本断言，防止静默升级）。
+
+---
+
+# 14. AI 自主审计（agent harness）：架构、实测、接手要点
+
+> 这一节是**本层**的交接：从「分析包」往后那一段——把仓库交给一组会读代码的 agent，让它们自己
+> 调查、互相共享、验证、出报告。上面 §1–§13 讲的是扫描与组装，仍然有效；这一节补的是它之后的那半条。
+>
+> 日期：2026-09-13。代码状态：HEAD `412c206`；`python -m pytest -q` → **674 passed / 13 skipped**；
+> `python -m ruff check .` 干净。
+
+## 14.0 一分钟版本
+
+一次审计 = 一次 `POST /v1/audit {workspace}`，worker 里跑一条固定流水线：
+
+```
+prep（确定性预扫描，不调模型）
+  → recon ∥ threat_model（并发，可多轮，直到互相读完）
+  → planner（把区域分给子 agent）
+  → discovery（按 scope + 覆盖率分组并发，可多轮收敛）
+  → validation（每个候选一个 run，含 dataflow_verify）
+  → attack_path（每个确认候选一个 run）
+  → findings（合并同一位点）→ report.md
+```
+
+所有 agent 共用**一块黑板**（`Blackboard`）读写：读用 `board` 工具（分节、有上限），写用 `record`
+工具（8 种 kind，只能追加）。过程可观测：`run_dir/trail.jsonl` 是逐事件的 JSONL，前端每 2 秒增量拉。
+
+**这一层的关键不是"接了个模型"，而是三件被实测逼出来的事**：agent 之间真的互相读（开场收敛循环）、
+黑板上的字段各有一种粒度（区域 / 位点 / 入口点）、模型写出畸形的回答时 harness 仍能把它变成工作
+（解析恢复），而不是浪费掉一整轮。
+
+## 14.1 代码地图（本层）
+
+```
+services/harness/
+├── coordinator.py     ★ 编排：阶段顺序、开场收敛循环、覆盖率闭环、黑板写入器 _record/_board_view
+├── agents.py          AgentSpec（prompt / 允许的工具 / 输出 schema）、task 构造、material 打包
+├── react.py           ReAct 循环：预算、批量调用、解析、警告、预算提醒、截断抢救
+├── survey.py          确定性预扫描：语言计数、构建系统、scope 划分、入口标记
+├── coverage.py        覆盖率台账（按真实 read 调用算）、整仓分片
+├── blackboard.py      ★ 合并规则：context / architecture / threats，append-only，sites 累加
+├── report.py          报告渲染（索引表 + 可达详情 + 被排除聚合 + 逐 run 摘要）
+├── trail.py           事件定义、JSONL sink、增量读
+├── skills.py          按文件类型给 agent 的额外提示词（lite skill）
+├── material.py        候选材料包（有界、带出处）
+├── cli.py             命令行入口（--dry-run、单次跑、评分用）
+└── tools/             工具层（唯一的行动能力，全部经 ToolContext 注入）
+    ├── read.py / list_files.py / shell.py / dataflow.py   只读
+    ├── record.py      唯一会写的工具（8 种 kind，只能追加）
+    └── board.py       读黑板（5 个分节，有上限，被截断会明说）
+```
+
+调用方：`services/queue/worker.py` 的 `_run_audit()`（队列路径，生产用）；
+`services/harness/cli.py`（本地路径，评分/调试用）；`app/api/audit.py`（HTTP 三个路由）。
+
+## 14.2 黑板：一块状态，两种能力，各有边界
+
+`aegis_contracts/harness.py::Blackboard` 是一次运行的唯一共享状态：`project / architecture / threats /
+work / coverage / candidates / verdicts / attack_paths / leads / findings / runs / opening / revision`。
+
+三条硬规则：
+
+1. **合并是并集，不是覆盖。** `services/harness/blackboard.py` 里每个合并函数只做追加与去重
+   （`_append_unique`、`_merge_context`、`_merge_architecture`、`_merge_threats`）。任何"本层写入"
+   都不得删除或替换别的东西——这样两个并发 agent 交错写入的收敛结果是确定的。
+2. **`revision` 是唯一可信的"变没变"信号。** `bb.set_context()` 返回的是**黑板对象**（永远为真），
+   所以 `changed = bb.set_context(...)` 恒为真。曾经因此让"已去重"分支变成死代码，模型以为自己写进去了
+   而实际没有。现在一律用 `self.blackboard.revision > before` 判断（见 `coordinator._record`）。
+3. **agent 拿不到黑板本身，只能拿到被注入的两个能力**：`ToolContext.record`（写一条）与
+   `ToolContext.board`（读一节）。工具层"够不到没被交给它的东西"这条规则在这里是承重的：模型不能
+   清空候选台账，也读不到覆盖率表。
+
+## 14.3 开场阶段：prep → 并发 → **收敛循环**（本层最值得读的一段）
+
+**`prep` 是独立阶段，先于任何模型调用**（`_prepare`）。它做确定性预扫描并写黑板：
+语言计数、构建系统、候选 scope（角色化：controller/service/dao/config/root…）与每个 scope 的完整文件清单，
+以及 `origin: "survey"` 的区域行。它同时把快照留在 `self._snapshot`，**planner 复用同一份**（不再二次走树）。
+
+> 路由标记不进黑板。预扫描还会 grep 入口标记，但它的答案是**文件级**的（"这个文件注册了 REST 控制器"），
+> 那是"去哪看"的线索，不是"哪些请求能到达"的答案。写进黑板会和 agent 的路由级结论混在一张表里，
+> 而且谁也合并不了（文件 ≠ 文件:行）。实测：51 文件的 Spring 基准上，预扫描贡献 13 条文件级命中、
+> recon 自己给出 42 条路由级条目，混在一起 55 条 / 实际 42 条路由。现在它们只出现在 recon 的任务文本里，
+> 名字就叫 `route_markers_in_code`，并附一句"逐条枚举真实路由，不要抄这些标记"。
+
+**recon 与 threat_model 并发跑**（`ThreadPoolExecutor`，两个线程），各自边查边用 `record` 写黑板。
+两个 agent 的 task 文本在开跑时就固定了，所以"对方后来写了什么"只能靠 `board` 工具读——这就是下一段。
+
+**收敛循环（opening convergence）**：一轮结束后，看每个 agent"还没拿到"的**实质内容**；落后的那个
+（通常只有一个）再跑一轮，任务是**增量**而不是重查仓库。规则如下，全部有实测依据：
+
+| 规则 | 取值 | 为什么 |
+| --- | --- | --- |
+| 什么算"实质内容" | 组件 / 信任边界 / 入口点 / 威胁 | note/lead 是评论；assets/actors 是同一批东西的散文描述，两个 agent 永远写不完（实测：第 2 轮只新增了 1 个 asset、1 个 actor、1 条 note、1 条 lead，却让整轮报"未收敛"） |
+| 水位线怎么算 | **交付即算**：agent 的 task 文本覆盖到的 revision，或它自己 `board` 调用真实拿到的 revision，取大者 | 早期版本只认 `board` 调用，于是"不调工具的模型永远落后"，循环必然跑满上限并报假警报（假工具层的单元测试立刻暴露：没有 revision 就永远不收敛） |
+| 上限 | `max_opening_passes = 3` | 结构性而非慷慨：一个 agent 的 run 在它给出 `final` 时结束，所以第 N 轮发布的东西只能第 N+1 轮被读到。上限 2 在结构上不可能收敛 |
+| 怎么报告 | `Blackboard.opening = {passes, converged, watermarks, unread, note}`，并进计数器（`opening_passes`/`opening_unread`） | "未收敛"是本次运行的**缺口**，必须与"已完成"区分；前端审计页和报告都会显示 |
+
+**实测（51 文件 benchmark，MiniMax-M2.7）**：3 轮收敛，`unread = 0`，开场 6 个 run / 109 步 / 7 分钟。
+**实测（5 文件 demo，同一机制）**：3 轮收敛；另一次 2 轮时 `unread=1`（recon 第 2 轮新记了 4 条信任边界，
+威胁模型还没读到）——报告如实写"未收敛"。
+
+**开场 pass ≥ 2 的黑板复用**：pass 1 是唯一允许从磁盘读的读者；pass 2 起是構造性的重读，所以
+`_opening_reuse()` 用 `agents.replayable_reads` 把 pass 1 已经完整读过的文件从黑板上取出来
+作为初始步注入。实测四文件项目上，重派发会每 pass 重读同一批四个文件。
+
+## 14.4 覆盖率闭环与验证分组（沿用并加固）
+
+- **覆盖率按真实 `read` 调用台账算，不看模型自述**（`coverage.from_runs`）。搜索命中不算审完一个文件。
+- 整仓清单被切成覆盖组（`_coverage_items`），"每个文件都归属某个 agent"这条保证来自这里，**不依赖
+  planner 划的 scope**（plan 错了也不会漏文件）。
+- 一轮至少要新增 `min_new_places_per_round = 2` 个**新位点**才值得再来一轮；否则视为"评审者在逐行注释"。
+  曾经"任何新位点都再来一轮"导致 243 行的 demo 跑了 4 轮 / 88 个 run / 564 次调用。
+- validation 按 `(文件, 行, 类型)` 分组，一个 run 判一组；`dataflow_verify` 只接受 `file/line`
+  （**没有 sink 参数**：sink 由引擎从代码里推，不能由调用方指定）。
+- **discovery round 0 也复用**：任何一个文件在另一个 scope 里被完整读过，round 0 就从黑板上取
+  出来给新 agent，不对磁盘再发一次 `read`。`_planner_call` 会把 planner 返回的 `files` 回写进
+  `_scope_files`（之前被丢弃，导致 planner 拆出来的 scope `files=0`，预取静默空转）。
+- **未做**：按"位点"而不是"按 claim"分组（实测 73 个候选 → 33 组按 claim，20 组按位点；5/20 位点有混合
+  判决，所以需要"一次 run 产出多条判决"的合约改动）。
+
+## 14.5 粒度规则：区域 / 位点 / 入口点
+
+黑板上的 `architecture.components` 曾经被同时当成两种东西用，于是丢过数据。现在规则是：
+
+| 概念 | 存放 | 身份 | 实测教训 |
+| --- | --- | --- | --- |
+| **区域**（一个目录/模块/scope） | `components` 一行 | `id`（`scope-…`，由预扫描或 planner 给） | 同一 id 再来的**区域**按证据强度升级字段（`origin=survey` < agent） |
+| **位点**（区域里的具体文件/路由） | 该行的 `sites` 列表 | `route` / `path:line` | 同 id 来的**位点**不再覆盖区域字段，而是累加。曾经"先到先得"把 recon 读到的 `handler.py` 丢给了预扫描的 `path: "."` |
+| **端点**（外部请求能到达的入口） | `project.entry_points` | `(文件:行)` | 按地点去重（同一地点的三种说法 = 一条）；内部函数不算入口（实测：把 `safe_escape/load_user/connect` 也算进去，10 条里只有 4 条是入口） |
+
+`sites` 的存在就是为了回答"一个区域里有 N 个端点，N 会继续增长"：第 2、3、N 个位点累加进去，
+一个都不丢。`entries` 侧则因为字符串列表只能按文本去重，所以**靠契约写作**（短名词短语、一条一个）
+而不是靠代码猜。
+
+## 14.6 模型输出的健壮性：解析恢复 + 预算提醒
+
+真实模型会给出**用不了的形状**，代价是一整轮（批量写入全丢）。已实现（`react.py`）：
+
+1. **严格解析**：`extract_json_object` + 必须是带 `thought`/`tool`/`calls`/`final` 的对象。
+2. **裸 payload**（`_as_final`）：直接给出 schema 内容、没有 `final` 外壳 → 认出来当 `final`
+   （要求命中 schema `required` 里 ≥2 个键，且不含任何 turn 键——不猜无关对象）。
+3. **截断的 `calls` 批量**（`_salvage_calls`）：逐字符扫描 `{...}` 平衡（正确处理字符串与转义），
+   把截断点之前**完整**的调用抢救出来执行；尾部的丢掉并告知模型。
+4. **厂商截断信号**（`services/ai/client.py::truncated`）：读 `finish_reason`，命中 `length`/`max_tokens`
+   时明确告诉模型"你被输出上限截断了，少写一点"，而不是报一个 JSON 语法错。
+5. **预算提醒**（`wrap_up_note`）：最后 2 轮在 user 消息里写"还剩 N 轮 / 这是最后一轮，现在就给 `final`"。
+   实测：给威胁模型加了 `record` 之后，它一度把 8 轮全花在记录上、**没有 final**，整个阶段零产出；
+   加了提醒后 4 个 run 全部 `finished`。
+
+**已知未修**：模型还会给出**多种非对象外壳**——把多个 JSON 对象用 `[TOOL_CALL]` 或逗号拼在一起，
+或直接给一个 JSON 数组。本轮 51 文件审计实测 **12 个这样的回答**（recon 6 / threat 3 / discovery 3，
+占约 1500 步的 3%），每个浪费一轮。修法与 (3) 同族：扫描整个回答里所有平衡的 `{...}`，收集带 `tool`
+的对象（顺带支持 `[ {...}, {...} ]`）。
+
+## 14.7 报告：可读性是功能，不是排版
+
+`services/harness/report.py` 的结构（第一版是"把所有东西都打出来"，实测 910,850 字符，
+其中 74% 是 88 个 agent run 的每一步）：
+
+1. 结论概览（含"开场轮次 / 是否收敛"一行）
+2. 确认的发现：**索引表** + 2.1 可达详情 + 2.2 不可达只列一行
+3. 被排除的候选：**按位置聚合**（同一地点多种类型合并成一行）
+4. 覆盖率与理由：开场收敛块 + scope 表 + 文件覆盖率 + 工作计划台账
+5. 提前结束的 agent
+6. 运行轨迹：每个 run 一行（含工具分布）；**只有提前结束的 run 才附全文**
+7. 其余内容在哪（指向 `blackboard.json` / `trail.jsonl`）
+
+实测：同一个 demo 报告 910,850 → **55,508 字符（6%）**，且没有隐藏任何东西（每个发现、每个被排除的
+位置、每个提前结束的 run 都在）。基准项目上修复前的报告是 **5.84 MB**（逐条全文）。
+
+## 14.8 部署与运行
+
+```powershell
+# 依赖与新模型：改根目录 .env（API_URL / API_KEY / MODEL），然后**重建**（env 变化需要重创建容器）
+docker compose -f docker/docker-compose.yml --env-file .env up -d worker gateway frontend
+
+# 每个服务现在都有自己的镜像 tag（同一个 docker/Dockerfile，不同 tag），可以单独重建部署：
+#   aegis-extract / aegis-worker / aegis-gateway / aegis-harness  ← 都基于 docker/Dockerfile
+#   aegis-scan / aegis-frontend / aegis-dataflow                  ← 各自独立 Dockerfile
+# 因此改了 Python 代码想只重发某个服务，build + up 那一个即可，不会牵连其他：
+docker compose -f docker/docker-compose.yml --env-file .env build extract
+docker compose -f docker/docker-compose.yml --env-file .env up -d --no-deps extract
+
+# BuildKit 会复用各镜像共享的层缓存，所以二次构建（tag 不同、内容相同）很快。
+# 例：单独给 extract 加 Java 语言服务器（jdtls）并只重发 extract：
+docker compose -f docker/docker-compose.yml --env-file .env build --build-arg INSTALL_JDTLS=true extract
+docker compose -f docker/docker-compose.yml --env-file .env up -d --no-deps extract
+
+# 前端（独立部署；改了前端才需要）
+docker compose -f docker/docker-compose.yml --env-file .env build frontend
+docker compose -f docker/docker-compose.yml --env-file .env up -d frontend
+```
+
+跑一次审计（两个入口）：
+
+```powershell
+# 队列路径（生产、可观测、可取消）
+python -c "import json,urllib.request;req=urllib.request.Request('http://127.0.0.1:8100/v1/audit?force=true',data=json.dumps({'workspace':'/data/projects/<name>'}).encode(),method='POST',headers={'Content-Type':'application/json'});print(urllib.request.urlopen(req,timeout=30).read().decode())"
+
+# 本地路径（调试、评分；不经过队列）
+python -m services.harness.cli --workspace var/projects/<name> --out var/harness
+```
+
+产物（worker 路径）：`var/work/audit/<job_id>/` 下 `report.md`、`blackboard.json`、`trail.jsonl`。
+`GET /v1/audit/{id}/trail?after_seq=N` 增量拉轨迹，`GET /v1/audit/{id}/report` 取报告，
+前端 `http://127.0.0.1:8102` 的「深度审计」页就是它。
+
+**重跑（`force=true`）时旧产物会归档**：网关接受重跑的那一刻，`report.md` → `report.attempt<N>-<UTC>.md`、
+`blackboard.json` → 同名，并删掉 `trail.jsonl`。不这样做的话，重跑期间 `/report` 会返回**上一轮**的报告，
+而那会被当成这一次的结论（实测踩过）。
+
+## 14.9 怎么验证（不用花钱的先跑）
+
+```powershell
+python -m ruff check . && python -m pytest -q          # 门禁：应 674 passed / 13 skipped
+python var\joern\show_prescan.py var\projects\<name>    # 预扫描到底贡献了什么（零模型调用）
+python var\joern\show_prep_value.py var\projects\<name> # 同上，逐字段
+python var\joern\probe_model.py                         # 一次真调用：新 key/模型通不通、多慢
+docker exec aegis-worker python /data/work/smoke_opening.py   # 部署镜像内的开场冒烟（stub 模型，零成本）
+python var\joern\watch_audit.py <job_id>                # 盯一次完整审计（流式，结束会打报告开头）
+python var\joern\audit_cost.py <ISO时间>                # 这次跑了多少次调用 / 多少 token / 多慢
+python var\joern\count_unparsed.py <job_id>             # 有多少回答是 harness 用不了的形状
+python var\joern\verify_rerun_archive.py                # 重跑归档行为（对部署网关，零成本）
+```
+
+**基准评分**（标准结果在 `benchamrk/sinkspring_expected(1).json`，脚本要 `PYTHONPATH`）：
+
+```powershell
+$env:PYTHONPATH="$PWD\var\joern"
+python var\joern\score_harness.py var\work\audit\<job_id>     # 写 var/joern/harness_benchmark_score.txt
+```
+
+判读口径（脚本自带说明）：**浮现** = 至少作为候选被考虑过；**确认** = 进入 FinalFinding；
+匹配按**所在方法**而不是 ±3 行窗口（窗口会误判真阳/漏判安全对照）；一个代码位置可以同时是多类漏洞，
+所以同时给"单条最优"和"并集"两个口径。
+
+## 14.10 本轮 benchmark 实测对账（2026-09-13）
+
+**被测项目**：`/data/projects/benchmark` = `sinkspring-bench-all-main`（Spring Boot，51 个 `.java`，61 个文件）。
+**标准结果**：`benchamrk/sinkspring_expected(1).json` —— 正例 V01–V30、7 个**声明不该报**的安全对照
+（C01–C07）、5 个配置项（Cfg01–Cfg05）。
+**本轮 job**：`J-65f573d99dee3b0b043a0d62d9f43e57b9da80cd`，模型 `MiniMax-M2.7`，worker 路径，并发 1。
+**基线**：`var/harness/bench-confirm/run-20260913T041818Z-b6a3fd86`（模型 deepseek-v4-flash，CLI 路径，并发 4）。
+评分：`python var/joern/score_harness.py <run_dir>`（需 `PYTHONPATH=var/joern`）。
+
+| 指标 | 基线（deepseek / 并发 4） | **本轮（MiniMax / 并发 1）** |
+| --- | --- | --- |
+| 正例**并集口径**浮现 / 确认 | 30/30 · 30/30 | **30/30 · 30/30** |
+| 正例单条最优口径浮现 / 确认 | 28/30 · 28/30 | 25/30 · 25/30 |
+| **配置项（Cfg01–05）** | **0/5** | **5/5** |
+| 安全对照被浮现（看过） | 0 | 3（C01/C02/C06） |
+| **安全对照被确认（=误报）** | **0** | **0** |
+| 候选未被验证 | 0 | 0 |
+| 不在标准结果里的候选 | 5 | 6 |
+| 最终发现 / 确认候选 | 99 / 106 | 64 / 108（44 个候选按同位点合并） |
+| agent run | 236 | 223 |
+| 报告体积 | 5,844,226 字符 | **168,837 字符（2.9%）** |
+
+**结论（端到端）**：并集口径召回与基线**完全一致**（30/30，且 30/30 全部进入 FinalFinding），
+7 个安全对照**一个都没被确认为发现**（误报 0），而**配置面从 0/5 提到 5/5** —— 这正是上一轮
+明确记下的缺口（`application.yml` 的三个开关没人看）。报告体积降到基线的 2.9%，同时每个发现、
+每个被排除的位置、每个异常结束的 run 都仍在报告里。
+
+**"浮现了但被否掉"的 10 条是什么（单条最优口径 83% 的来源）**：全部是**同一漏洞的不可达副本**，
+否决理由都是带 grep 证据的"没有调用方"：
+
+```
+V07 NativeProcessHandler.java:22  executeCommand(String) 零调用方；可达的是 executeShellCommand(:108)
+V17 CatalogImportService.java:40  importArchivedCatalog() 无路由指向（路由指向 importCatalog）
+V14 ResourceSyncService.java:72   refreshLegacyIndex() 全仓零引用
+V20 OperationsToolService.java:63 lookupArchive() 零调用方
+V12 DocumentService.java:62       loadArchive() 零调用点
+```
+
+也就是说：**模型把"真实漏洞的另一份副本"也报出来了，验证阶段用证据把它们分成了可达/不可达**——
+这是判断力，不是漏报（并集口径下这些行仍然算已确认，因为同一类漏洞在可达锚点上已确认）。
+
+**6 条超出标准结果的候选**：`AccountController.java:34 authz_bypass`（确认）、
+`CatalogImportService.java:41 xxe`（确认）、`ProductValidator.java:26 sql_injection`（确认）、
+`ResourceSyncService.java:72 ssrf`（否决）、`FileUtils.java:77/84 security_misconfiguration`（否决）。
+标准结果不是穷尽的，只有 C01–C07 是"声明不该报"，所以这 6 条不等于误报。
+
+**本轮发现的一个真缺陷**：报告里有 **1 条发现的文件路径是错的**——`sinkspring-all-main/...`
+（少了 `bench-`，该路径在工作区里不存在，出现 2 次）。候选的 `file` 是模型写的字符串，
+**没有人拿它和真实文件清单核对**，于是错路径一路走到报告。见 §14.12。
+
+## 14.11 成本与延迟（实测，用于判断改动是否退化）
+
+同一轮 benchmark 审计（`J-65f573d9…`，51 个 Java 文件，模型 `MiniMax-M2.7`，并发 1）：
+
+| | 数值 |
+| --- | --- |
+| 墙钟 | **187.8 分钟**（16:37:58 → 19:45:53） |
+| agent run | 223 |
+| 模型调用 | **792 次**（788 成功 / 4 失败，失败全部重试成功，含一次 180s 超时） |
+| tokens | **6,136,774 输入 + 685,947 输出 = 6.82M** |
+| 单次调用耗时 | 中位 **9.4s**，p90 23.3s，最长 102.8s |
+| 模型占用 | 167.4 分钟（占墙钟 89% —— 并发 1 时基本全程在等模型） |
+
+**为什么比基线慢 7 倍**（基线 26.6 分钟 / 3998 步）：
+
+| | 基线 | 本轮 |
+| --- | --- | --- |
+| 入口 | CLI（`HarnessConfig.concurrency` 默认 **4**） | worker（取 `settings.ai.concurrency` = **1**） |
+| 模型单次耗时 | 4s 量级 | 中位 9.4s |
+
+模型慢约 2.5 倍 × 并发低 4 倍 ≈ 10 倍。**想让下一次快起来：`.env` 里加 `AEGIS_AI__CONCURRENCY=4`**
+（然后重建/重启 worker），即可对齐基线的吞吐。本轮刻意保持 1，是为了与之前几轮可比。
+
+注意 token 结构：**输入 6.14M 占 90%** —— 因为每轮都把完整对话重发给模型。任何"往 prompt 里塞东西"
+的改动都要按**轮数 × 内容**计费；这也是"预扫描的路由标记不进黑板"那类改动的实际收益所在
+（实测每轮 1,633 字符 × 60 轮 ≈ 2.4 万 token，见 `var/joern/show_prompt_cost.py`）。
+
+**小仓库上的两条补充实测**（demo-taint / 4 个 `.py` + 1 个 json，`J-712e9f99…`）：
+- **墙钟 ≈ 输出token × 20.4ms ÷ 并发**（corr(延迟, 输出) = +0.93，corr(延迟, 输入) = +0.22）。
+  模型往返才是墙钟的绝大部分：22 个 run 墙钟合计 1179.4s，模型调用延迟合计 1176.6s，工具执行
+  只有 2.8s（0.24%）。
+- **81 次 `read` 只花 20 个往返**：模型批量读（`MAX_CALLS_PER_TURN = 8`），
+  `recon:workspace` 一个 turn 里 5 个 `read`，4 个 discovery scope 各自一个 turn 4 个 `read`。
+  读的代价在**往返次数**不在 token——同一个文件被反复读（`service.py` 7 次、`handler.py` 6 次、
+  `repo.py` 6 次、`util.py` 6 次）才是可以省的部分。
+
+## 14.12 已知问题与下一步
+
+按"有没有实测证据"排序：
+
+1. **候选的文件路径没人核对（本轮实测踩到）**：报告里 1 条发现的路径是 `sinkspring-all-main/...`，
+   工作区里不存在这个目录。候选的 `file` 来自模型，进入候选台账前没有和真实文件清单对过；
+   验证阶段按方法名/行号匹配，于是错路径一路到报告。
+   **修法**：`_record_candidates` 时用 `coverage.inventory` 的清单校验 `file`，不在清单里的候选
+   标记为 `path_not_in_workspace` 并拒绝（或按最近似路径纠正并记录），这是零模型成本的确定性检查。
+2. **模型输出的非对象外壳仍有 12 个/轮**（recon 6 / threat 3 / discovery 3，占约 3% 的步数）：
+   多个 JSON 对象用 `[TOOL_CALL]` 或逗号拼在一起、或直接给 JSON 数组。现有恢复只覆盖"截断的
+   `calls` 数组"和"裸 payload"。**修法**：扫描整个回答里所有平衡的 `{...}` 对象，收集带 `tool` 的
+   作为 calls（顺带支持数组外壳），与 `_salvage_calls` 同族。
+3. **`assets` / `actors` 仍是散文**：`record` 路径已按"短名词短语、一条一个"改进（实测 actors 8→2），
+   但两个 agent 的**最终 JSON** 仍会写长句，于是同一件资产出现多条（实测 12→8）。字符串列表只能按
+   文本去重，代码硬合并就是猜，所以这条只靠契约写作收窄，收益递减。
+4. **validation 按 claim 而不是按位点分组**（未做）：实测 73 个候选 → 33 组（按 claim）/ 20 组（按位点），
+   5/20 的位点有混合判决。要省这部分开销需要"一次 run 产出多条判决"的合约改动。
+5. **`leads` 字段写而不读**：`record(kind="lead")` 能写（本轮真用过一次），但规划/调度都不读它。
+   要么接进 planner，要么删掉。
+6. **并发默认 1**：见 §14.11。不是 bug，是配置；但"默认慢 4 倍"值得在部署文档里写死一句。
+7. **`sites` 的边界情况**：模型有时把多个路径写进一个标量（`path: "service.py, util.py"`），
+   于是它被判成"区域"而不是位点、覆盖了区域行的 `path`。没有丢东西（端点都在 `entry_points`），
+   但区域行的 path 会变成拼接串。契约写作能减轻，代码纠正需要猜。
+8. **标准结果不是穷尽的**：6 条"超出标准结果"的候选里有 4 条被确认为发现。评估新改动时不要把它们
+   当误报；唯一能判误报的是 7 个安全对照。
+
+**已修**：planner 拆出来的 scope 无文件集。`_planner_call` 现在会把 planner 返回的 `files` 回写
+进 `_scope_files`（过滤掉不在真实 inventory 里的路径），planner scope 开始受到"未读完文件"守则
+约束——这是预期效果，不是回归。
+
+## 14.13 本轮改动清单（文件 → 为什么）
+
+> 全部在 HEAD `412c206` 里；`pytest` 674 passed / 13 skipped；`ruff` 干净。
+
+| 文件 | 改了什么 | 为什么（实测依据） |
+| --- | --- | --- |
+| `services/harness/coordinator.py` | `prep` 独立阶段并先写黑板；开场并发；**开场收敛循环**（水位线=交付或真实 board 读取、上限 3、只补落后一方）；`_record`/`_board_view`；实质增量收窄；`_agent` 崩了也补 `agent_end` | 预扫描必须先于模型；开场两个 agent 要互相读；`set_context` 返回值恒为真导致"已去重"成死代码；实测开场 3 轮收敛、unread=0 |
+| `services/harness/agents.py` | recon/threat 的 task 用上预扫描快照；`record`/`board` 工具；增量重派发任务（`opening_delta_block`）；`route_markers_in_code`；包封 8 种 kind 的语气 | 让"边查边写"和"读对方"成立；路由标记是文件级线索而非结论 |
+| `services/harness/blackboard.py` | **区域/位点**分离（`sites` 累加，区域字段不被位点覆盖）；入口点按 `(文件:行)` 去重；首份 payload 也走合并（不再整体赋值） | 同 id 的位点曾互相覆盖/被丢；第一份 payload 曾被跳过规范化 |
+| `services/harness/react.py` | 解析恢复（裸 payload / 截断 calls 抢救 / 厂商截断信号）+ 预算提醒 | 截断的批量回答曾让一整轮零执行；威胁模型曾把 8 轮花光且没有 final |
+| `services/ai/client.py` | `finish_reason()` / `truncated()` | 把厂商的"被截断"变成模型能行动的反馈 |
+| `services/harness/report.py` | 索引表 + 可达详情 + 被排除按位点聚合 + 逐 run 摘要；开场收敛块 | 报告 910,850 → 55,508 字符（demo）；benchmark 5.84M → 169k 字符 |
+| `app/api/audit.py`、`app/api/jobs.py` | 重跑时归档上一轮产物（`report.attempt<N>-<时间戳>.md`）并删 `trail.jsonl` | 否则重跑期间 `/report` 返回上一轮报告，会被当成这次的结论 |
+| `aegis_contracts/harness.py` | `ToolName.RECORD`/`BOARD`、`OpeningConvergence`、`Blackboard.opening` | 收敛状态要能进报告和前端，而不是只存在于日志 |
+| `services/harness/tools/board.py`、`tools/record.py` | 两个新工具（只读分节 / 只追加 8 种 kind） | agent 的读写能力必须显式注入且可审计 |
+| `frontend/src/audit.ts`、`screens/Audit.tsx`、`api/types.ts` | 阶段表加 `prep`、事件标签、`record` 事件、「开场轮次」统计块 | 过程可观测：未收敛要在屏幕上看得见 |
+| `tests/*` | 674 个用例（本轮新增约 50：收敛、粒度、解析恢复、归档、字段语义） | 每条规则都有对应测试，包括"上限用尽要如实报未收敛" |
+
+**验证脚本**（都在 `var/joern/`，除冒烟外都零模型成本）：`show_prescan.py`、`show_prep_value.py`、
+`probe_model.py`、`probe_realistic.py`、`audit_cost.py`、`count_unparsed.py`、`watch_audit.py`、
+`check_run.py`、`verify_rerun_archive.py`、`demo_opening.py`、`show_opening_records.py`、
+`show_prompt_cost.py`；部署镜像内的冒烟是 `var/work/smoke_opening.py`。

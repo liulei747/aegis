@@ -129,10 +129,32 @@ def test_the_worker_runs_extraction_in_process(compose: dict) -> None:
     )
 
 
-def test_the_worker_and_gateway_share_one_image(compose: dict) -> None:
-    """A second image would be a second copy of the extraction code, free to drift."""
+def test_each_service_has_a_distinct_image_name(compose: dict) -> None:
+    """Every service that runs the extraction toolchain gets its own image tag.
+
+    The four callers of `docker/Dockerfile` (extract / worker / gateway / harness) used to
+    share one `aegis:0.1.0` image, which made it impossible to rebuild and redeploy one of
+    them (a language-server bump, say) without pulling the others along. They are now split
+    into distinct tags -- same Dockerfile, separate deployable artifacts -- so a change to one
+    never forces a rebuild of the rest. Distinct tags are what makes `docker compose build
+    extract` touch only the extractor.
+    """
     services = compose["services"]
-    assert services["worker"]["image"] == services["gateway"]["image"]
+    build_images = {
+        name: svc["image"]
+        for name, svc in services.items()
+        if svc.get("build") and svc["build"].get("dockerfile") == "docker/Dockerfile"
+    }
+    expected = {"extract", "worker", "gateway", "harness"} <= set(build_images)
+    assert expected, f"the four extraction callers must build from docker/Dockerfile: {sorted(build_images)}"
+    assert len(build_images) == len(set(build_images.values())), (
+        f"each service must have its own image tag so it can be deployed alone; got {build_images}"
+    )
+    # Every extraction caller that is not a profiled tool runs in-process and needs the worker
+    # entrypoint; it also shares the exact same Dockerfile, so none of them can drift by
+    # accident at the container level -- only the tag separates them.
+    assert services["worker"]["image"] != services["gateway"]["image"]
+    assert services["worker"]["image"] != services["extract"]["image"]
     assert services["worker"]["entrypoint"] == ["aegis-worker"]
 
 

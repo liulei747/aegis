@@ -347,7 +347,7 @@ docker run -d --name aegis-extract --network aegis-net \
   -e AEGIS_WORK_DIR=/data/work -e AEGIS_SCAN_SERVICE_URL=http://aegis-scan:8101 \
   -v "$PWD/demo/repo:/workspace:ro" -v "$PWD/var/packages:/data/packages" \
   -v "$PWD/var/work:/data/work" \
-  --entrypoint uvicorn aegis:0.1.0 services.extraction.app:app --host 0.0.0.0 --port 8103
+  --entrypoint uvicorn aegis-extract:0.1.0 services.extraction.app:app --host 0.0.0.0 --port 8103
 
 docker run -d --name aegis-gateway --network aegis-net -p 127.0.0.1:8100:8000 \
   -e AEGIS_WORKSPACE_ROOT=/workspace -e AEGIS_OUTPUT_DIR=/data/packages \
@@ -356,7 +356,7 @@ docker run -d --name aegis-gateway --network aegis-net -p 127.0.0.1:8100:8000 \
   -e AEGIS_EXTRACTION_SERVICE_URL=http://aegis-extract:8103 \
   -v "$PWD/demo/repo:/workspace:ro" -v "$PWD/var/packages:/data/packages" \
   -v "$PWD/var/work:/data/work" \
-  aegis:0.1.0
+  aegis-gateway:0.1.0
 ```
 
 Note that `docker build` only produces the image — the service is a container, so

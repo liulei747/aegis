@@ -335,6 +335,11 @@ class AgentRun(BaseModel):
     scope_id: str
     model: str = ""
     steps: list[AgentStep] = Field(default_factory=list)
+    #: Workspace-relative files this run did **not** read from disk because the run had already read
+    #: them completely and the bytes came out of the blackboard instead (`agents.replayable_reads`).
+    #: Empty for a run that fetched everything itself. Derived from the seeded `index=0` steps, not
+    #: reported by the agent, for the same reason the coverage ledger is: a claim is not evidence.
+    reused_files: list[str] = Field(default_factory=list)
     #: Why it stopped: `finished`, `budget`, `error` or `no_tool`. A run that ended because the
     #: step budget ran out produced whatever it had, and the report has to say so.
     stop_reason: str = ""

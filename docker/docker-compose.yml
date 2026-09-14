@@ -4,10 +4,14 @@
 #
 #   scan       opengrep only             :8101 (internal only)  625 MB, CPU bound
 #   extract    LSP + graph + packaging   :8103 (internal only)  1.9 GB, memory bound
-#   worker     consumes the job queue    :8104 (internal only)  same image as gateway
+#   worker     consumes the job queue    :8104 (internal only)  aegis-worker image
 #   dataflow-N Joern taint flows         :8105 (internal only)  5.9 GB each, one JVM each
 #   redis      job state + streams       :6379 (internal only)  no persistence
 #   gateway    orchestration + queries   :8100 (published)      thin, stateless
+#
+#   extract / worker / gateway / harness each get their own image (same
+#   docker/Dockerfile, distinct tag) so any one of them can be rebuilt and redeployed
+#   without touching the others.
 #
 #   frontend   the console (static)       :8102 (published)      no API coupling
 #              its own image; it is told where the API is with AEGIS_API_BASE and calls it
@@ -104,7 +108,14 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: aegis:0.1.0
+      additional_contexts:
+        # `docker/Dockerfile` mounts this as `/jdtls-local` to install jdtls from a local
+        # snapshot instead of download.eclipse.org (unreachable from the build sandbox on some
+        # networks; the host downloads it through the system proxy). Put the tarball at
+        # var/jdtls/jdt-language-server.tar.gz; leave the dir empty and the build falls back
+        # to the network fetch.
+        jdtls: ../var/jdtls
+    image: aegis-extract:0.1.0
     container_name: aegis-extract
     depends_on:
       scan:
@@ -156,15 +167,26 @@ services:
 
   # ── worker: consumes the job queue. Internal only. ─────────────────────────
   #
-  # Same image as the gateway, different entrypoint. It needs the full toolchain (pyright,
-  # clangd, Node, the LSP catalog) because it runs extraction in-process, and it needs the
-  # scan URL because scanning stays delegated to the small CPU-bound image.
+  # Its own image (same Dockerfile as extract/gateway, distinct tag) so it can be rebuilt and
+  # redeployed independently, e.g. after a language-server or Python change. It needs the full
+  # toolchain (pyright, clangd, Node, the LSP catalog) because it runs extraction in-process,
+  # and it needs the scan URL because scanning stays delegated to the small CPU-bound image.
   #
   # It is deliberately NOT a dependency of the gateway: a gateway that cannot start until a
   # worker is healthy would refuse to serve read-only bundle queries during a worker
   # restart, and those queries need nothing but the filesystem.
   worker:
-    image: aegis:0.1.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        # `docker/Dockerfile` mounts this as `/jdtls-local` to install jdtls from a local
+        # snapshot instead of download.eclipse.org (unreachable from the build sandbox on some
+        # networks; the host downloads it through the system proxy). Put the tarball at
+        # var/jdtls/jdt-language-server.tar.gz; leave the dir empty and the build falls back
+        # to the network fetch.
+        jdtls: ../var/jdtls
+    image: aegis-worker:0.1.0
     container_name: aegis-worker
     depends_on:
       redis:
@@ -214,8 +236,21 @@ services:
     shm_size: "512m"
 
   # ── gateway: the only API the outside world talks to ──────────────────────
+  #
+  # Its own image (same Dockerfile, distinct tag) so it can be rebuilt without touching the
+  # heavier extraction services. Thin, stateless; the default entrypoint serves the gateway.
   gateway:
-    image: aegis:0.1.0
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        # `docker/Dockerfile` mounts this as `/jdtls-local` to install jdtls from a local
+        # snapshot instead of download.eclipse.org (unreachable from the build sandbox on some
+        # networks; the host downloads it through the system proxy). Put the tarball at
+        # var/jdtls/jdt-language-server.tar.gz; leave the dir empty and the build falls back
+        # to the network fetch.
+        jdtls: ../var/jdtls
+    image: aegis-gateway:0.1.0
     container_name: aegis-gateway
     depends_on:
       scan:
@@ -432,7 +467,14 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: aegis:0.1.0
+      additional_contexts:
+        # `docker/Dockerfile` mounts this as `/jdtls-local` to install jdtls from a local
+        # snapshot instead of download.eclipse.org (unreachable from the build sandbox on some
+        # networks; the host downloads it through the system proxy). Put the tarball at
+        # var/jdtls/jdt-language-server.tar.gz; leave the dir empty and the build falls back
+        # to the network fetch.
+        jdtls: ../var/jdtls
+    image: aegis-harness:0.1.0
     profiles: ["tools"]
     entrypoint: ["python", "-m", "services.harness"]
     environment:

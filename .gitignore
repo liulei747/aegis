@@ -12,7 +12,14 @@ venv/
 .mypy_cache/
 
 # --- local runtime state -------------------------------------------------
-var/
+# `var/` is runtime output, but `var/jdtls/` is the local jdtls snapshot the compose build
+# mounts as an additional build context. The tarball stays ignored (the operator downloads it
+# through the system proxy into var/jdtls/jdt-language-server.tar.gz); the directory is kept so
+# a clone can still `docker compose build` without the context path being missing. The same
+# exclusion-re-entry pattern as demo/ below: git never descends into an excluded directory.
+var/*
+!var/jdtls/
+var/jdtls/*.tar.gz
 workspace/
 # The demo workspace is checked in on purpose: docker-compose.yml mounts
 # ../demo/repo, and while that directory is ignored Docker creates an *empty* one
