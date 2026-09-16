@@ -1,4 +1,4 @@
-"""Runtime settings. Everything is env-overridable (prefix ``AEGIS_``)."""
+﻿"""Runtime settings. Everything is env-overridable (prefix ``AEGIS_``)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class BudgetConfig(BaseModel):
     """
 
     # --- graph shape -------------------------------------------------
-    max_depth: int = Field(2, ge=0, le=6, description="How many call-graph hops from the sink.")
+    max_depth: int = Field(2, ge=0, le=8, description="How many call-graph hops from the sink.")
     max_nodes: int = Field(60, ge=1, description="Max distinct methods in one bundle.")
     max_callers_per_node: int = Field(8, ge=0)
     max_callees_per_node: int = Field(12, ge=0)
@@ -270,3 +270,4 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings().resolve()
+
