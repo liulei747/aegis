@@ -24,6 +24,7 @@ import type {
   AICall,
   BundleSummary,
   JobSummary,
+  ProjectRecord,
   TokenUsage,
   Verdict,
 } from "../api/types.ts";
@@ -271,13 +272,16 @@ export function VerdictsPanel({ bundleId }: { bundleId: string }) {
 function QuickTriagePanel({
   bundles,
   jobs,
+  projects,
   onOpenBundle,
 }: {
   bundles: BundleSummary[];
   jobs: JobSummary[];
+  /** 项目注册表：新项目还没有任务与分析包，只靠那两份派生的话它在选择器里是隐形的。 */
+  projects: ProjectRecord[];
   onOpenBundle: (bundleId: string) => void;
 }) {
-  const { choices, choice, select } = useProjectChoice(bundles, jobs);
+  const { choices, choice, select } = useProjectChoice(bundles, jobs, projects);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<ApiError | null>(null);
   const [queued, setQueued] = useState<string | null>(null);
@@ -295,7 +299,10 @@ function QuickTriagePanel({
     setBusy(true);
     setFailure(null);
     try {
-      const answer = await api.submitJob({ workspace: choice.workspace, lsp: true });
+      // `force` 是必须的：assemble 的指纹就是 workspace，项目扫描过一次之后重扫永远命中同一个
+      // 指纹 —— 不带 force，上一次 succeeded 的任务原样返回（点了没反应），failed/canceled 回 409。
+      // 重新扫描是用户点按钮说出口的意图，这里直接带。
+      const answer = await api.assemble({ workspace: choice.workspace }, { force: true });
       if (answer && typeof answer === "object" && "job_id" in answer) setQueued(answer.job_id);
     } catch (caught) {
       setFailure(caught as ApiError);
@@ -321,20 +328,26 @@ function QuickTriagePanel({
           onSelect={select}
           emptyHint="还没有任何项目。先去「项目管理」新建一个（从仓库拉取或上传压缩包），再回来研判。"
         />
+        <button
+          type="button"
+          className="right"
+          onClick={assemble}
+          disabled={busy || choice === null || assembling}
+          title="对这个项目再跑一遍 静态扫描 → 调用图组装，生成一份新的分析包"
+        >
+          {assembling
+            ? "正在重新扫描…"
+            : busy
+              ? "提交中…"
+              : bundle
+                ? "重新扫描"
+                : "先组装分析包"}
+        </button>
         {bundle ? (
-          <button type="button" className="right" onClick={() => onOpenBundle(bundle.bundle_id)}>
+          <button type="button" onClick={() => onOpenBundle(bundle.bundle_id)}>
             打开分析包
           </button>
-        ) : (
-          <button
-            type="button"
-            className="right"
-            onClick={assemble}
-            disabled={busy || choice === null || assembling}
-          >
-            {assembling ? "正在组装…" : busy ? "提交中…" : "先组装分析包"}
-          </button>
-        )}
+        ) : null}
       </div>
 
       <ProjectFacts choice={choice} />
@@ -377,11 +390,13 @@ function QuickTriagePanel({
 export function VerdictsScreen({
   bundles,
   jobs,
+  projects,
   bundleId,
   onOpenBundle,
 }: {
   bundles: BundleSummary[];
   jobs: JobSummary[];
+  projects: ProjectRecord[];
   bundleId: string | null;
   onOpenBundle: (bundleId: string) => void;
 }) {
@@ -405,6 +420,7 @@ export function VerdictsScreen({
       <QuickTriagePanel
         bundles={bundles}
         jobs={jobs}
+        projects={projects}
         onOpenBundle={onOpenBundle}
       />
 

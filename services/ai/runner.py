@@ -65,6 +65,7 @@ def client_from(config: AIConfig, *, transport=None) -> ChatClient:
         model=config.model,
         temperature=config.temperature,
         timeout_s=config.timeout_s,
+        max_tokens=config.max_tokens,
         **extra,
     )
 

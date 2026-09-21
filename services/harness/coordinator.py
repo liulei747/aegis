@@ -44,7 +44,7 @@ import hashlib
 import json
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,12 +61,15 @@ from aegis_contracts.harness import (
     CrossScopeLead,
     EvidenceKind,
     FinalFinding,
+    InvestigationRecord,
     OpeningConvergence,
     ProjectContext,
     ThreatModel,
     ToolName,
     VerdictKind,
+    WorkGap,
     WorkItem,
+    WorkItemKind,
     WorkItemState,
 )
 from aegis_core.cancel import CanceledAbort
@@ -74,9 +77,26 @@ from aegis_core.logging import get_logger
 from services.harness import agents, coverage, report, survey
 from services.harness import blackboard as bb
 from services.harness import trail as trail_mod
+from services.harness.budget import BudgetClient, BudgetStop, RunBudget
 from services.harness.react import AgentRun, ToolLayerUnavailable
+from services.harness.tasks import TaskLedger
 
 log = get_logger(__name__)
+
+#: A coverage reason that says a scope still owns files nobody read end to end. Named because two
+#: places depend on recognising it: the closure rule writes it, and the marginal-yield stop refuses to
+#: end the loop while a scope is INSUFFICIENT for this reason -- an unread file is a known target,
+#: not a marginal-yield question.
+UNREAD_REASON_MARKER = "覆盖率按 read 调用台账计算，搜索命中不算审完"
+
+#: Sentinel for "this claim's `dataflow_verify` has not been run yet". Distinct from `None`, which is
+#: the real answer for a claim that is not taint-shaped at all -- see `_validation_single`. Defined up
+#: here because it is a *default argument*, evaluated when the class body runs.
+_PREFETCH: Any = object()
+
+
+class ModelUnavailableStop(BaseException):
+    """Stop the run after the provider has failed across several independent agents."""
 
 #: The heuristic plainer's reason prefix. Named so the report can mark these scopes as
 #: derived-from-directory-names rather than derived-from-a-model, which is a materially weaker
@@ -103,29 +123,50 @@ class HarnessConfig:
     #: evidence that the scope is unreviewed -- it is evidence that the reviewer is now annotating.
     #: `0` restores the old behaviour ("any new place justifies a round").
     min_new_places_per_round: int = 2
-    #: Scopes planned in one round. Also the cap on how many scopes a single round may dispatch.
-    max_scopes_per_round: int = 12
-    #: How many passes the opening pair (recon + threat modelling) may take before the pipeline moves
-    #: on. Copied from the frameworks that hit this problem first rather than invented here: MetaGPT
-    #: bounds its own iterative feedback loop at three retries, and AutoGen never ships a termination
-    #: condition without a hard cap beside it (`MaxMessageTermination`, `TokenUsageTermination`, …).
+    #: How many times a scope that *failed to produce a run* (agent error, or a run that stopped on
+    #: `budget` with nothing usable) may be re-dispatched. Beyond it the scope stays INSUFFICIENT and
+    #: stops being paid for.
     #:
-    #: Three, and the number is structural rather than generous. An agent's run ends at its `final`, so
-    #: whatever it publishes in pass N can only be read by its peer in pass N+1. With a cap of 2 the pair
-    #: can publish in both passes and still never reach quiescence: measured on the six-file demo, pass 2
-    #: ended with recon having recorded four trust boundaries (`request.args` reaching a concatenated
-    #: query, `repo.connect` opening a cwd-relative `app.db`) that the threat model had never seen, and
-    #: the stage reported "未收敛" for a run in which nothing was wrong. Pass 3 is what lets the lagging
-    #: agent read the last pass's material -- and it is cheap, because it goes only to whoever is behind
-    #: and its task is the delta, not the repository: measured at 12-16 model steps, against 22-30 for a
-    #: first pass.
-    max_opening_passes: int = 3
+    #: Measured on the `upp-module-infra` audit: 3 scopes ended `budget`/`error` in **every one of the
+    #: 4 rounds**, and each round re-dispatched all three -- 9 agent runs whose outcome was known
+    #: before they started. One retry is kept because a failure can be transient (a gateway 504 that
+    #: killed a run says nothing about the scope); a third is a pattern, not bad luck.
+    max_scope_retries: int = 1
+    #: Stop starting new rounds when the last round's new places are below this fraction of every
+    #: place found so far. `0.0` disables the clause and restores "keep going while a scope is
+    #: INSUFFICIENT and has new places".
+    #:
+    #: Measured on the module audit, per round: +82, +60, +28, +22 new candidates (the last two costing
+    #: 25 minutes and returning 19 of the run's 161 confirmed findings). At 0.25 the loop stops after
+    #: round 2 -- round 2's 28 places are 20% of the 142 found so far -- and keeps rounds 0 and 1,
+    #: whose yields were 100% and 73%. The clause is a *ratio* rather than a count because a large
+    #: repository legitimately yields more per round than a small one.
+    min_round_yield_ratio: float = 0.25
+    #: Discovery dispatch batch size; all planned tasks survive. Independent of model concurrency.
+    max_scopes_per_round: int = 12
+    planner_calls: int = 4
+    planner_wait_seconds: float = 60.0
+    planner_min_interval: float = 5.0
+    max_lead_continuations: int = 1
+    max_gap_continuations: int = 2
+    max_no_progress_continuations: int = 1
+    max_claim_attempts: int = 3
+    max_run_seconds: float = 7200
+    max_model_calls: int = 512
+    max_model_tokens: int = 0
+    max_cost_usd: float = 0
+    input_usd_per_million: float = 0
+    output_usd_per_million: float = 0
     #: Candidates recorded per scope. Bounds both the blackboard and the validation bill.
     candidates_per_scope: int = 5
     #: Turns per agent run. The hard budget the ReAct loop holds itself to.
     steps_per_agent: int = 8
     #: Model calls in flight at once, inherited from `AIConfig.concurrency` when built from config.
     concurrency: int = 4
+    #: Every model call already retries four times. If this many independent agent runs still end
+    #: in AIUnavailable, the provider is down rather than one scope being unlucky. Stop dispatching
+    #: so the remaining task ledger can be retried after service recovery.
+    max_consecutive_ai_unavailable: int = 4
     #: `--dry-run`: plan and scan deterministically, make no model calls, dispatch no agents.
     dry_run: bool = False
     #: Characters of source the harness inlines into a validation or attack-path task. `0` disables
@@ -137,6 +178,20 @@ class HarnessConfig:
     #: reads of what it contains; it never replaces the tools, and the coverage ledger keeps counting
     #: real `read` calls exactly as before.
     material_budget: int = 12_000
+    #: How many *different* claims one judging run may carry -- validation first, and attack paths
+    #: with the same bound. `1` is the historical behaviour: one run per claim.
+    #:
+    #: Why the batched form exists, measured on the `upp-module-infra` audit (177 Java files): 139
+    #: validation runs for 98 distinct claims, 196 s each, 110 of the run's 274 minutes, plus 72
+    #: attack-path runs for 161 confirmed candidates. Reading was the repeated part -- 2940 `read`
+    #: calls over 203 distinct files, `FileController.java` alone read 261 times -- and claims from one
+    #: controller share almost all of it. Batching does not merge decisions: a run judges N claims, each
+    #: keeps its own verdict, confidence and reasons, and a claim that can only be settled by a traced
+    #: path answers `needs_dataflow` and is re-run alone.
+    #:
+    #: Off by default because it changes what a judging run *is*, and a quality change of that kind
+    #: should be switched on deliberately with a run in front of it.
+    claim_batch_size: int = 1
 
 
 @dataclass
@@ -176,6 +231,7 @@ class HarnessCoordinator:
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.config = config or HarnessConfig()
+        self.budget = RunBudget(self.config)
         self.client = client
         #: Where events go while the run is happening. Defaults to a trail with no sinks, so a
         #: caller that does not care pays nothing and no code path has to check for `None`.
@@ -205,21 +261,27 @@ class HarnessCoordinator:
         #: are unions, so interleaved *appends* converge on their own; what this protects is the
         #: merge helpers that read a field, compare, and append -- two threads doing that on the same
         #: field can each see the pre-state and one of them loses its update.
-        self._board_lock = threading.Lock()
+        self._board_lock = threading.RLock()
+        self._planner_lock = threading.Lock()
+        self._model_slots = threading.BoundedSemaphore(max(1, self.config.concurrency))
+        self._availability_lock = threading.Lock()
+        self._consecutive_ai_unavailable = 0
+        self._planner_calls = 0
+        self._planner_last_at: datetime | None = None
         #: Which agent is running on *this* thread. Set by `_agent` for the duration of a run, read by
         #: `_record` so a fact an agent wrote says who wrote it -- needed because recon and threat
         #: modelling write from two threads at once and the trail has no other way to tell them apart.
         self._current = threading.local()
-        #: The opening stage's substantive publications, in order: what an agent recorded or merged,
-        #: which board revision it produced, and who wrote it. The convergence rule is "does the peer
-        #: have anything published after its watermark", and this log is the only place that can answer
-        #: it -- a revision number alone cannot say *whether* what changed is something a peer's answer
-        #: could depend on, and re-dispatching on a note would double the opening stage for nothing.
-        self._publications: list[dict] = []
         #: Which files each scope owns. The coverage rule reads this: a scope is not closed while a
         #: file it owns has never been read end to end, and the re-dispatch hands the unread subset
         #: back to the next agent instead of letting it guess where it left off.
         self._scope_files: dict[str, list[str]] = {}
+        #: Consecutive rounds in which a scope's discovery run failed to produce one (agent error, or
+        #: `budget` with nothing usable). Read by the re-dispatch decision: a scope that keeps failing
+        #: is left INSUFFICIENT instead of being paid for again -- see `max_scope_retries`. Reset to 0
+        #: by any run that finishes, because the counter is about consecutive failure, not history.
+        self._scope_failures: dict[str, int] = {}
+        self.tasks = TaskLedger(self.blackboard, self.trail)
 
     # ── context ────────────────────────────────────────────────────────────
 
@@ -263,6 +325,28 @@ class HarnessCoordinator:
         """
         with self._board_lock:
             board = self.blackboard
+            if getattr(self._current, "agent", "") == agents.DISCOVERY:
+                work = self.tasks.get(getattr(self._current, "work_id", ""))
+                if work is None:
+                    return {"revision": board.revision, "error": "task_context_missing"}
+                records = [r.model_dump(mode="json") for r in board.investigation_records
+                           if r.work_id == work.work_id or r.file in work.files]
+                candidates = [c for c in board.candidates
+                              if c.scope_id == work.scope_id or c.file in work.files]
+                updates = list(work.pending_updates)
+                # Do not acknowledge a clipped read; completion checks actual returned updates.
+                self._current.seen_updates = updates
+                return {
+                    "revision": board.revision, "work_id": work.work_id,
+                    "records": records[-self.BOARD_LIST_LIMIT:],
+                    "omitted_records": max(0, len(records) - self.BOARD_LIST_LIMIT),
+                    "candidates": [c.model_dump(mode="json") for c in candidates[:self.BOARD_LIST_LIMIT]],
+                    "verdicts": [v.model_dump(mode="json") for v in board.verdicts
+                                 if v.candidate_id in {c.candidate_id for c in candidates}][:self.BOARD_LIST_LIMIT],
+                    "updates": [lead.model_dump(mode="json") for lead in board.leads if lead.lead_id in updates],
+                    "gaps": [g.model_dump(mode="json") for item in board.work for g in item.gaps
+                             if item.work_id == work.work_id or g.lead_id in updates],
+                }
             project = board.project
             architecture = board.architecture
             threats = board.threats
@@ -424,6 +508,11 @@ class HarnessCoordinator:
         kind = str(record.get("kind") or "")
         text = str(record.get("text") or "").strip()
         scope = str(record.get("scope") or "").strip()
+        if getattr(self._current, "agent", "") == agents.DISCOVERY:
+            work = self.tasks.get(getattr(self._current, "work_id", ""))
+            if work is None or kind not in {"evidence", "candidate", "lead", "gap"}:
+                return {"recorded": False, "reason": "discovery_record_not_allowed"}
+            scope = work.scope_id
         if kind not in KINDS:
             return {"recorded": False, "reason": f"unknown_kind:{kind}"}
         if not text:
@@ -436,12 +525,8 @@ class HarnessCoordinator:
             # "already on the board, deduplicated" branch below dead code that no test could reach.
             # The revision is bumped by `_touch` only when a merge actually appended something, so it
             # is the ledger's own answer to "did anything change".
+            self._current.record_fields = {}
             before = self.blackboard.revision
-            # How much substantive material the board held before this write, so what the write
-            # *added* can be published for the peer's convergence check (`_opening_growth`). A record
-            # that changed nothing publishes nothing, which is what keeps a duplicate from waking the
-            # other agent up.
-            before_counts = self._opening_counts()
             try:
                 note = self._apply_record(kind, text, scope)
             except (ValueError, TypeError) as exc:
@@ -458,7 +543,8 @@ class HarnessCoordinator:
             changed = self.blackboard.revision > before
             revision = self.blackboard.revision
             agent = getattr(self._current, "agent", "")
-            self._publish(agent, self._opening_growth(before_counts), f"{kind}: {text}")
+            if changed and agent == agents.DISCOVERY:
+                bb.save(self.blackboard, self.run_dir)
 
         if not changed:
             # A duplicate is not a failure, and saying so is what stops an agent from retrying it or
@@ -470,6 +556,8 @@ class HarnessCoordinator:
             # bogus event type instead of as a record.
             "record", agent=agent, scope=scope,
             record_kind=kind, revision=revision, text=trail_mod.clip(text), note=note,
+            work_id=getattr(self._current, "work_id", ""),
+            **getattr(self._current, "record_fields", {}),
         )
         return {"recorded": True, "revision": revision, "note": note}
 
@@ -487,6 +575,54 @@ class HarnessCoordinator:
         Called with `_board_lock` held. The lock is the caller's because the merge helpers read a field
         and then append to it, and two opening agents doing that to the same field can lose a write.
         """
+        if kind == "gap":
+            return self._record_gap(text)
+        if kind in {"evidence", "candidate"}:
+            payload = _json_object(text)
+            if payload is None:
+                raise ValueError("需要 JSON 对象")
+            work_id = getattr(self._current, "work_id", "")
+            work = self.tasks.get(work_id)
+            if work is None:
+                raise ValueError("需要当前调查任务")
+            file = str(payload.get("file") or "").replace("\\", "/")
+            line = payload.get("line")
+            if file not in set(coverage.inventory(self.workspace)) or not isinstance(line, int) or isinstance(line, bool) or line < 1:
+                raise ValueError("需要仓库内源码位置 file 和正整数 line")
+            payload["file"] = file
+            if kind == "candidate":
+                candidates = agents._parse_candidates({"candidates": [payload]}, scope_id=scope)
+                if not candidates:
+                    raise ValueError("候选需要 title、file 和漏洞类型")
+                existing = [c for c in self.blackboard.candidates if c.scope_id == scope]
+                if len(existing) >= self.config.candidates_per_scope and candidates[0].candidate_id not in {c.candidate_id for c in existing}:
+                    raise ValueError("当前任务候选预算耗尽；保留断点后结束")
+                self._record_candidates(candidates)
+                self.tasks.link_candidates(work_id, [c.candidate_id for c in candidates])
+                for candidate in candidates:
+                    self._claim_work([candidate], WorkItemKind.VALIDATION)
+                return "候选已登记验证待办（尚未裁决）"
+            category = payload.get("category", "hypothesis")
+            if category not in {"source_fact", "hypothesis"}:
+                raise ValueError("Discovery 只能发布 source_fact 或 hypothesis，不能发布验证结论")
+            detail = str(payload.get("text") or "").strip()
+            if not detail:
+                raise ValueError("证据 text 不能为空")
+            affected = bb.find_candidate(self.blackboard, str(payload.get("candidate_id") or ""))
+            if payload.get("candidate_id") and (affected is None or category != "source_fact"):
+                raise ValueError("关联候选的证据需要已存在的 candidate_id 和 source_fact")
+            identity = json.dumps([work_id, file, line, category, detail], ensure_ascii=False)
+            record_id = "E-" + hashlib.sha256(identity.encode()).hexdigest()[:20]
+            if not any(r.record_id == record_id for r in self.blackboard.investigation_records):
+                self.blackboard.investigation_records.append(InvestigationRecord(
+                    record_id=record_id, work_id=work_id, scope_id=scope,
+                    file=file, line=line, category=category, text=detail,
+                ))
+                self.blackboard.revision += 1
+            self._current.record_fields = {"file": file, "line": line, "category": category, "record_id": record_id}
+            if affected is not None:
+                self._record_candidates([affected.model_copy(update={"evidence": [*affected.evidence, record_id]})])
+            return f"证据已记录：{record_id} ({category})"
         if kind == "note":
             bb.set_context(
                 self.blackboard,
@@ -541,20 +677,37 @@ class HarnessCoordinator:
                 # coordinator would route on. Accepting it would put a row on the board that looks
                 # like a thread and leads nowhere.
                 raise ValueError("lead 需要 to_scope：说的是把它交给哪个 scope")
-            bb.add_lead(
-                self.blackboard,
-                CrossScopeLead(
+            if getattr(self._current, "agent", "") == agents.DISCOVERY:
+                if not str(payload.get("question") or payload.get("why") or "").strip():
+                    raise ValueError("独立线索需要具体 question")
+                if payload.get("file") not in set(coverage.inventory(self.workspace)):
+                    raise ValueError("线索需要仓库内起点 file")
+                if not isinstance(payload.get("line"), int) or isinstance(payload.get("line"), bool) or payload["line"] < 1:
+                    raise ValueError("线索需要正整数 line")
+                refs = payload.get("evidence_refs") or []
+                if not isinstance(refs, list) or any(ref not in {r.record_id for r in self.blackboard.investigation_records} for ref in refs):
+                    raise ValueError("evidence_refs 必须引用已存在的证据")
+            new_lead = CrossScopeLead(
                     lead_id=agents.stable_candidate_id(
-                        scope or "workspace", target, None, "lead"
+                        scope or "workspace", target, None, "lead:" + json.dumps(
+                            [" ".join(str(payload.get("question") or payload.get("why") or payload.get("title") or "").split()).casefold(),
+                             payload.get("file"), payload.get("line")], ensure_ascii=False, sort_keys=True
+                        )
                     ),
                     from_scope=scope or "workspace",
                     to_scope=target,
                     title=str(payload.get("title") or target),
                     detail=text,
                     raised_by=getattr(self._current, "agent", ""),
-                ),
+                    question=str(payload.get("question") or payload.get("why") or payload.get("title") or target),
+                    file=str(payload.get("file") or ""), line=payload.get("line"),
+                    evidence_refs=payload.get("evidence_refs") or [],
+                    source_work_id=getattr(self._current, "work_id", ""),
+                    sequence=max((lead.sequence for lead in self.blackboard.leads), default=0) + 1,
             )
-            return "已记入 leads（交给目标 scope，不是自己追过去）"
+            bb.add_lead(self.blackboard, new_lead)
+            self._current.record_fields = {"lead": new_lead.model_dump(mode="json")}
+            return "已记入持久化线索收件箱，等待协调器处理"
         # Unreachable: the caller validated `kind` against `KINDS` before taking the lock. Raising
         # rather than returning keeps a future kind from silently recording nothing.
         raise ValueError(f"没有实现记录方式：{kind}")
@@ -580,10 +733,33 @@ class HarnessCoordinator:
             # inside it reports the wrong thing at the wrong time (measured in the deployed image: the
             # stage table said 仓库勘察 had started while the pre-scan was still walking the tree).
             self._stage("prep", self._prepare)
+            bb.add_work(self.blackboard, self._coverage_items())
+            self._publish_discovery_tasks()
             self._stage("recon", self._recon_and_threat_model)
+            self._stage("security_inventory", self._build_security_inventory)
             self._stage("plan", self._plan)
             self._stage("discovery", self._discovery_and_closure)
-            self._stage("attack_path", self._attack_paths)
+            self._stage("attack_path", self._complete_attack_paths)
+            self._stage("findings", self._emit_findings)
+        except BudgetStop as exc:
+            self._emit_findings()
+            self.tasks.stop(str(exc))
+            self.blackboard.execution_budget = self.budget.snapshot()
+            bb.mark_closed(self.blackboard, f"{exc}；未完成任务与线索保留。")
+            return self._finish()
+        except ModelUnavailableStop as exc:
+            reason = str(exc)
+            self.tasks.stop(reason)
+            self.blackboard = bb.mark_closed(
+                self.blackboard, f"{reason}；已停止派发新任务，未完成任务与线索保留，可在服务恢复后重新审计。"
+            )
+            self.trail.emit("error", where="model_provider", message=reason)
+            return self._finish(fatal=reason)
+        except (CanceledAbort, KeyboardInterrupt):
+            self.tasks.stop("运行已取消", canceled=True)
+            bb.mark_closed(self.blackboard, "运行已取消；未完成任务保留在任务清单中。")
+            self._finish()
+            raise
         except ToolLayerUnavailable as exc:
             # A missing tool package is a broken installation, not a stage result. Recorded and
             # returned so the CLI can exit non-zero with the actionable message intact.
@@ -592,9 +768,8 @@ class HarnessCoordinator:
             self.blackboard = bb.mark_closed(self.blackboard, f"工具层不可用：{exc}")
             return self._finish(fatal=str(exc))
 
-        self._stage("findings", self._emit_findings)
         note = (
-            f"覆盖率收敛完成，共 {self.rounds_run} 轮；"
+            f"审计执行结束，共 {self.rounds_run} 轮；"
             f"{len(self.blackboard.candidates)} 个候选、"
             f"{len(bb.confirmed_candidates(self.blackboard))} 个确认、"
             f"{len(self.blackboard.findings)} 条最终发现。"
@@ -621,6 +796,7 @@ class HarnessCoordinator:
             [trail_mod.JsonlSink(self.run_dir / trail_mod.TRAIL_NAME, mode="w"), *sinks],
             base={"run_id": self.run_id, **(base or {})},
         )
+        self.tasks.trail = self.trail
         return self.trail
 
     def _stage(self, name: str, fn) -> None:
@@ -655,10 +831,13 @@ class HarnessCoordinator:
         if self._abort is not None and self._abort():
             raise CanceledAbort(stage="ai", resource="harness_stage_boundary",
                                 detail=f"harness stage: {stage}")
+        if not self.config.dry_run:
+            self.budget.check()
 
     def _on_step(self, run: AgentRun, step) -> None:
         """One turn of one agent, as an event. This is the agent's side of the conversation."""
         result = step.result
+        self._current.active_run = run
         call = step.call
         arguments = {}
         if call is not None:
@@ -680,6 +859,18 @@ class HarnessCoordinator:
             summary=trail_mod.clip(result.summary) if result is not None else "",
             error=result.error if result is not None else None,
         )
+        if call is not None and call.tool is ToolName.BOARD and result is not None and result.ok and not result.truncated:
+            work = self.tasks.get(getattr(self._current, "work_id", ""))
+            if work is not None:
+                seen = set(getattr(self._current, "seen_updates", []))
+                self._current.consumed_updates = set(getattr(self._current, "consumed_updates", set())) | seen
+        if call is not None and call.tool is ToolName.READ and result is not None and result.ok:
+            item = self.tasks.get(f"W-{run.scope_id}")
+            if item is not None and item.files:
+                reads = coverage.from_runs([*self.blackboard.runs, run])
+                count = sum(bool(reads.get(name) and reads[name].fully_read) for name in item.files)
+                if count != item.read_files:
+                    self.tasks.update(item.work_id, read_files=count)
 
     def _agent(self, **kwargs) -> agents.AgentOutcome:
         """`agents.run` plus the three events that make it watchable, and the ledger write.
@@ -695,7 +886,18 @@ class HarnessCoordinator:
         """
         agent = kwargs.get("agent", "")
         scope_id = kwargs.get("scope_id", "")
+        work_ids = kwargs.pop("work_ids", [])
+        if agent == agents.DISCOVERY and self.tasks.get(f"W-{scope_id}"):
+            work_ids = [f"W-{scope_id}"]
         self.check_abort(f"{agent}:{scope_id}")
+        self.tasks.trail = self.trail
+        base_run_id = kwargs.get("run_id") or f"{agent}:{scope_id}"
+        previous_attempts = max((len(self.tasks.get(wid).attempts) for wid in work_ids), default=0)
+        if previous_attempts and (agent != agents.DISCOVERY or any(
+            attempt.run_id == base_run_id for wid in work_ids for attempt in self.tasks.get(wid).attempts
+        )):
+            kwargs["run_id"] = f"{base_run_id}:attempt:{previous_attempts + 1}"
+        self.tasks.start(work_ids, agent, kwargs.get("run_id") or f"{agent}:{scope_id}")
         started = _now()
         self.trail.emit(
             "agent_start",
@@ -706,9 +908,29 @@ class HarnessCoordinator:
         )
         previous = getattr(self._current, "agent", "")
         self._current.agent = agent
+        previous_work = getattr(self._current, "work_id", "")
+        self._current.work_id = work_ids[0] if work_ids else ""
+        self._current.consumed_updates = set()
+        self._current.active_run = None
+        claim_ids = {cid for wid in work_ids for cid in self.tasks.get(wid).candidate_ids}
+        versions = {c.candidate_id: c.evidence_version for c in self.blackboard.candidates if c.candidate_id in claim_ids}
         try:
-            outcome = agents.run(on_step=self._on_step, **kwargs)
+            with self._model_slots:
+                self.check_abort(f"{agent}:{scope_id}")
+                client = kwargs.get("client")
+                if client is not None:
+                    kwargs["client"] = BudgetClient(client, self.budget, self.check_abort)
+                outcome = agents.run(on_step=self._on_step, **kwargs)
         except BaseException as exc:
+            active = getattr(self._current, "active_run", None)
+            if active is not None:
+                active.stop_reason = "budget" if isinstance(exc, BudgetStop) else "aborted"
+                active.finished_at = _now()
+                bb.add_run(self.blackboard, active)
+            self.tasks.end(
+                work_ids, stop_reason="aborted" if isinstance(exc, (CanceledAbort, KeyboardInterrupt)) else "error",
+                steps=len(active.steps) if active is not None else 0, error=f"{type(exc).__name__}: {exc}",
+            )
             # A run that dies *inside* the orchestrator still gets its `end`. The trail's contract is
             # that every announced run is closed, and a screen that shows an agent which never finished
             # cannot tell "still working" from "died here" -- which is exactly what happened when the
@@ -730,7 +952,18 @@ class HarnessCoordinator:
             # Restored rather than cleared: an agent run nested in another (a re-dispatch inside a
             # stage) must leave the outer attribution as it found it.
             self._current.agent = previous
+            self._current.work_id = previous_work
         bb.add_run(self.blackboard, outcome.run)
+        if agent in {agents.VALIDATION, agents.VALIDATION_BATCH, agents.ATTACK_PATH, agents.ATTACK_PATH_BATCH} and any(
+            c.evidence_version != versions.get(c.candidate_id, c.evidence_version)
+            for c in self.blackboard.candidates if c.candidate_id in claim_ids
+        ):
+            outcome.parsed, outcome.error = None, "执行期间关键证据版本变化，保留待复核，未采用旧结果"
+        self.blackboard.execution_budget = self.budget.snapshot()
+        self.tasks.end(
+            work_ids, stop_reason=outcome.run.stop_reason, steps=len(outcome.run.steps),
+            error=outcome.error or ("模型未返回可用结果" if outcome.parsed is None else ""),
+        )
         step_count = len(outcome.run.steps)
         self.trail.emit(
             "agent_end",
@@ -741,196 +974,78 @@ class HarnessCoordinator:
             steps=step_count,
             parsed=outcome.parsed is not None,
             error=outcome.error,
+            # Whether this run's answer came out of a truncated reply (`react._salvage_final`). In the
+            # trail because it is the only place a reader can see the recovery working: the run looks
+            # `finished` in every other record, and its lists may stop early.
+            salvaged=outcome.run.salvaged,
             duration_ms=int((_now() - started).total_seconds() * 1000),
         )
+        self._check_model_availability(outcome.run)
         return outcome
+
+    def _check_model_availability(self, run: AgentRun) -> None:
+        """Trip a run-wide circuit after repeated, fully retried provider failures."""
+        unavailable = bool(
+            run.stop_reason == "error"
+            and run.steps
+            and run.steps[-1].thought.startswith("model call failed: AIUnavailable:")
+        )
+        with self._availability_lock:
+            if unavailable:
+                self._consecutive_ai_unavailable += 1
+            else:
+                self._consecutive_ai_unavailable = 0
+            failures = self._consecutive_ai_unavailable
+        threshold = max(1, self.config.max_consecutive_ai_unavailable)
+        if failures >= threshold:
+            raise ModelUnavailableStop(
+                f"模型服务连续 {failures} 个 agent 不可用（每次请求已完成内部重试）"
+            )
 
     # ── stage 0: prep, stage 1: recon + threat model ───────────────────────
 
     def _recon_and_threat_model(self) -> None:
-        """The opening: recon and threat modelling, concurrently, until neither has unread work.
+        """The opening: recon and threat modelling once each, concurrently and without cross-reading.
 
-        The parallelism is deliberate, and it was arrived at by being wrong first. An earlier version
-        ran these two concurrently and reverted to sequential, with a comment explaining why: threat
-        modelling builds its task from the architecture map, so whichever call lost the race saw an
-        empty blackboard, and the stage was skipped when recon had produced nothing. That was a symptom
-        of *when* findings were merged, not of concurrency being wrong: each agent merged its output
-        only after its run had finished.
+        This used to be a convergence loop (up to `max_opening_passes`, each pass re-dispatching
+        whichever agent had unread peer publications), copied from MetaGPT's message pool and AutoGen's
+        delta termination. Two measurements killed it. On the real module audit the pair ran 3 passes
+        and still reported `unread=2`; on the demo, pass 2's publications were rephrasings of what both
+        sides had already seen -- the loop paid for a third agent run to re-read a sentence. The design
+        change that replaces it: the two agents **do not react to each other at all**. Recon describes
+        the system; threat modelling reasons independently from the deterministic survey;
+        whatever neither of them established is the job of the next stage -- the AI security inventory,
+        which runs after both and is the only place expected to reconcile their outputs.
 
-        Three things make the overlap work, and the third is what this method is about:
-
-        * the deterministic prep ran as its own stage before this one, so both agents start from facts
-          instead of an empty board -- and those facts are the seed revision, which neither is asked to
-          re-read because both were handed them in their task;
-        * `record` lets an agent write a fact the moment it has it, so each can see what the other has
-          established *while* both are still working (the board's merges are unions and `_board_lock`
-          covers the read-modify-write ones);
-        * the stage **repeats** until each agent has read what the other published.
-
-        That last part is copied rather than invented, because the failure it fixes is a known one.
-        MetaGPT's answer to the same problem is a shared message pool with publish-subscribe: agents
-        "publish their structured messages in the pool", each subscribes by role, and "an agent
-        activates its action only after receiving all its prerequisite dependencies"
-        (https://arxiv.org/abs/2308.00352 §3.2). AutoGen's answer to *when to stop* is a termination
-        condition that sees "the delta sequence of messages since the last time it was called", is
-        composable (`|` = stop if either holds), carries a `stop_reason` saying which one fired, and is
-        always paired with a hard cap (`MaxMessageTermination`, `TokenUsageTermination`, …)
-        (https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/termination.html).
-        Both shapes are reused here: the delta is "publications after this agent's watermark", the
-        condition is `converged | passes exhausted`, and the cap is `max_opening_passes`.
-
-        The watermark is taken from the board revision each agent's `board` calls actually served --
-        a tool call in the ledger -- and never from the agent saying it has caught up. That is the same
-        rule the coverage table follows, and it exists because measurement said so: on the first real
-        audit the threat model called `board` at steps 1 and 2 (before recon had published anything),
-        then finished 50 events later without looking again, while recon published eleven facts in
-        between. The tool worked; the timing did not, and a prompt telling it to re-read was ignored.
+        Both tasks are built before either run starts, from the same frozen survey state. They then run
+        concurrently. Their final outputs are merged only after both futures finish, so scheduling can
+        never leak recon's answer into the threat-model prompt.
         """
-        # Idempotent: this runs the survey only for a caller that skipped the prep stage (a bare
-        # `_recon_and_threat_model()` in a test). In `run()` the snapshot is already taken and this
-        # returns immediately.
         self._prepare()
-        seed = self.blackboard.revision
-        watermarks = {agents.RECON: seed, agents.THREAT_MODEL: seed}
-        passes = max(1, self.config.max_opening_passes)
-        pending: list[str] = [agents.RECON, agents.THREAT_MODEL]
-        converged = False
-        index = 0
-        for index in range(1, passes + 1):
-            self._opening_pass(index, pending, watermarks)
-            backlog = self._opening_backlog(watermarks)
-            pending = [agent for agent in (agents.RECON, agents.THREAT_MODEL) if backlog.get(agent)]
-            if not pending:
-                converged = True
-                break
-
-        unread = {
-            agent: len(items)
-            for agent, items in self._opening_backlog(watermarks).items()
-            if items
-        }
-        note = (
-            f"开场第 {index} 轮达成静默：两个 agent 都已读过对方发布的内容。"
-            if converged
-            else (
-                f"开场跑了 {index} 轮仍未收敛（上限 {passes} 轮）："
-                f"{'、'.join(f'{agent} 还有 {count} 条未读' for agent, count in unread.items())}。"
-                "这是本次运行的已知缺口，不是“已完成”。"
-            )
-        )
+        frozen = self.blackboard.model_copy(deep=True)
+        recon_task = agents.recon_task(str(self.workspace), prep=self._snapshot)
+        threat_task = agents.threat_model_task(frozen)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            recon_future = pool.submit(self._run_recon, recon_task)
+            threat_future = pool.submit(self._run_threat_model, threat_task)
+            recon_run = recon_future.result()
+            threat_run = threat_future.result()
         self.blackboard.opening = OpeningConvergence(
-            passes=index,
-            converged=converged,
-            watermarks=dict(watermarks),
-            unread=unread,
-            note=note,
+            passes=1,
+            converged=True,
+            watermarks={},
+            unread={},
+            note=(
+                "单轮独立开场：recon 与威胁建模各执行一轮、不互读收敛（设计变更）；"
+                "两者结论由随后的 AI 安全清单阶段统一核对与补全。"
+                + (
+                    ""
+                    if recon_run is not None and threat_run is not None
+                    else "（其中一方未产出结论，见其 run 的 stop_reason。）"
+                )
+            ),
         )
-        log.info("harness: opening %s", note)
-
-    def _opening_pass(
-        self, index: int, pending: list[str], watermarks: dict[str, int]
-    ) -> None:
-        """Run one pass of the opening stage: every agent in `pending`, concurrently.
-
-        Later passes dispatch **only the agents that are behind**, which is the point of computing a
-        backlog at all: an agent that has already been handed everything the other published has nothing
-        left to react to, and re-running it would pay for a fresh reading of the repository to reach the
-        same answer. Pass 2 onwards also gets a task built from the backlog instead of the whole board.
-        """
-        backlog = {agent: self._opening_backlog(watermarks).get(agent, []) for agent in pending}
-        runners = {
-            agents.RECON: self._run_recon,
-            agents.THREAT_MODEL: self._run_threat_model,
-        }
-        # What each dispatched agent's task text carries. Captured before the pool starts, so a peer's
-        # concurrent write during this pass is *not* counted as delivered -- conservative, and the reason
-        # the loop alternates: what one publishes in pass N is read in pass N+1.
-        delivered = {agent: self.blackboard.revision for agent in pending}
-        with ThreadPoolExecutor(max_workers=max(1, len(pending))) as pool:
-            futures = {
-                pool.submit(runners[agent], index, backlog.get(agent, [])): agent
-                for agent in pending
-            }
-            for future in futures:
-                # Every future is awaited before the pass ends. A failure in one is already recorded as
-                # that agent's result; letting it escape here would lose the other's work, which is the
-                # same rule `_bounded` follows.
-                try:
-                    future.result()
-                except ToolLayerUnavailable:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "harness: opening pass %d failed for %s (%s: %s)",
-                        index, futures[future], type(exc).__name__, exc,
-                    )
-        # Watermarks move on *delivery*, not on a model promise: an agent counts as up to date once it
-        # has been handed the material (the task text it was given, which for a re-dispatch is the delta)
-        # or has read at least that far itself (`board`). Both are facts the coordinator owns.
-        #
-        # The first version required a `board` call, and that was a proxy that fails on the one case it
-        # was built for: a model that ignores the tool stays "behind" forever, so the loop could never
-        # converge and always ran to its cap -- which is also what the fake tool layer (no board
-        # revision at all) showed immediately. Requiring the read measures willingness to call a tool;
-        # delivering the delta measures what the agent was actually given, and the loop terminates when a
-        # pass adds nothing new, which is the blackboard architecture's own stopping rule.
-        for agent in pending:
-            given = delivered.get(agent, 0)
-            run = self._opening_runs(index).get(agent)
-            seen = _board_revision_seen(run) if run is not None else None
-            if seen is not None:
-                given = max(given, seen)
-            if given > watermarks.get(agent, 0):
-                watermarks[agent] = given
-
-    def _opening_runs(self, index: int) -> dict[str, AgentRun]:
-        """This pass's opening runs, read back off the ledger by their pass-suffixed id."""
-        runs: dict[str, AgentRun] = {}
-        for agent in (agents.RECON, agents.THREAT_MODEL):
-            run_id = _opening_run_id(agent, index)
-            run = next((item for item in self.blackboard.runs if item.run_id == run_id), None)
-            if run is not None:
-                runs[agent] = run
-        return runs
-
-    def _opening_backlog(self, watermarks: dict[str, int]) -> dict[str, list[dict]]:
-        """Per opening agent, the substantive publications it has not read.
-
-        Substantive means something a peer's *conclusions about the code* could depend on: a component,
-        a trust boundary, an entry point or a threat. Notes, leads, assets and actors are deliberately
-        excluded -- notes and leads are commentary, and assets/actors are prose descriptions of the same
-        few things, which two agents will keep rewriting (see `SUBSTANTIVE` for the measurement). An
-        agent never goes stale on its own writes: the point is to read the *other* one.
-        """
-        backlog: dict[str, list[dict]] = {}
-        for agent in (agents.RECON, agents.THREAT_MODEL):
-            watermark = watermarks.get(agent, 0)
-            backlog[agent] = [
-                item
-                for item in self._publications
-                if item["revision"] > watermark and item["by"] != agent and item["kinds"]
-            ]
-        return backlog
-
-    def _publish(self, by: str, kinds: list[str], label: str) -> None:
-        """Log one substantive publication, at the board revision it produced.
-
-        Called from both writers of the opening stage: `_record` when an agent writes a fact mid-run,
-        and the two stage methods when an agent's final answer is merged. Both matter -- measured on
-        the real audit, most of recon's material arrived as `record` calls, and the rest arrived in its
-        final answer; a watermark that watched only one of them would declare convergence while
-        half the board was still unread.
-        """
-        if not kinds:
-            return
-        self._publications.append(
-            {
-                "revision": self.blackboard.revision,
-                "by": by,
-                "kinds": list(kinds),
-                "label": trail_mod.clip(label, 200),
-            }
-        )
+        log.info("harness: opening finished (single round, independent)")
 
     def _prepare(self) -> None:
         """Write the deterministic facts onto the blackboard before any model call.
@@ -991,43 +1106,86 @@ class HarnessCoordinator:
             ),
         )
 
-    def _opening_reuse(self) -> list[AgentStep]:
-        """Complete reads this run already has, to seed an opening re-dispatch with.
+    def _build_security_inventory(self) -> None:
+        """Run the AI security-inventory agent **once**, after recon and threat modelling.
 
-        Pass 1 is the reader: it is the only pass allowed to fetch from disk, and its reads are the
-        evidence the coverage ledger rests on. Pass 2 onwards is a *re-read* by construction (see
-        `_run_recon`), so the bytes come out of the blackboard instead -- measured on a four-file
-        project, the re-dispatches re-read the same four files once per pass.
+        This is the stage the opening was refactored for. It used to be a deterministic regex pre-scan
+        run *before* the opening pair (measured: 659 regex records over the inventory, most of them
+        keyword hits a model then had to disown) -- both the order and the mechanism were wrong. The
+        inventory is a *judgement* about entry points, authorization controls, dangerous capabilities,
+        configuration and dependencies, and it needs the two opening agents' conclusions as input:
+        recon says what the system is, the threat model says what matters, and this agent reconciles
+        both against the source and manifests, with its own reads.
+
+        Its output is what the planner is asked to turn into investigations, and `coverage_gaps` is
+        the honest part: uncertainty is recorded there instead of being padded into a section.
         """
-        steps, _reused, _missing = agents.replayable_reads(
-            self.blackboard,
-            coverage.inventory(self.workspace),
-            budget=self.config.material_budget,
-        )
-        return steps
-
-    def _run_recon(self, index: int = 1, backlog: list[dict] | None = None) -> AgentRun | None:
-        """One recon run. `backlog` is what the peer published since this agent last read the board.
-
-        Pass 2 onwards is a *re-read*, not a re-investigation: the agent is handed the publications it
-        has not seen and asked whether they change its answer. Its tool surface is unchanged -- it may
-        still read code to check a peer's claim -- but the task no longer describes the repository from
-        scratch, so the common case is one short turn rather than a second full survey.
-        """
+        if self.blackboard.security_inventory is not None:
+            return
+        if self.blackboard.project is None and self.blackboard.architecture is None:
+            # Without the opening there is nothing to reconcile against; recorded as skipped rather
+            # than run on an empty board, exactly like the threat model's own guard.
+            self.dataflow_notes.append(
+                "warning: the opening produced nothing usable, so the security-inventory stage was "
+                "skipped; the planner below works from the deterministic survey only"
+            )
+            return
         outcome = self._agent(
-            agent=agents.RECON,
+            agent=agents.SECURITY_INVENTORY,
             scope_id="workspace",
-            run_id=_opening_run_id(agents.RECON, index),
-            task=agents.recon_task(
-                str(self.workspace),
-                prep=self._snapshot if index == 1 else None,
-                delta=agents.opening_delta_block(backlog or []),
-            ),
+            task=agents.security_inventory_task(self.blackboard),
             context=self.context,
             client=self.client,
             max_steps=self.config.steps_per_agent,
             blackboard=self.blackboard,
-            initial_steps=self._opening_reuse() if index >= 2 else None,
+        )
+        if outcome.parsed is None:
+            log.warning(
+                "harness: security inventory produced nothing usable (%s)", outcome.error
+            )
+            self.dataflow_notes.append(
+                "warning: 安全清单阶段没有产出（%s）；planner 只依据勘察与威胁模型。"
+                % (outcome.error or "no answer")
+            )
+            return
+        bb.set_security_inventory(self.blackboard, outcome.parsed)
+        inventory: agents.SecurityInventory = outcome.parsed
+        counts = {
+            name: len(getattr(inventory, name) or [])
+            for name in (
+                "entry_points",
+                "authorization_controls",
+                "dangerous_capabilities",
+                "configurations",
+                "dependencies",
+                "state_controls",
+            )
+        }
+        self.trail.emit(
+            "summary",
+            phase="security_inventory",
+            note=(
+                f"AI 安全清单完成：入口 {counts['entry_points']}、鉴权控制 "
+                f"{counts['authorization_controls']}、危险能力 {counts['dangerous_capabilities']}、"
+                f"配置 {counts['configurations']}、依赖 {counts['dependencies']}、"
+                f"状态控制 {counts['state_controls']}；未决 {len(inventory.coverage_gaps)} 条。"
+            ),
+            inventory={"counts": counts, "coverage_gaps": len(inventory.coverage_gaps),
+                       "files_reviewed": len(inventory.files_reviewed)},
+            counters=self.trail.counters(self.blackboard),
+        )
+
+    def _run_recon(self, task: str | None = None) -> AgentRun | None:
+        """One recon run. There is no second one: the opening is single-round by design."""
+        outcome = self._agent(
+            agent=agents.RECON,
+            scope_id="workspace",
+            run_id=_opening_run_id(agents.RECON),
+            task=task or agents.recon_task(str(self.workspace), prep=self._snapshot),
+            context=self.context,
+            client=self.client,
+            max_steps=self.config.steps_per_agent,
+            blackboard=self.blackboard,
         )
         if outcome.parsed is None:
             log.warning("harness: recon produced nothing usable (%s)", outcome.error)
@@ -1035,91 +1193,47 @@ class HarnessCoordinator:
         project, architecture = outcome.parsed
         # `workspace` comes from the coordinator, not from the model: it is the identity of the run.
         project.workspace = str(self.workspace)
-        before = self._opening_counts()
-        bb.set_context(self.blackboard, project=project, architecture=architecture)
-        self._publish(agents.RECON, self._opening_growth(before), "recon 的最终结论")
+        with self._board_lock:
+            bb.set_context(self.blackboard, project=project, architecture=architecture)
         return outcome.run
 
-    def _run_threat_model(
-        self, index: int = 1, backlog: list[dict] | None = None
-    ) -> AgentRun | None:
+    def _run_threat_model(self, task: str | None = None) -> AgentRun | None:
+        """One threat-model run from the deterministic survey. No peer read or re-dispatch."""
         if self.blackboard.project is None and self.blackboard.architecture is None:
-            # Threat modelling without recon would be reasoning about a project nobody described.
+            # Threat modelling without the deterministic survey would be reasoning about a project
+            # nobody described.
             # Recorded as a skipped stage rather than run on nothing -- a threat model invented
             # without the architecture map is exactly the generic output this pipeline exists to
             # avoid, and the report has to be able to see that the stage did not run.
             log.warning("harness: no recon findings; skipping the threat-model call")
             self.dataflow_notes.append(
-                "warning: recon produced nothing usable, so the threat-model stage was skipped; "
+                "warning: deterministic survey produced nothing usable, so threat modelling was skipped; "
                 "the plan and the coverage table below are not guided by a threat model"
             )
             return None
         outcome = self._agent(
             agent=agents.THREAT_MODEL,
             scope_id="workspace",
-            run_id=_opening_run_id(agents.THREAT_MODEL, index),
-            task=agents.threat_model_task(
-                self.blackboard, delta=agents.opening_delta_block(backlog or [])
-            ),
+            run_id=_opening_run_id(agents.THREAT_MODEL),
+            task=task or agents.threat_model_task(self.blackboard),
             context=self.context,
             client=self.client,
             max_steps=self.config.steps_per_agent,
             blackboard=self.blackboard,
-            initial_steps=self._opening_reuse() if index >= 2 else None,
         )
         if outcome.parsed is None:
             log.warning("harness: threat model produced nothing usable (%s)", outcome.error)
             return outcome.run
-        before = self._opening_counts()
-        bb.set_context(self.blackboard, threats=outcome.parsed)
-        self._publish(agents.THREAT_MODEL, self._opening_growth(before), "威胁模型的最终结论")
+        with self._board_lock:
+            bb.set_context(self.blackboard, threats=outcome.parsed)
         return outcome.run
-
-    #: The fields an opening agent's next answer can depend on, and therefore the only ones whose growth
-    #: makes the peer stale enough to re-dispatch. Notes and leads are absent because commentary does not
-    #: make a peer's answer wrong -- and `assets`/`actors` joined them after a real run, for a subtler
-    #: reason: they are *descriptions* of the same few things, so two agents writing them will always
-    #: produce more of them, and every pass therefore looked like it had work waiting.
-    #:
-    #: Measured on the demo: pass 2 published an asset, an actor, a note and a lead, all of them
-    #: rephrasings, and the stage reported "未收敛（recon 还有 3 条未读、threat_model 还有 1 条未读）" when
-    #: nothing in those four could have changed either agent's reading of the code. What the pair had
-    #: actually established -- components, trust boundaries, entry points, threats -- both sides had
-    #: already seen. Narrowing the set here does not drop those descriptions: the planner, discovery,
-    #: validation and the report all read the final board. It only stops paying for a third agent run to
-    #: re-read a sentence.
-    SUBSTANTIVE = ("components", "trust_boundaries", "entry_points", "threats")
-
-    def _opening_counts(self) -> dict[str, int]:
-        """How much substantive material is on the board right now, by field."""
-        board = self.blackboard
-        threats = board.threats
-        architecture = board.architecture
-        return {
-            "components": len(getattr(architecture, "components", []) or []),
-            "trust_boundaries": len(getattr(architecture, "trust_boundaries", []) or []),
-            "entry_points": len(board.project.entry_points) if board.project else 0,
-            "assets": len(threats.assets) if threats else 0,
-            "actors": len(threats.actors) if threats else 0,
-            "threats": len(threats.threats) if threats else 0,
-        }
-
-    def _opening_growth(self, before: dict[str, int]) -> list[str]:
-        """Which substantive fields a merge actually added to. Empty means nothing to publish."""
-        after = self._opening_counts()
-        return [field for field in self.SUBSTANTIVE if after.get(field, 0) > before.get(field, 0)]
-
     # ── stage 2: planning ──────────────────────────────────────────────────
 
     def _plan(self) -> list[WorkItem]:
-        """Turn the survey plus the threat model into `WorkItem`s with a stated rationale.
+        """Fix file ownership, then add concrete threat-model investigations.
 
-        The survey always exists, and always before this: `_prepare` ran it before the opening model
-        calls, so this stage reads the scopes it already derived (`_surveyed_scopes`) instead of walking
-        the tree again. Two reasons it must be there regardless: it is what makes the scopes a property
-        of *this* repository rather than of a fixed count, and it is the fallback when the planner call
-        fails -- a run whose planning stage errored must still investigate something, and must say in the
-        ledger that the plan is a fallback.
+        Directory survey entries are architecture context only. On planner failure the complete
+        deterministic file review remains available without another directory investigation layer.
         """
         scopes = self._surveyed_scopes()
         if self.blackboard.architecture is None:
@@ -1143,23 +1257,63 @@ class HarnessCoordinator:
                     notes=[f"{SURVEY_RATIONALE_PREFIX} architecture derived from directory names"],
                 ),
             )
-        items = self._survey_work_items(scopes)
+        file_items = self._coverage_items()
         refined = self._planner_call(scopes)
-        if refined:
-            items = _merge_work_items(items, refined, limit=self.config.max_scopes_per_round)
+        items = sorted(refined, key=lambda item: item.priority)
         # Coverage groups are added *outside* the cap: see `_coverage_items`.
         bb.add_work(
             self.blackboard,
-            [*self._coverage_items(), *items[: self.config.max_scopes_per_round]],
+            [*file_items, *items],
         )
+        self._publish_discovery_tasks()
         # Keep the derived scope list so discovery/closure can re-dispatch the same scope ids.
         self._planned_scopes = [
             item.scope_id
             for item in self.blackboard.work
             if item.state in (WorkItemState.PLANNED, WorkItemState.RUNNING)
+            and item.kind in (WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION)
         ]
         log.info("harness: planned %d scope(s): %s", len(self._planned_scopes), self._planned_scopes)
         return items
+
+    def _publish_discovery_tasks(self) -> None:
+        self.tasks.trail = self.trail
+        for item in self.blackboard.work:
+            if item.kind not in (WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION):
+                continue
+            is_file = item.scope_id.startswith(coverage.COVERAGE_SCOPE_PREFIX)
+            self.tasks.update(
+                item.work_id,
+                kind=WorkItemKind.FILE_REVIEW if is_file else WorkItemKind.INVESTIGATION,
+                files=list(self._scope_files.get(item.scope_id) or []),
+                completion_criteria=item.completion_criteria or "完成归属文件读取、提交调查结果并通过本轮覆盖检查；读取不等于安全检查完成",
+                status_reason="等待派发",
+            )
+
+    def _claim_work(self, members: list[Candidate], kind: WorkItemKind) -> str:
+        candidate = agents.group_representative(members)
+        key = repr(agents.validation_group_key(candidate)).encode("utf-8")
+        work_id = f"W-{kind.value}-{hashlib.sha256(key).hexdigest()[:16]}"
+        self.tasks.trail = self.trail
+        item = self.tasks.add(WorkItem(
+            work_id=work_id, scope_id=candidate.scope_id, kind=kind,
+            title=f"{'验证候选' if kind is WorkItemKind.VALIDATION else '攻击路径'}：{candidate.title}",
+            rationale=candidate.rationale,
+            files=sorted({member.file for member in members}),
+            candidate_ids=[member.candidate_id for member in members],
+            completion_criteria="每项候选有独立裁决和依据" if kind is WorkItemKind.VALIDATION else "记录入口、可达性、影响及限制",
+            status_reason="等待派发",
+        ))
+        self.tasks.link_candidates(item.work_id, [member.candidate_id for member in members])
+        return work_id
+
+    def _claim_allowed(self, members: list[Candidate], kind: WorkItemKind) -> bool:
+        work = self.tasks.get(self._claim_work(members, kind))
+        if len(work.attempts) >= self.config.max_claim_attempts:
+            self.tasks.update(work.work_id, state=WorkItemState.BLOCKED,
+                              status_reason="该项验证/攻击路径重试预算耗尽，保留未完成结果")
+            return False
+        return True
 
     def _surveyed_scopes(self) -> list[survey.Scope]:
         """The scope list the planner works from, surveyed at most once per run.
@@ -1228,15 +1382,7 @@ class HarnessCoordinator:
         return items
 
     def _planner_call(self, scopes: list[survey.Scope]) -> list[WorkItem]:
-        """Ask the planner to confirm or replace the survey's scopes. Empty on any failure.
-
-        Failure is not fatal and is not silent: the survey plan is used, and the ledger's rationale
-        prefix is what tells a reader that the scopes were derived from directory names rather than
-        from the model reading the repository.
-
-        The planner's `files` answer is written back into `_scope_files`, so a planner-created scope
-        is held to the same "read every file you own" coverage rule as a survey scope.
-        """
+        """Validate concrete investigations; file-review assignments cannot be changed."""
         components = [
             {
                 "id": scope.scope_id,
@@ -1249,14 +1395,28 @@ class HarnessCoordinator:
         ]
         task = "\n".join(
             [
-                "A directory-name survey proposed these candidate investigation scopes:",
+                "Directory survey (architecture context, not investigation assignments):",
                 agents._json(components),
-                "Decide which are worth investigating. Return `scopes` with, for each: "
-                "`scope_id` (reuse the survey id when you keep it), `title`, `kind`, `path`, "
-                "`rationale` (why this area, for this threat model), and `files` (the files in it). "
-                "You may split, merge, add or drop scopes when the code justifies it -- but say so "
-                "in the rationale. Also return `excluded`: areas you deliberately do not plan for, "
-                "each with its reason.",
+                "Security inventory (the AI stage's structured read of entry points, authorization "
+                "controls, dangerous capabilities, configuration and dependencies; unverified, "
+                "with its own coverage_gaps):",
+                agents._json(
+                    agents.security_inventory_payload(
+                        self.blackboard.security_inventory, per_section=None
+                    )
+                ),
+                "Create independent operation/asset × security property investigations. Each needs "
+                "scope_id, title, question, rationale, files (concrete source starting points), "
+                "completion_criteria, priority (1 highest, 3 lowest). Architecture and risk names "
+                "are labels, not separate full-repository investigations. Explore proactively using "
+                "the threat model; do not wait for candidates. File review assignments are fixed "
+                "by the coordinator and cannot be removed or renamed. Return excluded with reasons.",
+                agents._json({"file_tasks": [
+                    {"scope_id": key, "files": value} for key, value in self._scope_files.items()
+                    if key.startswith(coverage.COVERAGE_SCOPE_PREFIX)
+                ], "batch_size": self.config.max_scopes_per_round,
+                    "model_concurrency": self.config.concurrency}),
+                "Batch size limits dispatch, not retained tasks or total model budget.",
             ]
         )
         # The opening stage has already read part of this repository, and the planner's second turn is
@@ -1277,20 +1437,30 @@ class HarnessCoordinator:
             initial_steps=reuse or None,
         )
         if outcome.parsed is None:
-            log.warning("harness: planner produced nothing usable (%s); using the survey plan",
+            log.warning("harness: planner produced nothing usable (%s); retaining file review fallback",
                         outcome.error)
+            self.dataflow_notes.append("初始专题规划失败；保留完整文件审查兜底，未生成专题调查。")
             return []
-        planned = outcome.parsed
+        planned = agents._parse_plan(outcome.parsed)
+        inventory = set(coverage.inventory(self.workspace))
         items = [
             WorkItem(
                 work_id=f"W-{scope['scope_id']}",
                 scope_id=str(scope["scope_id"]),
                 title=str(scope.get("title") or scope["scope_id"]),
                 rationale=str(scope.get("rationale") or ""),
+                question=scope["question"],
+                completion_criteria=scope["completion_criteria"],
+                priority=scope["priority"],
+                files=scope["files"],
             )
             for scope in planned.get("scopes", [])
-            if isinstance(scope, dict) and scope.get("scope_id")
+            if all(name in inventory for name in scope["files"])
+            and not scope["scope_id"].startswith(coverage.COVERAGE_SCOPE_PREFIX)
         ]
+        accepted = {item.scope_id for item in items}
+        if not items:
+            self.dataflow_notes.append("初始 Planner 未提供有效专题；保留完整文件审查，主动专题探索未执行。")
         # The planner is asked for each scope's `files` and the list was being dropped. Two things
         # depended on that list and both were silently dead for a planner-created scope: the prefetch
         # above had nothing to reuse (measured: `scope-data-access` carried `files=0` and its
@@ -1301,7 +1471,7 @@ class HarnessCoordinator:
         # item 1 -- a path a model wrote is a string, and nobody has checked it against the workspace.
         inventory = set(coverage.inventory(self.workspace))
         for scope in planned.get("scopes", []):
-            if not isinstance(scope, dict) or not scope.get("scope_id"):
+            if scope.get("scope_id") not in accepted:
                 continue
             named = [
                 str(name) for name in (scope.get("files") or []) if str(name) in inventory
@@ -1338,6 +1508,7 @@ class HarnessCoordinator:
         the coverage table have to be about the same run.
         """
         pending = list(self._planned_scopes)
+        new_by_scope: dict[str, int] = {}
         rounds = max(1, self.config.max_rounds)
         for round_index in range(rounds + 1):
             if not pending:
@@ -1382,11 +1553,48 @@ class HarnessCoordinator:
                 for scope_id in self._planned_scopes
                 if (entry := bb.coverage_of(self.blackboard, scope_id)) is not None
                 and entry.state is CoverageState.INSUFFICIENT
+                and self._needs_discovery(scope_id, new_by_scope)
             ]
+            give_up = [
+                scope_id
+                for scope_id in pending
+                if self._scope_failures.get(scope_id, 0) > self.config.max_scope_retries
+            ]
+            if give_up:
+                # A scope that has failed `max_scope_retries` times is not dispatched again. It stays
+                # INSUFFICIENT in the coverage table -- that is the honest record -- but the run stops
+                # paying an agent to fail at it, and the note says which scopes and why. Measured: 3
+                # scopes ended budget/error in each of the 4 rounds of the module audit.
+                pending = [scope_id for scope_id in pending if scope_id not in give_up]
+                self.dataflow_notes.append(
+                    f"{len(give_up)} scope(s) stopped being re-dispatched after "
+                    f"{self.config.max_scope_retries} failed attempt(s): {', '.join(give_up)} -- "
+                    "their coverage rows stay INSUFFICIENT"
+                )
+            if pending and not self._round_is_worth_it(new_by_scope, pending):
+                self.dataflow_notes.append(
+                    f"stopped after round {round_index}: this round found "
+                    f"{sum(new_by_scope.values())} new place(s), below "
+                    f"{self.config.min_round_yield_ratio:.0%} of everything found so far -- "
+                    f"{len(pending)} scope(s) were still INSUFFICIENT"
+                )
+                pending = []
+            if round_index < rounds:
+                for scope_id in pending:
+                    self.tasks.update(f"W-{scope_id}", state=WorkItemState.PLANNED)
         # Closing sweep. Validation now runs inside every round, so this only catches what a round
         # could not decide (an agent that errored on a candidate leaves it without a verdict), and it
         # is cheap by construction: `_validation` only looks at candidates that have none.
-        self._stage("validation", self._validation)
+        self._follow_leads()
+        self._continue_gaps()
+        self._stage("validation", self._complete_validation)
+        still_open_new_places = {
+            scope: count for scope, count in new_by_scope.items()
+            if (entry := bb.coverage_of(self.blackboard, scope)) is not None
+            and entry.state is CoverageState.INSUFFICIENT
+        }
+        self._close_coverage(self._candidate_map(), round_index=self.rounds_run,
+                             new_by_scope=still_open_new_places)
         if pending:
             # The bound bit. Recorded here because the report has to be able to say "this stopped
             # early", and the coverage rows already carry the reason each scope is still open.
@@ -1396,6 +1604,144 @@ class HarnessCoordinator:
                 "the report below shows what was reached, not a converged picture"
             )
         log.info("harness: discovery/closure finished after %d round(s)", self.rounds_run)
+
+    def _needs_discovery(self, scope_id: str, new_by_scope: dict[str, int]) -> bool:
+        """Validation gaps alone must never restart a completed investigation."""
+        return (
+            not self._covered(scope_id)
+            or self._scope_failures.get(scope_id, 0) > 0
+            or bool(self._unread_in(scope_id))
+            or new_by_scope.get(scope_id, 0) >= max(1, self.config.min_new_places_per_round)
+            or any(item.pending_updates for item in self.blackboard.work
+                   if item.scope_id == scope_id
+                   and item.kind in (WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION))
+        )
+
+    def _record_gap(self, text: str) -> str:
+        work = self.tasks.get(getattr(self._current, "work_id", ""))
+        payload = _json_object(text)
+        if work is None or not payload:
+            raise ValueError("gap 必须关联当前调查任务")
+        if payload.get("gap_id"):
+            linked = {lead.lead_id for lead in self.blackboard.leads if lead.linked_work_id == work.work_id}
+            target = next(((item, gap) for item in self.blackboard.work for gap in item.gaps
+                           if gap.gap_id == payload["gap_id"] and (item.work_id == work.work_id or gap.lead_id in linked)), None)
+            if target is None:
+                raise ValueError("不能修改未分配给当前任务的缺口")
+            owner, gap = target
+            refs = payload.get("evidence_refs")
+            facts = {r.record_id for r in self.blackboard.investigation_records
+                     if r.category == "source_fact" and r.work_id == work.work_id}
+            if payload.get("state") != "resolved" or not isinstance(refs, list) or not refs or any(ref not in facts for ref in refs):
+                raise ValueError("解决已分配缺口需要本任务记录的源码事实证据")
+            gap.state, gap.reason = "resolved", str(payload.get("reason") or "已补充源码检查")
+            gap.evidence_refs = sorted(set(gap.evidence_refs) | set(refs))
+            self.tasks.update(owner.work_id, gaps=owner.gaps)
+            return f"缺口 {gap.gap_id} 已解决"
+        kind, question = payload.get("kind"), payload.get("question")
+        if kind not in {"unread", "basic_check", "relationship", "tool_failure"} or not isinstance(question, str) or not question.strip():
+            raise ValueError("gap 需要具体 kind 和 question")
+        file, line = payload.get("file"), payload.get("line")
+        if file not in set(coverage.inventory(self.workspace)) or type(line) is not int or line < 1:
+            raise ValueError("gap 需要仓库内源码位置")
+        refs = payload.get("evidence_refs", [])
+        facts = {r.record_id for r in self.blackboard.investigation_records if r.category == "source_fact"}
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or ref not in facts for ref in refs):
+            raise ValueError("缺口证据必须引用已记录的源码事实")
+        state = payload.get("state", "pending")
+        if state not in {"pending", "resolved"} or (state == "resolved" and not refs):
+            raise ValueError("解决缺口需要源码事实证据")
+        identity = json.dumps([work.work_id, kind, file, line, " ".join(question.split()).casefold()])
+        gap_id = "G-" + hashlib.sha256(identity.encode()).hexdigest()[:20]
+        gap = next((g for g in work.gaps if g.gap_id == gap_id), None)
+        if gap is not None and gap.state == "resolved":
+            return "已解决的重复缺口不重启调查"
+        created = gap is None
+        if gap is None:
+            gap = WorkGap(gap_id=gap_id, kind=kind, question=question.strip(), file=file, line=line)
+            work.gaps.append(gap)
+        before = gap.model_dump()
+        gap.evidence_refs = sorted(set(gap.evidence_refs) | set(refs))
+        gap.state = state
+        gap.reason = str(payload.get("reason") or "待补充具体检查")
+        if kind == "relationship" and state == "pending" and not gap.lead_id:
+            self._apply_record("lead", json.dumps(dict(to_scope="investigation", question=question,
+                               file=file, line=line, evidence_refs=refs)), work.scope_id)
+            gap.lead_id = self.blackboard.leads[-1].lead_id
+        if before != gap.model_dump() or created:
+            self.tasks.update(work.work_id, gaps=work.gaps)
+        return f"缺口 {gap_id}：{state}"
+
+    def _progress_key(self, work: WorkItem) -> tuple:
+        # Titles and free-text reasons do not count as new evidence.
+        ranges = coverage.unread_ranges(work.files, coverage.from_runs(self.blackboard.runs))
+        return (tuple((name, tuple(windows)) for name, windows in sorted(ranges.items())),
+                tuple(sorted({(r.file, r.line) for r in self.blackboard.investigation_records
+                              if r.work_id == work.work_id and r.category == "source_fact"})),
+                tuple(sorted(g.gap_id for g in work.gaps if g.state == "resolved")))
+
+    def _continue_gaps(self) -> None:
+        for turn in range(max(0, self.config.max_gap_continuations)):
+            runnable = []
+            before = {}
+            for work in self.blackboard.work:
+                pending = [g for g in work.gaps if g.state == "pending" and g.kind != "relationship"]
+                if not pending or work.state in {WorkItemState.CANCELED, WorkItemState.RUNNING}:
+                    continue
+                if (work.gap_continuations >= self.config.max_gap_continuations
+                        or work.no_progress_continuations >= self.config.max_no_progress_continuations):
+                    for gap in pending:
+                        gap.state, gap.reason = "blocked", "缺口续查次数耗尽或没有新的源码证据"
+                    self.tasks.update(work.work_id, gaps=work.gaps, state=WorkItemState.BLOCKED,
+                                      status_reason="具体缺口受阻，已有证据保留")
+                    continue
+                before[work.work_id] = self._progress_key(work)
+                self.tasks.update(work.work_id, state=WorkItemState.PLANNED,
+                                  gap_continuations=work.gap_continuations + 1)
+                runnable.append(work.scope_id)
+            if not runnable:
+                break
+            self._discover(runnable, round_index=f"gap:{turn}")
+            for work_id, old in before.items():
+                work = self.tasks.get(work_id)
+                stalled = old == self._progress_key(work)
+                self.tasks.update(work_id, no_progress_continuations=(work.no_progress_continuations + 1 if stalled else 0))
+            self._stage("validation", self._validation)
+            self._follow_leads()
+        for work in self.blackboard.work:
+            for gap in work.gaps:
+                if gap.state == "pending" and gap.kind != "relationship":
+                    gap.state, gap.reason = "blocked", "本次缺口续查已停止，保留未完成检查"
+            if work.gaps:
+                self.tasks.update(work.work_id, gaps=work.gaps)
+
+    def _round_is_worth_it(self, new_by_scope: dict[str, int], pending: list[str]) -> bool:
+        """Whether another round is worth paying for, by marginal yield rather than by "not converged".
+
+        The clause this replaces let the loop run to `max_rounds` on a *technicality*: as long as one
+        scope anywhere found two new places, the run had "somewhere not yet looked at". With 42 scopes
+        that is almost always true, so the last rounds were decided by the round bound, not by the
+        evidence -- measured: rounds 2 and 3 cost 25 minutes and returned 19 of 161 confirmed findings.
+
+        Two things are deliberately *not* stopped by it:
+
+        * a scope whose files nobody has opened. That is not a marginal-yield question -- the next
+          round has a known target (those files) rather than a guess -- so a concrete unread backlog
+          keeps the loop alive;
+        * anything at all when `min_round_yield_ratio` is 0, which restores the old behaviour.
+        """
+        ratio = self.config.min_round_yield_ratio
+        if ratio <= 0:
+            return True
+        for scope_id in pending:
+            entry = bb.coverage_of(self.blackboard, scope_id)
+            if entry is not None and UNREAD_REASON_MARKER in (entry.reason or ""):
+                return True
+        found_now = sum(new_by_scope.values())
+        places = {(candidate.file, candidate.line) for candidate in self.blackboard.candidates}
+        if not places:
+            return True
+        return found_now >= ratio * len(places)
 
     def _discover(self, scope_ids: list[str], *, round_index: int) -> dict[str, int]:
         """Run discovery for each scope, bounded by `concurrency`, each stopping at its bound.
@@ -1416,8 +1762,11 @@ class HarnessCoordinator:
         Reuse happens in **every** round, round 0 included: a file another scope already read
         completely is the same bytes, and re-fetching it costs a round trip per scope.
         """
-        items = {item.scope_id: item for item in self.blackboard.work}
-        work = [items[scope_id] for scope_id in scope_ids if scope_id in items]
+        items = {
+            item.scope_id: item for item in self.blackboard.work
+            if item.kind in (WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION)
+        }
+        work = sorted([items[scope_id] for scope_id in scope_ids if scope_id in items], key=lambda item: item.priority)
         if not work:
             return {}
         new_by_scope: dict[str, int] = {}
@@ -1426,7 +1775,25 @@ class HarnessCoordinator:
         positions = {item.scope_id: index for index, item in enumerate(work)}
 
         def one(item: WorkItem) -> None:
+            if item.state is WorkItemState.CANCELED:
+                return
+            try:
+                _discover_one(item)
+            except Exception:
+                # A run that raised (an unreachable gateway, a broken tool) never reached the
+                # bookkeeping below, so the failure is counted here -- otherwise a scope whose agent
+                # dies every round looks like a scope nobody ever tried to run.
+                self._scope_failures[item.scope_id] = (
+                    self._scope_failures.get(item.scope_id, 0) + 1
+                )
+                raise
+
+        def _discover_one(item: WorkItem) -> None:
+            with self._board_lock:
+                initial_places = {(c.file, c.line) for c in self.blackboard.candidates if c.scope_id == item.scope_id}
             owned = self._scope_files.get(item.scope_id) or []
+            previous_reads = coverage.from_runs(self.blackboard.runs)
+            self.tasks.update(item.work_id, unread_ranges=coverage.unread_ranges(owned, previous_reads))
             prefetched_steps: list[AgentStep] = []
             prefetched_files: list[str] = []
             skipped_files: list[str] = []
@@ -1447,6 +1814,8 @@ class HarnessCoordinator:
             # whose context is the workspace.
             if owned:
                 wanted = (self._unread_in(item.scope_id) or owned) if round_index else owned
+                if round_index:
+                    wanted = [name for name in wanted if name not in previous_reads or previous_reads[name].fully_read]
                 (
                     prefetched_steps,
                     reused_files,
@@ -1464,7 +1833,7 @@ class HarnessCoordinator:
                 task=agents.discovery_task(
                     self.blackboard,
                     item,
-                    attempt=round_index + 1,
+                    attempt=round_index + 1 if isinstance(round_index, int) else 2,
                     files=assigned,
                     reused=reused_files,
                     prefetched=prefetched_files,
@@ -1476,10 +1845,10 @@ class HarnessCoordinator:
                 blackboard=self.blackboard,
                 run_id=f"discovery:{item.scope_id}:r{round_index}",
                 initial_steps=prefetched_steps or None,
-                extra_system=agents.discovery_extra_system(
+                extra_system="Pending task updates (read BOARD before finishing): " + agents._json(item.pending_updates) + "\n" + agents.discovery_extra_system(
                     self.blackboard,
                     item.scope_id,
-                    index=positions.get(item.scope_id, 0) + round_index,
+                    index=positions.get(item.scope_id, 0) + (round_index if isinstance(round_index, int) else 0),
                     files=self._scope_files.get(item.scope_id),
                 ),
             )
@@ -1494,15 +1863,15 @@ class HarnessCoordinator:
             # is whether the scope found somewhere **new to look at**, and a second opinion about a
             # line already in the ledger is not that -- see `_close_coverage` for the measurement
             # that made this distinction necessary.
-            seen_before = {
-                (candidate.file, candidate.line)
-                for candidate in self.blackboard.candidates
-                if candidate.scope_id == item.scope_id
-            }
-            added = self._record_candidates(found[: self.config.candidates_per_scope])
-            new_by_scope[item.scope_id] = len(
-                {(candidate.file, candidate.line) for candidate in added} - seen_before
-            )
+            with self._board_lock:
+                existing = {c.candidate_id for c in self.blackboard.candidates if c.scope_id == item.scope_id}
+                remaining_budget = max(0, self.config.candidates_per_scope - len(existing))
+                accepted = [c for c in found if c.candidate_id in existing]
+                accepted.extend([c for c in found if c.candidate_id not in existing][:remaining_budget])
+                self._record_candidates(accepted)
+                new_by_scope[item.scope_id] = len(
+                    {(c.file, c.line) for c in self.blackboard.candidates if c.scope_id == item.scope_id} - initial_places
+                )
             # `DONE` is what marks the scope as looked at; a run that hit its step budget still
             # looked, and `stop_reason` in the transcript is what says it stopped early. Only an
             # outright error leaves the item ABANDONED, which closes the scope as uncovered.
@@ -1513,9 +1882,217 @@ class HarnessCoordinator:
                 state=WorkItemState.DONE if finished else WorkItemState.ABANDONED,
                 steps_used=len(outcome.run.steps),
             )
+            with self._board_lock:
+                consumed = getattr(self._current, "consumed_updates", set()) if finished and outcome.parsed is not None else set()
+                remaining = [lead_id for lead_id in item.pending_updates if lead_id not in consumed]
+                for lead in self.blackboard.leads:
+                    if lead.lead_id in consumed:
+                        lead.status = "handled"
+                        self.trail.emit("record", record_kind="lead_status", scope=item.scope_id,
+                                        text=f"{lead.question}：handled", lead=lead.model_dump(mode="json"), work_id=item.work_id)
+                self.tasks.update(item.work_id, pending_updates=remaining,
+                                  state=WorkItemState.PLANNED if remaining else item.state,
+                                  status_reason="仍有待处理线索" if remaining else "本次调查已结束，等待覆盖检查")
+                if consumed or remaining:
+                    bb.save(self.blackboard, self.run_dir)
+            # Counted per scope, so a scope that fails every round can be dropped from the re-dispatch
+            # list instead of being paid for again: measured on the module audit, 3 scopes ended
+            # budget/error in every one of the 4 rounds, and each was re-dispatched anyway.
+            self._scope_failures[item.scope_id] = (
+                0 if finished else self._scope_failures.get(item.scope_id, 0) + 1
+            )
 
-        self._bounded(work, one, label="discovery")
+        batch_size = max(1, self.config.max_scopes_per_round)
+        for offset in range(0, len(work), batch_size):
+            work[offset:] = sorted(work[offset:], key=lambda item: item.priority)
+            self._bounded(work[offset:offset + batch_size], one, label="discovery")
         return new_by_scope
+
+    def _plan_inbox(self, *, force: bool = False, idle: bool = False) -> None:
+        """Snapshot/commit only known pending leads. Failure never acknowledges the snapshot."""
+        if not self._planner_lock.acquire(blocking=False):
+            return
+        try:
+            with self._board_lock:
+                pending = [lead for lead in self.blackboard.leads if lead.status == "pending"]
+                if not pending or self._planner_calls >= self.config.planner_calls:
+                    return
+                now = _now()
+                oldest = min(lead.raised_at for lead in pending)
+                due = (now - oldest).total_seconds() >= self.config.planner_wait_seconds
+                if not force and not due and not idle:
+                    return
+                if not idle and not due and self._planner_last_at and (now - self._planner_last_at).total_seconds() < self.config.planner_min_interval:
+                    return
+                snapshot = {lead.lead_id: lead.model_copy(deep=True) for lead in pending[:40]}
+                directory = [{"work_id": w.work_id, "title": w.title, "state": w.state.value,
+                              "kind": w.kind.value, "files": w.files, "completion_criteria": w.completion_criteria,
+                              "question": w.question, "priority": w.priority}
+                             for w in self.blackboard.work]
+                refs = {ref for lead in snapshot.values() for ref in lead.evidence_refs}
+                evidence = [r.model_dump(mode="json") for r in self.blackboard.investigation_records if r.record_id in refs]
+                self._planner_calls += 1
+                self._planner_last_at = now
+            outcome = self._agent(
+                agent=agents.PLAN_UPDATE, scope_id="plan-inbox", context=self.context,
+                client=self.client, max_steps=min(3, self.config.steps_per_agent),
+                run_id=f"planner-inbox:{self._planner_calls}",
+                task=agents._json({"tasks": directory, "leads": [v.model_dump(mode="json") for v in snapshot.values()],
+                                   "evidence": evidence, "budget": self.budget.snapshot(),
+                                   "remaining_planner_calls": self.config.planner_calls - self._planner_calls}),
+            )
+            if not isinstance(outcome.parsed, dict):
+                return
+            decisions = outcome.parsed.get("decisions")
+            if not isinstance(decisions, list):
+                return
+            inventory = set(coverage.inventory(self.workspace))
+            # Validate the complete response before applying any decision.
+            seen = set()
+            for decision in decisions:
+                if not isinstance(decision, dict):
+                    return
+                lead_id, action = decision.get("lead_id"), decision.get("action")
+                if not isinstance(lead_id, str) or not isinstance(action, str) or lead_id not in snapshot or lead_id in seen or action not in {"link", "create", "defer", "dismiss", "priority", "merge"} or not isinstance(decision.get("reason"), str) or not decision["reason"].strip():
+                    return
+                seen.add(lead_id)
+                if action in {"link", "priority", "merge"}:
+                    if not isinstance(decision.get("work_id"), str):
+                        return
+                    work = self.tasks.get(decision.get("work_id", ""))
+                    if work is None or work.kind not in {WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION} or work.state is WorkItemState.CANCELED:
+                        return
+                    if action in {"priority", "merge"} and work.state is not WorkItemState.PLANNED:
+                        return
+                if "priority" in decision and (type(decision["priority"]) is not int or decision["priority"] not in (1, 2, 3)):
+                    return
+                if action == "priority" and "priority" not in decision:
+                    return
+                if action == "merge":
+                    source = self.tasks.get(decision.get("source_work_id", ""))
+                    if (source is None or source.work_id == work.work_id
+                            or source.kind is not WorkItemKind.INVESTIGATION or source.state is not WorkItemState.PLANNED
+                            or source.attempts or source.gaps or work.kind is not WorkItemKind.INVESTIGATION
+                            or set(source.files) != set(work.files)
+                            or " ".join((source.question or source.title).split()).casefold() != " ".join((work.question or work.title).split()).casefold()):
+                        return
+                if action == "create":
+                    files = decision.get("files")
+                    if not isinstance(files, list) or not files or any(not isinstance(f, str) or f not in inventory for f in files):
+                        return
+                    if not all(isinstance(decision.get(key), str) and decision[key].strip() for key in ("title", "completion_criteria")):
+                        return
+            with self._board_lock:
+                for decision in decisions:
+                    lead = next(entry for entry in self.blackboard.leads if entry.lead_id == decision["lead_id"])
+                    if lead.status != "pending" or lead.sequence != snapshot[lead.lead_id].sequence:
+                        continue
+                    action = decision["action"]
+                    if action in {"link", "priority", "merge"}:
+                        target = self.tasks.get(decision["work_id"])
+                        if target.state is WorkItemState.CANCELED or (action != "link" and target.state is not WorkItemState.PLANNED):
+                            continue
+                    if action == "merge":
+                        source = self.tasks.get(decision["source_work_id"])
+                        if source.state is not WorkItemState.PLANNED or source.attempts or source.gaps:
+                            continue
+                        updates = list(dict.fromkeys([*target.pending_updates, *source.pending_updates]))
+                        self.tasks.update(target.work_id, pending_updates=updates)
+                        self.tasks.update(source.work_id, state=WorkItemState.CANCELED, merged_into=target.work_id,
+                                          pending_updates=[], status_reason=decision["reason"])
+                        bb.set_coverage(self.blackboard, source.scope_id, CoverageState.EXCLUDED,
+                                        reason=f"重复待办已合并到 {target.work_id}：{decision['reason']}")
+                        self._planned_scopes = [scope for scope in self._planned_scopes if scope != source.scope_id]
+                        for previous in self.blackboard.leads:
+                            if previous.linked_work_id == source.work_id:
+                                previous.linked_work_id = target.work_id
+                                self.trail.emit("record", record_kind="lead_status", lead=previous.model_dump(mode="json"))
+                    lead.processing_reason = str(decision["reason"])
+                    if action in {"dismiss", "defer"}:
+                        lead.status = "dismissed" if action == "dismiss" else "deferred"
+                    else:
+                        if action == "create":
+                            question_key = " ".join(lead.question.split()).casefold()
+                            existing = next((w for w in self.blackboard.work
+                                             if w.kind is WorkItemKind.INVESTIGATION and not w.merged_into
+                                             and " ".join(w.question.split()).casefold() == question_key
+                                             and set(w.files) == set(decision["files"])), None)
+                            scope_id = existing.scope_id if existing else "lead-" + lead.lead_id
+                            work = self.tasks.add(WorkItem(
+                                work_id=f"W-{scope_id}", scope_id=scope_id, title=str(decision["title"]),
+                                rationale=lead.processing_reason, files=decision["files"],
+                                completion_criteria=str(decision["completion_criteria"]),
+                                question=lead.question, priority=decision.get("priority", 2),
+                            ))
+                            self._scope_files[scope_id] = list(work.files)
+                            if scope_id not in self._planned_scopes:
+                                self._planned_scopes.append(scope_id)
+                        else:
+                            work = self.tasks.get(decision["work_id"])
+                        if action == "priority":
+                            self.tasks.update(work.work_id, priority=decision["priority"])
+                        lead.status = "linked"
+                        lead.linked_work_id = work.work_id
+                        duplicate = next((previous for previous in self.blackboard.leads
+                                          if previous.lead_id != lead.lead_id and previous.linked_work_id == work.work_id
+                                          and previous.status == "handled" and previous.file == lead.file and previous.line == lead.line
+                                          and " ".join(previous.question.split()).casefold() == " ".join(lead.question.split()).casefold()
+                                          and set(lead.evidence_refs) <= set(previous.evidence_refs)), None)
+                        if duplicate:
+                            lead.status, lead.processing_reason = "dismissed", "相同起点、问题与证据的线索已处理，不重新启动调查"
+                            self.blackboard.revision += 1
+                            self.trail.emit("record", record_kind="lead_status", lead=lead.model_dump(mode="json"))
+                            continue
+                        if work.state is WorkItemState.CANCELED:
+                            lead.status, lead.processing_reason = "deferred", "相同任务已取消，不自动重启"
+                            self.blackboard.revision += 1
+                            self.trail.emit("record", record_kind="lead_status", lead=lead.model_dump(mode="json"))
+                            continue
+                        updates = list(dict.fromkeys([*work.pending_updates, lead.lead_id]))
+                        self.tasks.update(work.work_id, pending_updates=updates,
+                                          status_reason=f"线索待处理：{lead.question}；{lead.processing_reason}")
+                        if work.state is not WorkItemState.RUNNING:
+                            self.tasks.update(work.work_id, state=WorkItemState.PLANNED)
+                    self.blackboard.revision += 1
+                    self.trail.emit("record", record_kind="lead_status", scope=lead.to_scope,
+                                    text=f"{lead.question}：{lead.status}；{lead.processing_reason}",
+                                    lead=lead.model_dump(mode="json"), work_id=lead.linked_work_id)
+                bb.save(self.blackboard, self.run_dir)
+        except Exception as exc:
+            self.trail.emit("record", record_kind="planner_error", text=f"Planner 失败，收件箱保留：{exc}")
+        finally:
+            self._planner_lock.release()
+
+    def _follow_leads(self) -> None:
+        """Bounded known-gap sweep, reusing original tasks and retaining blocked updates."""
+        for turn in range(self.config.planner_calls + self.config.max_lead_continuations + 1):
+            self.check_abort("lead-followup")
+            before_calls = self._planner_calls
+            self._plan_inbox(force=True, idle=True)
+            runnable = []
+            with self._board_lock:
+                for work in self.blackboard.work:
+                    if not work.pending_updates or work.state in {WorkItemState.CANCELED, WorkItemState.RUNNING}:
+                        continue
+                    continuations = sum(":rlead:" in a.run_id for a in work.attempts)
+                    if continuations >= self.config.max_lead_continuations:
+                        self.tasks.update(work.work_id, state=WorkItemState.BLOCKED, status_reason="线索续查次数耗尽，未处理更新保留")
+                        continue
+                    runnable.append(work.scope_id)
+            if not runnable:
+                if self._planner_calls > before_calls and any(entry.status == "pending" for entry in self.blackboard.leads):
+                    continue
+                break
+            self._discover(runnable, round_index=f"lead:{turn}")
+            self._stage("validation", self._validation)
+            self._close_coverage(self._candidate_map(), round_index=turn, new_by_scope={})
+
+        if self._planner_calls >= self.config.planner_calls:
+            for lead in self.blackboard.leads:
+                if lead.status == "pending" and not lead.processing_reason:
+                    lead.processing_reason = "Planner 调用预算耗尽；未处理事件保留"
+                    self.blackboard.revision += 1
+                    self.trail.emit("record", record_kind="lead_status", lead=lead.model_dump(mode="json"))
 
     def _candidate_map(self) -> dict[str, list[Candidate]]:
         out: dict[str, list[Candidate]] = {}
@@ -1536,6 +2113,45 @@ class HarnessCoordinator:
         """
         added: list[Candidate] = []
         for candidate in candidates:
+            group = [c for c in self.blackboard.candidates
+                     if agents.validation_group_key(c) == agents.validation_group_key(candidate)]
+            def facts(members):
+                return {" ".join(value.split()).casefold() for member in members
+                        for value in [*member.evidence, *member.entry_points] if value.strip()}
+            new_facts = facts([candidate]) - facts(group)
+            old = bb.find_candidate(self.blackboard, candidate.candidate_id)
+            version = max((c.evidence_version for c in group), default=1)
+            if group and new_facts:
+                version += 1
+                ids = {c.candidate_id for c in group}
+                for existing in group:
+                    existing.evidence_version = version
+                self.blackboard.verdict_history.extend(v for v in self.blackboard.verdicts if v.candidate_id in ids)
+                self.blackboard.attack_path_history.extend(p for p in self.blackboard.attack_paths if p.candidate_id in ids)
+                self.blackboard.verdicts = [v for v in self.blackboard.verdicts if v.candidate_id not in ids]
+                for entry in self.blackboard.coverage:
+                    entry.confirmed = sum(1 for c in self.blackboard.candidates if c.scope_id == entry.scope_id
+                                          and (v := bb.find_verdict(self.blackboard, c.candidate_id)) is not None
+                                          and v.verdict is VerdictKind.CONFIRMED)
+                self.blackboard.attack_paths = [p for p in self.blackboard.attack_paths if p.candidate_id not in ids]
+                self.blackboard.findings = [f for f in self.blackboard.findings if f.candidate_id not in ids]
+                for kind in (WorkItemKind.VALIDATION, WorkItemKind.ATTACK_PATH):
+                    if kind is WorkItemKind.ATTACK_PATH and not any(
+                        w.kind is kind and ids.intersection(w.candidate_ids) for w in self.blackboard.work
+                    ):
+                        continue
+                    work_id = self._claim_work(group, kind)
+                    self.tasks.update(work_id, state=WorkItemState.PLANNED if kind is WorkItemKind.VALIDATION else WorkItemState.BLOCKED,
+                                      status_reason=f"关键证据已更新至版本 {version}，等待重新验证")
+                self.trail.emit("record", record_kind="evidence_changed", candidate_ids=sorted(ids),
+                                evidence_version=version, text="新增入口或证据，旧裁决和攻击路径已归档")
+                self.blackboard.revision += 1
+            candidate.evidence_version = version
+            if old is not None:
+                old.evidence = list(dict.fromkeys([*old.evidence, *candidate.evidence]))
+                old.entry_points = list(dict.fromkeys([*old.entry_points, *candidate.entry_points]))
+                old.evidence_version = version
+                continue
             if bb.add_candidate(self.blackboard, candidate):
                 added.append(candidate)
                 self.trail.emit(
@@ -1547,6 +2163,7 @@ class HarnessCoordinator:
                     vulnerability_type=candidate.vulnerability_type,
                     title=trail_mod.clip(candidate.title, 200),
                     method=candidate.method,
+                    evidence_version=candidate.evidence_version,
                 )
         return added
 
@@ -1599,11 +2216,28 @@ class HarnessCoordinator:
             if entry is not None and entry.state is CoverageState.EXCLUDED:
                 continue
             candidates = candidates_by_scope.get(scope_id, [])
+            work = self.tasks.get(f"W-{scope_id}")
+            gaps = [g for g in work.gaps if g.state != "resolved"] if work else []
+            if gaps:
+                bb.set_coverage(self.blackboard, scope_id, CoverageState.INSUFFICIENT,
+                                reason="未完成检查：" + "；".join(g.question + "（" + g.reason + "）" for g in gaps))
+                continue
             if not self._covered(scope_id):
-                reason = (
-                    f"第 {round_index} 轮：没有任何 discovery 看过这个 scope"
-                    "（没有对应的工作项，或其 agent 以 error/budget 结束），因此它是未覆盖的"
-                )
+                latest = work.attempts[-1] if work and work.attempts else None
+                if latest is not None and latest.stop_reason == "error":
+                    total = len(work.files)
+                    read = work.read_files
+                    reason = (
+                        f"第 {round_index} 轮：没有任何 discovery 成功完成；"
+                        f"已完整读取 {read}/{total} 个归属文件，"
+                        f"但 discovery 执行失败，未产生可用于覆盖结论的最终回答："
+                        f"{latest.error or '未知执行错误'}"
+                    )
+                else:
+                    reason = (
+                        f"第 {round_index} 轮：没有成功完成的 discovery"
+                        "（没有对应工作项，或 agent 以 error/budget 结束），因此它是未覆盖的"
+                    )
                 bb.set_coverage(self.blackboard, scope_id, CoverageState.INSUFFICIENT, reason=reason)
                 continue
             discovered_now = new_by_scope.get(scope_id, 0)
@@ -1626,7 +2260,7 @@ class HarnessCoordinator:
                 listed = "、".join(unread[:6]) + ("…" if len(unread) > 6 else "")
                 reason = (
                     f"第 {round_index} 轮：本 scope 还有 {len(unread)} 个文件从未被完整读取"
-                    f"（{listed}）；覆盖率按 read 调用台账计算，搜索命中不算审完"
+                    f"（{listed}）；{UNREAD_REASON_MARKER}，搜索命中不算审完"
                 )
                 bb.set_coverage(self.blackboard, scope_id, CoverageState.INSUFFICIENT, reason=reason)
                 continue
@@ -1667,6 +2301,16 @@ class HarnessCoordinator:
             entry = bb.coverage_of(self.blackboard, scope_id)
             if entry is None:
                 continue
+            self.tasks.update(
+                f"W-{scope_id}",
+                state=WorkItemState.DONE if entry.state is CoverageState.SUFFICIENT else (
+                    WorkItemState.CANCELED if entry.state is CoverageState.EXCLUDED else WorkItemState.BLOCKED
+                ),
+                status_reason=entry.reason,
+                read_files=len(self._scope_files.get(scope_id) or []) - len(self._unread_in(scope_id)),
+                unread_ranges=coverage.unread_ranges(self._scope_files.get(scope_id) or [], coverage.from_runs(self.blackboard.runs)),
+                candidate_ids=[c.candidate_id for c in self.blackboard.candidates if c.scope_id == scope_id],
+            )
             self.trail.emit(
                 "coverage",
                 scope=scope_id,
@@ -1701,13 +2345,38 @@ class HarnessCoordinator:
         items = [item for item in self.blackboard.work if item.scope_id == scope_id]
         if not items:
             return False
-        return any(item.state is WorkItemState.DONE for item in items)
+        return any(
+            (item.state is WorkItemState.DONE if not item.attempts else any(
+                attempt.agent == agents.DISCOVERY and not attempt.error
+                and attempt.stop_reason in ("finished", "budget")
+                for attempt in item.attempts
+            ))
+            for item in items
+            if item.kind in (WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION)
+        )
+
+    def _complete_validation(self) -> None:
+        for _ in range(max(1, self.config.max_claim_attempts)):
+            before = sum(len(w.attempts) for w in self.blackboard.work if w.kind is WorkItemKind.VALIDATION)
+            self._validation()
+            after = sum(len(w.attempts) for w in self.blackboard.work if w.kind is WorkItemKind.VALIDATION)
+            if before == after:
+                break
 
     def _validation(self) -> None:
-        """Validate every candidate that does not already have a verdict.
+        """Validate every *claim* that does not already have a verdict.
 
-        Idempotent by construction: the input is "candidates without verdicts", so re-entering this
-        stage (a resumed run) validates only what is missing instead of re-deciding and appending.
+        Idempotent by construction: the input is "claims without verdicts", so re-entering this stage
+        (a resumed run, or the next discovery round) validates only what is missing instead of
+        re-deciding and appending.
+
+        **By claim, not by candidate id, and that distinction cost 41 agent runs.** Measured on the
+        `upp-module-infra` audit: 139 validation runs for 98 distinct claims. The extra 41 are the same
+        position re-registered in a later round -- discovery files an instance the round before did not
+        name, `find_verdict` is asked about *that* `candidate_id`, gets None, and the claim is paid for
+        a second and third time. The decision for a location is a property of the location, so a new
+        instance inherits it; it is copied rather than skipped, because a candidate with no verdict
+        would hold its scope INSUFFICIENT forever.
         """
         pending = [
             candidate
@@ -1717,14 +2386,228 @@ class HarnessCoordinator:
         if not pending:
             return
 
+        # What each already-decided location was decided as. Built from the ledger, not from a second
+        # source of truth: the verdicts are the decisions this run actually paid for.
+        decided: dict[tuple[str, int | None, str], CandidateVerdict] = {}
+        for candidate in self.blackboard.candidates:
+            verdict = bb.find_verdict(self.blackboard, candidate.candidate_id)
+            if verdict is not None:
+                decided.setdefault(agents.validation_group_key(candidate), verdict)
+
+        inherited = 0
+        undecided: list[Candidate] = []
+        for candidate in pending:
+            verdict = decided.get(agents.validation_group_key(candidate))
+            if verdict is None:
+                undecided.append(candidate)
+                continue
+            copy = verdict.model_copy(deep=True)
+            copy.reasons = [
+                *copy.reasons,
+                f"同一位置（{candidate.file}:{candidate.line}）此前已有裁决，"
+                "本条作为该位置的后续记录继承结论，没有为同一位置重复付费",
+            ]
+            self._apply_verdict([candidate], copy)
+            inherited += 1
+        if inherited:
+            log.info(
+                "harness: %d candidate(s) inherited an existing verdict for their own location; "
+                "%d claim(s) still need one",
+                inherited,
+                len(undecided),
+            )
+        pending = undecided
+        if not pending:
+            return
+
         # One validation per *claim*, not per recorded instance. The ledger keeps every instance --
         # coverage is counted per scope and a scope whose candidate carried no verdict would stay
         # INSUFFICIENT forever -- but the decision is paid for once and copied, which is what turns
         # 106 candidates into 56 agent runs without touching the closure rule.
         groups = agents.validation_groups(pending)
+        groups = {key: members for key, members in groups.items()
+                  if self._claim_allowed(members, WorkItemKind.VALIDATION)}
+        for members in groups.values():
+            self._claim_work(members, WorkItemKind.VALIDATION)
+        if self.config.claim_batch_size > 1:
+            self._validation_batched(groups)
+            return
 
         def one(members: list[Candidate]) -> None:
-            candidate = agents.group_representative(members)
+            self._validation_single(members)
+
+        self._bounded(list(groups.values()), one, label="validation")
+
+    def _apply_verdict(self, members: list[Candidate], verdict: CandidateVerdict) -> None:
+        """Record one decision for every instance of the claim it was reached for.
+
+        Split out of `_validation` because the batched path reaches decisions too, and the property
+        that matters -- *every* instance carries the verdict, with the merge made visible in
+        `reasons` -- has to hold identically on both paths. A batch that recorded the verdict only for
+        the representative would leave the other instances undecided, which the closure rule reads as
+        "this scope was not looked at", and the run would re-dispatch it forever.
+        """
+        candidate = agents.group_representative(members)
+        for member in members:
+            copy = verdict.model_copy(deep=True)
+            copy.candidate_id = member.candidate_id
+            copy.evidence_version = member.evidence_version
+            if len(members) > 1:
+                copy.reasons = [
+                    *copy.reasons,
+                    f"由同一位置（{candidate.file}:{candidate.line}，共 {len(members)} 条实例）"
+                    "的一次验证统一判定",
+                ]
+            bb.add_verdict(self.blackboard, copy)
+            self.trail.emit(
+                "verdict",
+                candidate_id=copy.candidate_id,
+                scope=member.scope_id,
+                file=member.file,
+                line=member.line,
+                vulnerability_type=member.vulnerability_type,
+                verdict=copy.verdict.value,
+                evidence_kind=copy.evidence_kind.value,
+                confidence=copy.confidence,
+                merged_from=len(members),
+                reason=trail_mod.clip("；".join(copy.reasons[:2])),
+            )
+        self.tasks.update(
+            self._claim_work(members, WorkItemKind.VALIDATION),
+            state=WorkItemState.DONE,
+            status_reason=f"{verdict.verdict.value}：{'；'.join(verdict.reasons)}",
+        )
+        if verdict.verdict is VerdictKind.REJECTED:
+            ids = {member.candidate_id for member in members}
+            for work in self.blackboard.work:
+                if work.kind is WorkItemKind.ATTACK_PATH and ids.intersection(work.candidate_ids):
+                    self.tasks.update(work.work_id, state=WorkItemState.CANCELED,
+                                      status_reason="当前证据版本的候选已排除，无需补攻击路径")
+
+    @staticmethod
+    def _prefetch_derived(step: Any) -> bool:
+        """Whether a harness-run `dataflow_verify` produced a path this run must carry itself.
+
+        A trace that derived a path is typed evidence attached to *the run it happened in*, so a claim
+        holding one cannot share a run with other claims. A trace that failed, or that the worker could
+        not answer, leaves nothing to attribute -- which is what makes batching such a claim safe.
+        """
+        if step is None or getattr(step, "result", None) is None or not step.result.ok:
+            return False
+        evidence = (step.result.data or {}).get("evidence") or {}
+        return bool(evidence.get("path")) and not evidence.get("error")
+
+    def _validation_batched(self, groups: dict[tuple[str, int | None, str], list[Candidate]]) -> None:
+        """Validate several *different* claims per run, each with its own verdict.
+
+        Batching changes what a run reads, never how a claim is decided: the decisions are copied to
+        every instance by the same `_apply_verdict` the single-claim path uses, and a batch that
+        cannot settle a claim by reading says `needs_dataflow` for it and is re-run alone with the
+        trace tool. See `agents.pack_claim_batches` for how the batches are packed (material overlap,
+        deep claims alone) and `HarnessConfig.claim_batch_size` for why this is off by default.
+        """
+        from services.harness import material
+
+        def files_of(candidate: Candidate) -> list[str]:
+            return material.files_for(candidate)
+
+        # A claim whose *prefetch derived a path* runs alone: the path is typed evidence attached while
+        # the run is happening (`dataflow_evidence` reads the last trace in the run), and one run
+        # cannot attribute one trace to four claims. A taint-*shaped* claim whose prefetch produced
+        # nothing has no such evidence to mis-attribute, so it is batchable -- and a batch that turns
+        # out to need a trace for it answers `needs_dataflow` and gets a second, tool-rich run.
+        singleton: list[list[Candidate]] = []
+        batchable: list[list[Candidate]] = []
+        prefetched_by_id: dict[str, Any] = {}
+        for group in groups.values():
+            candidate = agents.group_representative(group)
+            if agents.is_taint_candidate(candidate):
+                prefetched = agents.verify_taint_candidate(candidate, self.context)
+                if self._prefetch_derived(prefetched):
+                    singleton.append(group)
+                    prefetched_by_id[candidate.candidate_id] = prefetched
+                    continue
+            batchable.append(group)
+
+        for members in singleton:
+            candidate_id = agents.group_representative(members).candidate_id
+            if not self._validation_single(members, prefetched=prefetched_by_id[candidate_id]):
+                # An agent that produced nothing must not be turned into a `rejected` verdict: the
+                # next round re-dispatches the scope and this claim is validated then, exactly as the
+                # single-claim path has always done.
+                log.info("harness: validation for %s deferred", candidate_id)
+
+        by_id = {agents.group_representative(g).candidate_id: g for g in batchable}
+        batches = agents.pack_claim_batches(
+            batchable, files_of=files_of, max_batch=self.config.claim_batch_size
+        )
+        escalate: list[str] = []
+
+        def run_batch(batch: list[list[Candidate]]) -> None:
+            claims = [(agents.group_representative(g), g) for g in batch]
+            ids = [candidate.candidate_id for candidate, _ in claims]
+            outcome = self._agent(
+                agent=agents.VALIDATION_BATCH,
+                work_ids=[self._claim_work(group, WorkItemKind.VALIDATION) for group in batch],
+                scope_id=f"batch({len(claims)})",
+                task=agents.validation_batch_task(
+                    self.blackboard, claims, material_budget=self.config.material_budget
+                ),
+                context=self.context,
+                client=self.client,
+                max_steps=self.config.steps_per_agent,
+                blackboard=self.blackboard,
+                run_id=f"validation:batch:{ids[0]}+{len(ids) - 1}",
+                extra_system=agents.validation_extra_system(
+                    self.blackboard,
+                    claims[0][0].scope_id,
+                    files=[candidate.file for candidate, _ in claims],
+                ),
+            )
+            if outcome.parsed is None:
+                log.warning(
+                    "harness: batch validation produced nothing (%s); %d claim(s) stay undecided",
+                    outcome.error,
+                    len(claims),
+                )
+                return
+            parsed: agents.BatchVerdicts = outcome.parsed
+            for verdict in parsed.verdicts:
+                members = by_id.get(verdict.candidate_id)
+                if members is None:
+                    log.warning(
+                        "harness: batch verdict for %s is not in this batch; dropped",
+                        verdict.candidate_id,
+                    )
+                    continue
+                self._apply_verdict(members, verdict)
+            escalate.extend(parsed.escalate)
+
+        self._bounded(batches, run_batch, label="validation")
+        # `needs_dataflow` claims, and any claim the batch never answered, get their own run -- which
+        # is the tool-rich path. Answering "I need a trace" must not be a way to drop a claim.
+        undecided = [
+            candidate_id
+            for candidate_id in by_id
+            if bb.find_verdict(self.blackboard, candidate_id) is None
+        ]
+        for candidate_id in dict.fromkeys([*escalate, *undecided]):
+            members = by_id.get(candidate_id)
+            if members is not None:
+                self._validation_single(members)
+
+    def _validation_single(self, members: list[Candidate], *, prefetched: Any = _PREFETCH) -> bool:
+        """One validation run for one claim. `False` when the run produced no verdict.
+
+        `prefetched` is the harness-run `dataflow_verify` step for this claim, or the `_PREFETCH`
+        sentinel meaning "run it if this claim is taint-shaped". The batched path already ran it while
+        deciding whether the claim could be batched, and re-running it would spend the same tool call
+        twice for no new information.
+        """
+        if not self._claim_allowed(members, WorkItemKind.VALIDATION):
+            return False
+        candidate = agents.group_representative(members)
+        if prefetched is _PREFETCH:
             # Taint-shaped candidates are traced *before* the model sees them, so whether dataflow
             # was consulted stops being a preference the model can decline -- see
             # `agents.verify_taint_candidate` for why that delegation failed in practice. The step
@@ -1736,81 +2619,66 @@ class HarnessCoordinator:
                 if agents.is_taint_candidate(candidate)
                 else None
             )
-            # The path the prefetch just derived is exactly the material this validator needs: the
-            # functions the value crosses, taken out of the files so it does not have to read them
-            # again. When there is no prefetch (a non-taint-shaped candidate) the packet is still the
-            # hit's own function, which is what a validator reads first anyway.
-            evidence = None
-            if prefetched is not None and prefetched.result is not None:
-                evidence = (prefetched.result.data or {}).get("evidence") or None
-            task = agents.validation_task(
-                self.blackboard,
-                candidate,
-                prefetched=prefetched,
-                dataflow=evidence,
-                material_budget=self.config.material_budget,
+        # The path the prefetch just derived is exactly the material this validator needs: the
+        # functions the value crosses, taken out of the files so it does not have to read them
+        # again. When there is no prefetch (a non-taint-shaped candidate) the packet is still the
+        # hit's own function, which is what a validator reads first anyway.
+        evidence = None
+        if prefetched is not None and prefetched.result is not None:
+            evidence = (prefetched.result.data or {}).get("evidence") or None
+        task = agents.validation_task(
+            self.blackboard,
+            candidate,
+            prefetched=prefetched,
+            dataflow=evidence,
+            material_budget=self.config.material_budget,
+        )
+        note = agents.group_note(members)
+        if note:
+            task = f"{task}\n\n{note}"
+        outcome = self._agent(
+            agent=agents.VALIDATION,
+            work_ids=[self._claim_work(members, WorkItemKind.VALIDATION)],
+            scope_id=candidate.candidate_id,
+            task=task,
+            context=self.context,
+            client=self.client,
+            max_steps=self.config.steps_per_agent,
+            blackboard=self.blackboard,
+            run_id=f"validation:{candidate.candidate_id}",
+            # The lite skill is keyed on the *candidate's* file rather than on a scope name: the
+            # skill is about the kind of code, and a scope id says nothing about that. The sibling
+            # rule rides along, because a validator that finds a control on one member of a family
+            # will otherwise reject the whole family with it.
+            extra_system=agents.validation_extra_system(
+                self.blackboard, candidate.scope_id, files=[candidate.file]
+            ),
+            # Seeded, not appended afterwards: the verdict is parsed from this run while it is
+            # still inside `agents.run`, so a step added on the way out is a step the verdict
+            # never sees -- which is exactly how the first version of this lost the trace it had
+            # just paid for.
+            initial_steps=[prefetched] if prefetched is not None else None,
+        )
+        if outcome.parsed is None:
+            # No verdict is recorded for any member: an agent that produced nothing must not be
+            # turned into a `rejected` verdict, which would put a decision in the report that
+            # nobody made.
+            log.warning(
+                "harness: validation for %s produced no verdict (%s)",
+                candidate.candidate_id,
+                outcome.error,
             )
-            note = agents.group_note(members)
-            if note:
-                task = f"{task}\n\n{note}"
-            outcome = self._agent(
-                agent=agents.VALIDATION,
-                scope_id=candidate.candidate_id,
-                task=task,
-                context=self.context,
-                client=self.client,
-                max_steps=self.config.steps_per_agent,
-                blackboard=self.blackboard,
-                run_id=f"validation:{candidate.candidate_id}",
-                # The lite skill is keyed on the *candidate's* file rather than on a scope name: the
-                # skill is about the kind of code, and a scope id says nothing about that. The sibling
-                # rule rides along, because a validator that finds a control on one member of a family
-                # will otherwise reject the whole family with it.
-                extra_system=agents.validation_extra_system(
-                    self.blackboard, candidate.scope_id, files=[candidate.file]
-                ),
-                # Seeded, not appended afterwards: the verdict is parsed from this run while it is
-                # still inside `agents.run`, so a step added on the way out is a step the verdict
-                # never sees -- which is exactly how the first version of this lost the trace it had
-                # just paid for.
-                initial_steps=[prefetched] if prefetched is not None else None,
-            )
-            if outcome.parsed is None:
-                # No verdict is recorded for any member: an agent that produced nothing must not be
-                # turned into a `rejected` verdict, which would put a decision in the report that
-                # nobody made.
-                log.warning(
-                    "harness: validation for %s produced no verdict (%s)",
-                    candidate.candidate_id,
-                    outcome.error,
-                )
-                return
-            verdict: CandidateVerdict = outcome.parsed
-            for member in members:
-                copy = verdict.model_copy(deep=True)
-                copy.candidate_id = member.candidate_id
-                if len(members) > 1:
-                    copy.reasons = [
-                        *copy.reasons,
-                        f"由同一位置（{candidate.file}:{candidate.line}，共 {len(members)} 条实例）"
-                        "的一次验证统一判定",
-                    ]
-                bb.add_verdict(self.blackboard, copy)
-                self.trail.emit(
-                    "verdict",
-                    candidate_id=copy.candidate_id,
-                    scope=member.scope_id,
-                    file=member.file,
-                    line=member.line,
-                    vulnerability_type=member.vulnerability_type,
-                    verdict=copy.verdict.value,
-                    evidence_kind=copy.evidence_kind.value,
-                    confidence=copy.confidence,
-                    merged_from=len(members),
-                    reason=trail_mod.clip("；".join(copy.reasons[:2])),
-                )
+            return False
+        self._apply_verdict(members, outcome.parsed)
+        return True
 
-        self._bounded(list(groups.values()), one, label="validation")
+    def _complete_attack_paths(self) -> None:
+        for _ in range(max(1, self.config.max_claim_attempts)):
+            before = sum(len(w.attempts) for w in self.blackboard.work if w.kind is WorkItemKind.ATTACK_PATH)
+            self._attack_paths()
+            after = sum(len(w.attempts) for w in self.blackboard.work if w.kind is WorkItemKind.ATTACK_PATH)
+            if before == after:
+                break
 
     def _attack_paths(self) -> None:
         confirmed = [
@@ -1821,55 +2689,157 @@ class HarnessCoordinator:
         if not confirmed:
             return
 
+        groups = list(agents.validation_groups(confirmed).values())
+        groups = [members for members in groups if self._claim_allowed(members, WorkItemKind.ATTACK_PATH)]
+        for members in groups:
+            self._claim_work(members, WorkItemKind.ATTACK_PATH)
+        if self.config.claim_batch_size > 1:
+            self._attack_paths_batched(groups)
+            return
+
         def one(members: list[Candidate]) -> None:
-            candidate = agents.group_representative(members)
-            verdict = bb.find_verdict(self.blackboard, candidate.candidate_id)
-            if verdict is None:  # pragma: no cover - confirmed implies a verdict
+            self._attack_path_one(members, self._attack_path_run(members))
+
+        self._bounded(groups, one, label="attack_path")
+
+    def _attack_path_run(self, members: list[Candidate]) -> AttackPath | None:
+        """The agent run for one confirmed claim, or None when it produced nothing usable."""
+        if not self._claim_allowed(members, WorkItemKind.ATTACK_PATH):
+            return None
+        candidate = agents.group_representative(members)
+        verdict = bb.find_verdict(self.blackboard, candidate.candidate_id)
+        if verdict is None:  # pragma: no cover - confirmed implies a verdict
+            return None
+        outcome = self._agent(
+            agent=agents.ATTACK_PATH,
+            work_ids=[self._claim_work(members, WorkItemKind.ATTACK_PATH)],
+            scope_id=candidate.candidate_id,
+            task=agents.attack_path_task(
+                self.blackboard,
+                candidate,
+                verdict,
+                material_budget=self.config.material_budget,
+                members=members,
+            ),
+            context=self.context,
+            client=self.client,
+            max_steps=self.config.steps_per_agent,
+            blackboard=self.blackboard,
+            run_id=f"attack_path:{candidate.candidate_id}",
+            extra_system=agents.lite_skill_for_scope(self.blackboard, candidate.scope_id),
+        )
+        if outcome.parsed is None:
+            log.warning(
+                "harness: attack path for %s produced nothing usable (%s)",
+                candidate.candidate_id,
+                outcome.error,
+            )
+            return None
+        path: AttackPath = outcome.parsed
+        # Every entry the instances named, not only the ones the agent echoed back. The agent is
+        # asked for the union and usually returns it; this is what makes "usually" not matter, because
+        # an entry that was recorded once must not vanish from the report.
+        for entry in agents.instance_entry_points(members):
+            if entry not in path.entry_points:
+                path.entry_points.append(entry)
+        return path
+
+    def _attack_path_one(self, members: list[Candidate], path: AttackPath | None) -> None:
+        """Record one path for every instance of the claim it was established for."""
+        if path is None:
+            return
+        for member in members:
+            copy = path.model_copy(deep=True)
+            copy.candidate_id = member.candidate_id
+            copy.evidence_version = member.evidence_version
+            bb.add_attack_path(self.blackboard, copy)
+            self.trail.emit(
+                "attack_path",
+                candidate_id=copy.candidate_id,
+                scope=member.scope_id,
+                file=member.file,
+                line=member.line,
+                reachable=copy.reachable,
+                confidence=copy.confidence,
+                impact=trail_mod.clip(copy.impact),
+                entry_points=copy.entry_points[:4],
+            )
+        self.tasks.update(
+            self._claim_work(members, WorkItemKind.ATTACK_PATH),
+            state=WorkItemState.DONE,
+            status_reason=f"可达性：{'可达' if path.reachable else '未确认可达'}；{path.impact}",
+        )
+
+    def _attack_paths_batched(self, groups: list[list[Candidate]]) -> None:
+        """Several confirmed claims per attack-path run, each with its own path.
+
+        Measured basis: 72 attack-path runs for 161 confirmed candidates, 34 minutes. Confirmed
+        candidates that sit in one file share the entry points their stage exists to find, so the
+        packing is the same one validation uses (`agents.pack_claim_batches`). A claim the batch does
+        not answer is re-run alone: `reachable=False` is a claim about the code, and must not double as
+        "nobody looked".
+        """
+        from services.harness import material
+
+        by_id = {agents.group_representative(g).candidate_id: g for g in groups}
+        batches = agents.pack_claim_batches(
+            groups,
+            files_of=lambda candidate: material.files_for(candidate),
+            max_batch=self.config.claim_batch_size,
+        )
+
+        def run_batch(batch: list[list[Candidate]]) -> None:
+            claims = []
+            for group in batch:
+                candidate = agents.group_representative(group)
+                verdict = bb.find_verdict(self.blackboard, candidate.candidate_id)
+                if verdict is not None:
+                    claims.append((candidate, group, verdict))
+            if not claims:
                 return
+            ids = [candidate.candidate_id for candidate, _, _ in claims]
             outcome = self._agent(
-                agent=agents.ATTACK_PATH,
-                scope_id=candidate.candidate_id,
-                task=agents.attack_path_task(
-                    self.blackboard,
-                    candidate,
-                    verdict,
-                    material_budget=self.config.material_budget,
+                agent=agents.ATTACK_PATH_BATCH,
+                work_ids=[self._claim_work(group, WorkItemKind.ATTACK_PATH) for group in batch],
+                scope_id=f"batch({len(claims)})",
+                task=agents.attack_path_batch_task(
+                    self.blackboard, claims, material_budget=self.config.material_budget
                 ),
                 context=self.context,
                 client=self.client,
                 max_steps=self.config.steps_per_agent,
                 blackboard=self.blackboard,
-                run_id=f"attack_path:{candidate.candidate_id}",
-                extra_system=agents.lite_skill_for_scope(self.blackboard, candidate.scope_id),
+                run_id=f"attack_path:batch:{ids[0]}+{len(ids) - 1}",
+                extra_system=agents.lite_skill_for_scope(
+                    self.blackboard, claims[0][0].scope_id
+                ),
             )
             if outcome.parsed is None:
                 log.warning(
-                    "harness: attack path for %s produced nothing usable (%s)",
-                    candidate.candidate_id,
+                    "harness: batch attack path produced nothing (%s); %d claim(s) have no path",
                     outcome.error,
+                    len(claims),
                 )
                 return
-            path: AttackPath = outcome.parsed
-            # Copied to every member, for the same reason the verdict is: a confirmed candidate with
-            # no attack path would be reported as "reachability never established", which is a weaker
-            # claim than the run actually earned.
-            for member in members:
-                copy = path.model_copy(deep=True)
-                copy.candidate_id = member.candidate_id
-                bb.add_attack_path(self.blackboard, copy)
-                self.trail.emit(
-                    "attack_path",
-                    candidate_id=copy.candidate_id,
-                    scope=member.scope_id,
-                    file=member.file,
-                    line=member.line,
-                    reachable=copy.reachable,
-                    confidence=copy.confidence,
-                    impact=trail_mod.clip(copy.impact),
-                    entry_points=copy.entry_points[:4],
-                )
+            for path in outcome.parsed:
+                members = by_id.get(path.candidate_id)
+                if members is None:
+                    log.warning(
+                        "harness: batch attack path for %s is not in this batch; dropped",
+                        path.candidate_id,
+                    )
+                    continue
+                for entry in agents.instance_entry_points(members):
+                    if entry not in path.entry_points:
+                        path.entry_points.append(entry)
+                self._attack_path_one(members, path)
 
-        self._bounded(list(agents.validation_groups(confirmed).values()), one, label="attack_path")
+        self._bounded(batches, run_batch, label="attack_path")
+        # Whatever the batch did not answer gets its own run, which is the shape this stage always
+        # had -- so batching can add cost, but it can never leave a confirmed candidate unexplained.
+        for candidate_id, members in by_id.items():
+            if bb.find_attack_path(self.blackboard, candidate_id) is None:
+                self._attack_path_one(members, self._attack_path_run(members))
 
     # ── stage 7: findings ──────────────────────────────────────────────────
 
@@ -1928,6 +2898,10 @@ class HarnessCoordinator:
                             "file": member.file,
                             "line": member.line,
                             "title": member.title,
+                            # Per instance, because that is where the difference lives: the report
+                            # must be able to show that one record of this sink named an anonymous
+                            # route and another named a guarded one.
+                            "entry_points": list(member.entry_points),
                         }
                         for member in members
                     ]
@@ -1988,8 +2962,9 @@ class HarnessCoordinator:
         items = self._survey_work_items(scopes)
         bb.add_work(
             self.blackboard,
-            [*self._coverage_items(), *items[: self.config.max_scopes_per_round]],
+            [*self._coverage_items(), *items],
         )
+        self._publish_discovery_tasks()
         self._planned_scopes = [item.scope_id for item in self.blackboard.work]
         self.trail.emit(
             "stage", stage="plan", state="end", dry_run=True, scopes=len(self._planned_scopes)
@@ -2109,6 +3084,28 @@ class HarnessCoordinator:
 
     def _finish(self, *, dry_run: bool = False, fatal: str | None = None) -> HarnessResult:
         """Persist the blackboard and write the report. Always both, even after a fatal error."""
+        self.tasks.trail = self.trail
+        self.tasks.board = self.blackboard
+        self.blackboard.execution_budget = self.budget.snapshot()
+        if not dry_run:
+            for item in self.blackboard.work:
+                if item.kind not in (WorkItemKind.FILE_REVIEW, WorkItemKind.INVESTIGATION):
+                    continue
+                if item.state is WorkItemState.CANCELED:
+                    continue
+                entry = bb.coverage_of(self.blackboard, item.scope_id)
+                if entry is None or entry.state not in (CoverageState.SUFFICIENT, CoverageState.EXCLUDED):
+                    self.tasks.update(
+                        item.work_id, state=WorkItemState.BLOCKED,
+                        status_reason=self.budget.reason or (entry.reason if entry and entry.reason else "覆盖检查尚未完成"),
+                    )
+        self.tasks.stop(fatal or self.budget.reason or "本次运行结束，任务尚未满足完成条件")
+        unfinished_leads = [lead for lead in self.blackboard.leads if lead.status not in {"handled", "dismissed"}]
+        if unfinished_leads:
+            self.blackboard.closure_note += f" 仍有 {len(unfinished_leads)} 条未完成线索（预算耗尽、延期或等待处理），收件箱已保留。"
+        incomplete = sum(item.state not in (WorkItemState.DONE, WorkItemState.CANCELED) for item in self.blackboard.work)
+        if incomplete:
+            self.blackboard.closure_note += f" 仍有 {incomplete} 项任务未完成，见任务清单。"
         run_dir = self.run_dir
         run_dir.mkdir(parents=True, exist_ok=True)
         # The round count is written onto the blackboard before it is serialised: the report reads
@@ -2132,6 +3129,7 @@ class HarnessCoordinator:
             dry_run=dry_run,
             fatal=fatal,
             counters=self.trail.counters(self.blackboard),
+            execution_budget=self.blackboard.execution_budget,
         )
         return HarnessResult(
             blackboard=self.blackboard,
@@ -2169,45 +3167,43 @@ class HarnessCoordinator:
                 log.warning("harness: %s item failed (%s: %s)", label, type(exc).__name__, exc)
                 return None
 
+        # Keep at most `workers` submitted. `pool.map` eagerly queues the entire stage, which means a
+        # provider outage discovered by the first four agents still launches every remaining scope.
+        # Incremental submission makes the circuit breaker effective: only calls already in flight
+        # finish after it trips.
+        iterator = iter(work)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(guarded, work))
+            futures = set()
+            for _ in range(workers):
+                try:
+                    futures.add(pool.submit(guarded, next(iterator)))
+                except StopIteration:
+                    break
+            while futures:
+                done, futures = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+                if label == "discovery":
+                    self._plan_inbox(force=bool(done), idle=not futures)
+                for _ in range(len(done)):
+                    try:
+                        futures.add(pool.submit(guarded, next(iterator)))
+                    except StopIteration:
+                        break
 
 
 # ─────────────────────────────────────────────────────────── helpers
 
 
-def _opening_run_id(agent: str, index: int) -> str:
-    """The ledger id of one opening agent's run in pass `index`.
+def _opening_run_id(agent: str) -> str:
+    """The ledger id of an opening agent's run.
 
-    Suffixed from pass 2 on because `bb.add_run` keys on `run_id`: without it a re-dispatched recon
-    would be filed under the id its first run already used and the ledger would *drop* the second run
-    -- keeping the report's account of the pass that changed the answer while losing the pass itself.
+    The opening is single-round by design (recon once, threat model once, no cross-reading), so there
+    is no pass suffix: `bb.add_run` keys on `run_id`, and a second opening run under the same id would
+    be *dropped* rather than duplicated -- which is the safety net if someone reintroduces a loop
+    without also restoring the suffix.
     """
-    base = f"{agent}:workspace"
-    return base if index <= 1 else f"{base}:p{index}"
-
-
-def _board_revision_seen(run: AgentRun) -> int | None:
-    """The highest board revision this run's `board` calls actually served, or None if it never read.
-
-    This is the watermark the opening stage converges on, and it is read out of the run's tool calls
-    rather than out of anything the model said: the `board` tool stamps each result with the revision
-    it served, so "how much of the board has this agent seen" is a ledger fact. Deriving it from the
-    agent's own claim ("I have read the peer's components") would be the same category of evidence the
-    coverage rule refuses -- and measured on the first real audit, the threat model's claim to be
-    finished was worth nothing while it had read at step 1 and never looked again.
-    """
-    seen: int | None = None
-    for step in run.steps:
-        call, result = step.call, step.result
-        if call is None or result is None or not result.ok:
-            continue
-        if call.tool is not ToolName.BOARD:
-            continue
-        revision = (result.data or {}).get("revision")
-        if isinstance(revision, int) and (seen is None or revision > seen):
-            seen = revision
-    return seen
+    return f"{agent}:workspace"
 
 
 def _json_object(text: str) -> dict | None:

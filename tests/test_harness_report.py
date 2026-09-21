@@ -27,6 +27,7 @@ from aegis_contracts.harness import (
     EvidenceKind,
     FinalFinding,
     OpeningConvergence,
+    SecurityInventory,
     ToolCall,
     ToolName,
     ToolResult,
@@ -239,7 +240,14 @@ def test_rejections_are_aggregated_by_place_with_one_reason_each(tmp_path: Path)
 
 
 def test_a_finished_run_is_a_row_and_an_unfinished_run_keeps_its_transcript(tmp_path: Path) -> None:
-    """88 runs of steps is not a report; the runs that *stopped* are the ones worth reading."""
+    """88 runs of steps is not a report; the runs that *stopped* are the ones worth reading.
+
+    And since 2026-09-17 the transcript of those runs is written *beside* the report rather than in
+    it: measured on the `upp-module-infra` audit, inlining them was 665 KB of a 1080 KB report. The
+    content is not summarised away -- `abnormal_runs_markdown` is where it goes, and the report has to
+    say so, because a report that drops a transcript without naming where it went is worse than one
+    that is long.
+    """
     board = _board(tmp_path)
     for index in range(20):
         bb.add_run(board, _run(run_id=f"discovery:done-{index}", stop_reason="finished", steps=6))
@@ -249,50 +257,52 @@ def test_a_finished_run_is_a_row_and_an_unfinished_run_keeps_its_transcript(tmp_
     section = text.split("## 6. ")[1]
 
     assert "| `discovery`" in section and "read×6" in section, "each run is one row with its tools"
-    assert section.count("第 1 步的想法") == 1, (
-        "only the run that stopped early gets its steps written out -- its 4 steps, not 21 runs"
-    )
-    assert "### 6.1 未正常结束的 run（全文）" in section
+    assert "第 1 步的想法" not in section, "21 runs of steps is not a report"
+    assert "### 6.1 未正常结束的 run（全文另存）" in section
+    assert "abnormal-runs.md" in section
     assert "discovery:stuck" in section
+    assert "| `discovery:stuck` | `discovery` | `budget` | 4 |" in section
+
+    sidecar = report.abnormal_runs_markdown(board)
+    assert sidecar.count("第 1 步的想法") == 1, "the stuck run's 4 steps, and nobody else's"
+    assert "discovery:stuck" in sidecar
+    assert "discovery:done-0" not in sidecar, "a run that finished keeps only its row"
 
 
-def test_the_report_says_whether_the_opening_pair_read_each_other(tmp_path: Path) -> None:
-    """Converged and not-converged must not render the same.
+def test_the_report_describes_the_single_round_opening_and_the_inventory(
+    tmp_path: Path,
+) -> None:
+    """The opening block now reports the single-round design, and the inventory its own counts.
 
-    Two runs that differ only in whether the threat model ever read what recon published produce the
-    same `threats` list, and they are not the same review. Measured on the first real audit: the threat
-    model read the board at its first two steps and never again while recon published eleven facts after
-    that, and nothing in the report said so.
+    The old text audited the convergence loop ("已收敛/未收敛, N 条未读"); that loop is gone
+    (2026-09-18) and reconciling the pair's outputs is the AI security-inventory stage's job — so the
+    report shows the single-round claim plus the inventory's per-section counts and its coverage gaps.
     """
-    converged = _board(tmp_path)
-    converged.opening = OpeningConvergence(
-        passes=2,
+    board = _board(tmp_path)
+    board.opening = OpeningConvergence(
+        passes=1,
         converged=True,
-        watermarks={"recon": 9, "threat_model": 12},
+        watermarks={},
         unread={},
-        note="开场第 2 轮达成静默：两个 agent 都已读过对方发布的内容。",
+        note="单轮独立开场：recon 与威胁建模各执行一轮、不互读收敛（设计变更）。",
     )
-    text = report.render(converged)
-    assert "开场配对（recon × 威胁建模）" in text
-    assert "结论：已收敛；共 2 轮。" in text
-    assert "读到 revision 12" in text
+    board.security_inventory = SecurityInventory(
+        entry_points=[{"name": "POST /admin-api/infra/file/upload", "file": "AppFileController.java",
+                       "line": 38}],
+        coverage_gaps=["运行期动态数据源注册未能静态确认"],
+    )
+    text = report.render(board)
+    assert "开场（recon → 威胁建模）" in text
+    assert "单轮独立完成（1 轮；设计上不互读收敛）" in text
+    assert "安全清单（AI，基于开场两方的结论）" in text
+    assert "入口：1 项" in text
+    assert "POST /admin-api/infra/file/upload" in text
+    assert "运行期动态数据源注册未能静态确认" in text
+    assert "| 开场（recon → 威胁建模） | 单轮独立（1 轮，不互读收敛） |" in text
     assert "未收敛" not in text
-    assert "| 开场轮次（recon × 威胁建模） | 2（已收敛） |" in text
 
-    unconverged = _board(tmp_path)
-    unconverged.opening = OpeningConvergence(
-        passes=2,
-        converged=False,
-        watermarks={"recon": 12, "threat_model": 2},
-        unread={"threat_model": 3},
-        note="开场跑了 2 轮仍未收敛（上限 2 轮）：threat_model 还有 3 条未读。",
-    )
-    text = report.render(unconverged)
-    assert "结论：**未收敛**；共 2 轮。" in text
-    assert "`threat_model` 还有 3 条未读" in text
-    assert "| 开场轮次（recon × 威胁建模） | 2（未收敛，3 条未读） |" in text
-
-    # A dry run has no opening stage at all, and the absence of the claim is different from the claim.
+    # A dry run has neither an opening nor an inventory, and the absence of the claim is different
+    # from the claim.
     plain = _board(tmp_path)
-    assert "开场配对" not in report.render(plain)
+    assert "开场（recon" not in report.render(plain)
     assert "trail.jsonl" in text, "and the full record is named"

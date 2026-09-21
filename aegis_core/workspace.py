@@ -106,6 +106,35 @@ def iter_source_files(root: Path, suffixes: set[str] | None = None) -> list[Path
     return _walk_files(root, PYTHON_SUFFIXES if suffixes is None else suffixes)
 
 
+def suffix_census(root: Path, suffixes: set[str]) -> dict[str, int]:
+    """How many files under ``root`` carry each of ``suffixes``, lower-cased. No file is opened.
+
+    Deliberately separate from :func:`workspace_digest`, which reads every byte: this answers
+    "which language is this repository", and that has to be cheap enough to run before every CPG
+    build. Reading a 392 MB tree to answer it is the difference between a decision and a stall
+    (measured on the `payment-sys` fixture: 2341 `.java` plus 2776 `.class` under `target/`).
+
+    The caller decides which suffixes are worth counting -- this function has no opinion about
+    languages, and must not grow one: the set of parseable suffixes lives with the frontend map.
+    """
+    counts = dict.fromkeys(sorted(suffixes), 0)
+    for path in _walk_files(root, suffixes):
+        suffix = path.suffix.lower()
+        counts[suffix] = counts.get(suffix, 0) + 1
+    return counts
+
+
+def dominant_suffix(census: dict[str, int]) -> str | None:
+    """The most common suffix in a census, or None when there is nothing to count.
+
+    Ties break on the suffix in sorted order, so the answer is deterministic -- it picks the CPG
+    frontend, which decides the cache key, and an unstable key is a rebuild on every request.
+    """
+    if not census or max(census.values(), default=0) == 0:
+        return None
+    return max(sorted(census), key=lambda suffix: census[suffix])
+
+
 def workspace_digest(root: Path) -> str:
     """Content hash of a workspace: every file's relative path plus its bytes.
 

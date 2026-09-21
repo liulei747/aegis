@@ -213,7 +213,20 @@ export function projectsFrom(
     ]);
   }
 
-  return [...byWorkspace.values()].sort((left, right) => {
+  return byRecentActivity([...byWorkspace.values()]);
+}
+
+/**
+ * 最近活动在前，同名时按名字。
+ *
+ * 抽出来是因为**两张表都要它**：派生列表（上面这个函数），和选择器把注册表里"还没有任何活动"的
+ * 新项目并进来之后的列表。两份实现早晚会分叉，而分叉的表现是**新项目排到列表末尾** —— 选择器
+ * 的第一项就是用户最可能想要的那个，排到末尾等于让他以为没建成功。
+ */
+export function byRecentActivity<T extends { lastActivity: string | null; name: string }>(
+  rows: T[],
+): T[] {
+  return [...rows].sort((left, right) => {
     const a = left.lastActivity ?? "";
     const b = right.lastActivity ?? "";
     if (a !== b) return a < b ? 1 : -1;

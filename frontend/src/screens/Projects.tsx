@@ -209,7 +209,10 @@ function NewProjectPanel({
             </>
           ) : null}
           {" "}
-          · 接下来：<a href="#/audit">深度审计</a> 或 <a href="#/verdicts">快速研判</a>
+          · 接下来：
+          <a href={`#/audit/w/${encodeURIComponent(created.workspace)}`}>深度审计这个项目</a>
+          {" 或 "}
+          <a href="#/verdicts">快速研判</a>
         </Banner>
       ) : null}
 
@@ -257,12 +260,15 @@ export function ProjectsScreen({
   workspace,
   onOpenAudit,
   onOpenVerdicts,
+  onOpenJob,
 }: {
   bundles: BundleSummary[];
   jobs: JobSummary[];
   workspace: string | null;
   onOpenAudit: () => void;
   onOpenVerdicts: () => void;
+  /** 重新扫描提交成功后跳到组装任务的进度页。 */
+  onOpenJob: (jobId: string) => void;
 }) {
   // 轮询：新建项目后注册表里马上有它，而分析包要等任务跑完才出现。
   const registry = usePolled<{ projects: ProjectRecord[] }>(() => api.projects(), [], {
@@ -272,6 +278,54 @@ export function ProjectsScreen({
   const health = usePolled<Health>(() => api.health(), [], { pollMs: 60_000 });
   const deep: ProjectDeepAnalysis | undefined = health.data?.capabilities?.projects?.deep_analysis;
   const rows = mergeProjects(registry.data?.projects ?? [], bundles, jobs);
+
+  // 重新扫描：对同一个 workspace 再跑一遍 扫描 → 组装 → 分析包。
+  // 必须带 force（assemble 的指纹就是 workspace，不带会被上次任务去重掉，界面上就是"点了没反应"）。
+  const [rescanBusy, setRescanBusy] = useState<string | null>(null);
+  const [rescanError, setRescanError] = useState<ApiError | null>(null);
+  const rescan = async (target: string) => {
+    if (rescanBusy !== null) return;
+    setRescanBusy(target);
+    setRescanError(null);
+    try {
+      const answer = await api.assemble({ workspace: target }, { force: true });
+      if (answer && typeof answer === "object" && "job_id" in answer) onOpenJob(answer.job_id);
+    } catch (caught) {
+      setRescanError(caught as ApiError);
+    } finally {
+      setRescanBusy(null);
+    }
+  };
+  const assembling = (target: string) =>
+    jobs.some(
+      (job) =>
+        job.kind === "assemble" &&
+        job.workspace === target &&
+        (job.state === "running" || job.state === "queued"),
+    );
+
+  // 重新审计：带 `?force=true` 重跑一次深度审计（会归档上一次的结果再开跑）。
+  const [auditBusy, setAuditBusy] = useState<string | null>(null);
+  const reaudit = async (target: string) => {
+    if (auditBusy !== null || rescanBusy !== null) return;
+    setAuditBusy(target);
+    setRescanError(null);
+    try {
+      const answer = await api.submitAudit({ workspace: target }, { force: true });
+      if (answer && typeof answer === "object" && "job_id" in answer) onOpenJob(answer.job_id);
+    } catch (caught) {
+      setRescanError(caught as ApiError);
+    } finally {
+      setAuditBusy(null);
+    }
+  };
+  const auditInFlight = (target: string) =>
+    jobs.some(
+      (job) =>
+        job.kind === "audit" &&
+        job.workspace === target &&
+        (job.state === "running" || job.state === "queued"),
+    );
 
   if (workspace !== null) {
     const project = rows.find((candidate) => candidate.workspace === workspace);
@@ -295,7 +349,32 @@ export function ProjectsScreen({
           <button type="button" onClick={onOpenVerdicts}>
             去快速研判
           </button>
+          <button
+            type="button"
+            onClick={() => void rescan(project.workspace)}
+            disabled={rescanBusy !== null || auditBusy !== null || assembling(project.workspace)}
+            title="对这个项目再跑一遍 静态扫描 → 调用图组装，生成一份新的分析包"
+          >
+            {assembling(project.workspace)
+              ? "正在扫描…"
+              : rescanBusy === project.workspace
+                ? "提交中…"
+                : "重新扫描"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void reaudit(project.workspace)}
+            disabled={auditBusy !== null || rescanBusy !== null || auditInFlight(project.workspace)}
+            title="带 ?force=true 重跑一次深度审计；上一次的结果会先归档"
+          >
+            {auditInFlight(project.workspace)
+              ? "审计进行中…"
+              : auditBusy === project.workspace
+                ? "提交中…"
+                : "重新审计"}
+          </button>
         </div>
+        {rescanError ? <Banner kind="warn">重新扫描提交失败：{rescanError.detail}</Banner> : null}
         <p className="muted">
           <code>{project.workspace}</code>
         </p>

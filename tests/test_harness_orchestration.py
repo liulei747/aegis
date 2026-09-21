@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,8 +42,9 @@ from aegis_contracts.harness import (
 )
 from aegis_core.cancel import CanceledAbort
 from services.ai.client import AIUnavailable, ChatResult
-from services.harness import agents, coverage, react, report, skills, survey, trail
+from services.harness import agents, coverage, material, react, report, skills, survey, trail
 from services.harness import blackboard as bb
+from services.harness import coordinator as coordinator_mod
 from services.harness.cli import EXIT_NOT_CONFIGURED, main
 from services.harness.coordinator import HarnessConfig, HarnessCoordinator, _severity
 from services.harness.react import run_agent
@@ -153,7 +154,10 @@ def _which_agent(system: str) -> str:
         ("threat-modelling agent", agents.THREAT_MODEL),
         ("planning stage", agents.PLANNER),
         ("discovery agent", agents.DISCOVERY),
+        ("security-inventory agent", agents.SECURITY_INVENTORY),
+        ("validation batch agent", agents.VALIDATION_BATCH),
         ("validation agent", agents.VALIDATION),
+        ("attack-path batch agent", agents.ATTACK_PATH_BATCH),
         ("attack-path agent", agents.ATTACK_PATH),
     ):
         if marker in system:
@@ -490,6 +494,33 @@ def test_a_client_failure_stops_the_run_and_is_recorded(fake_tools, tmp_path: Pa
     assert run.finished_at is not None
 
 
+def test_discovery_only_sees_record_kinds_the_coordinator_accepts() -> None:
+    schemas = react.tool_schemas([ToolName.RECORD], agent=agents.DISCOVERY)
+
+    record = next(schema for schema in schemas if schema["name"] == "record")
+    assert record["parameters"]["properties"]["kind"]["enum"] == [
+        "candidate", "evidence", "gap", "lead"
+    ]
+
+
+def test_model_unavailability_trips_run_wide_circuit(tmp_path: Path) -> None:
+    coordinator = HarnessCoordinator(
+        workspace=tmp_path,
+        config=HarnessConfig(max_consecutive_ai_unavailable=2),
+    )
+    failed = AgentRun(
+        run_id="discovery:s1",
+        agent=agents.DISCOVERY,
+        scope_id="s1",
+        stop_reason="error",
+        steps=[AgentStep(index=1, thought="model call failed: AIUnavailable: TLS EOF")],
+    )
+
+    coordinator._check_model_availability(failed)
+    with pytest.raises(coordinator_mod.ModelUnavailableStop, match="连续 2 个 agent"):
+        coordinator._check_model_availability(failed)
+
+
 def test_a_non_retryable_model_error_is_not_retried(fake_tools, tmp_path: Path) -> None:
     """`AIError` is our fault (bad key, bad model): retrying it only burns the budget."""
     from services.ai.client import AIError
@@ -612,6 +643,70 @@ def test_the_blackboard_round_trips_through_disk(tmp_path: Path) -> None:
     assert loaded.run_id == "run-1"
     assert loaded.project is not None and loaded.project.languages == {"java": 3}
     assert bb.load(tmp_path / "empty") is None, "an unopened run is None, not an empty board"
+
+
+def test_the_saved_blackboard_keeps_one_copy_of_each_file_and_says_what_it_dropped(
+    tmp_path: Path,
+) -> None:
+    """38 MB of artifact, most of it the same bytes: measured on the module audit, 2902 `read` steps
+    carried their file body twice (tool `summary` and `data.lines`) for 203 distinct files.
+
+    What the artifact must keep: the coverage ledger's fields, and *one* copy of a file the run has
+    read completely -- that copy is what `material.lines_from_run` serves a later agent from. What it
+    must not do is look complete while silently dropping content, so every removal is counted in the
+    artifact itself.
+    """
+    board = bb.new_blackboard("run-1", tmp_path)
+    lines = ["one", "two", "three"]
+    for run_id in ("discovery:a:r0", "discovery:a:r1"):
+        board.runs.append(
+            AgentRun(
+                run_id=run_id,
+                agent="discovery",
+                scope_id="a",
+                stop_reason="finished",
+                steps=[
+                    AgentStep(
+                        index=1,
+                        thought="look",
+                        call=ToolCall(tool=ToolName.READ, arguments={"path": "a.java"}, reason=""),
+                        result=ToolResult(
+                            tool=ToolName.READ,
+                            ok=True,
+                            summary="a.java 第 1-3 行（共 3 行）：\none\ntwo\nthree",
+                            data={
+                                "path": "a.java",
+                                "offset": 1,
+                                "total_lines": 3,
+                                "returned_lines": 3,
+                                "lines": lines,
+                            },
+                        ),
+                    )
+                ],
+            )
+        )
+
+    bb.save(board, tmp_path)
+    payload = json.loads((tmp_path / "blackboard.json").read_text(encoding="utf-8"))
+    reads = [
+        step
+        for run in payload["runs"]
+        for step in run["steps"]
+        if (step.get("call") or {}).get("tool") == "read"
+    ]
+    assert len(reads) == 2, "the steps and their order are untouched"
+    assert [bool(step["result"]["data"]["lines"]) for step in reads] == [False, True], (
+        "only the newest complete read of the file keeps its body"
+    )
+    assert "lines_omitted" in reads[0]["result"]["data"]
+    assert reads[0]["result"]["data"]["total_lines"] == 3, "the ledger fields stay"
+    assert "省略" in reads[0]["result"]["summary"]
+    assert reads[0]["result"]["summary_chars"] > 0
+    # The in-memory board is not what was written: a run that keeps working after a save still has
+    # the transcript it had (the ledger and `material.lines_from_run` read the live object).
+    assert board.runs[0].steps[0].result.data["lines"] == lines
+    assert board.runs[0].steps[0].result.summary.startswith("a.java 第 1-3 行")
 
 
 def test_context_is_merged_field_by_field_not_replaced(tmp_path: Path) -> None:
@@ -742,14 +837,11 @@ def pipeline(tmp_path: Path, client: ScriptedClient, *, config: HarnessConfig, c
 
 
 def opening_answers() -> dict[str, str]:
-    """The answers an opening agent gives on the first pass and again on the re-dispatch.
+    """The answer each opening agent gives.
 
-    Two passes are the *normal* shape of the opening stage, not an edge case: each agent's task text is
-    fixed when its run starts, so an agent only ever sees the other's final answer by reading the board
-    after that answer was merged -- and one of the two runs always ends last. A scripted client with a
-    single answer per opening agent therefore leaves the pipeline mid-re-dispatch, which is how these
-    fixtures first broke. Both passes get the same payload here because the point of the second one is
-    "does this change your answer": the honest answer is no.
+    One round each, by design since 2026-09-18: recon and threat modelling run once and do not read
+    each other, and the AI security-inventory stage is what reconciles their outputs afterwards. The
+    old fixture scripted a second pass for the convergence loop, which no longer exists.
     """
     return {
         agents.RECON: final(
@@ -784,9 +876,18 @@ def two_scope_client(counter: CallCounter | None = None) -> ScriptedClient:
     client = ScriptedClient(counter)
     answers = opening_answers()
     for agent, answer in answers.items():
-        # Twice: the second one answers the re-dispatch the opening stage makes because a concurrent
-        # agent cannot have read the peer's *final* answer while both were still running.
-        client.script(agent, "workspace", answer, answer)
+        # One answer each: the opening is single-round by design (no convergence re-dispatch).
+        client.script(agent, "workspace", answer)
+    # The AI security-inventory stage runs after the opening pair and before the planner; its answer
+    # is deliberately spare — the tests that care about its content stub it themselves.
+    client.stub_agent(
+        agents.SECURITY_INVENTORY,
+        final(
+            entry_points=[], authorization_controls=[], dangerous_capabilities=[],
+            configurations=[], dependencies=[], state_controls=[],
+            coverage_gaps=[], files_reviewed=[],
+        ),
+    )
     client.script(
         agents.PLANNER,
         "plan",
@@ -794,13 +895,21 @@ def two_scope_client(counter: CallCounter | None = None) -> ScriptedClient:
             scopes=[
                 {
                     "scope_id": SERVICE_SCOPE,
-                    "title": "service layer",
+                    "title": "user listing × query integrity",
+                    "question": "Can sorting change query structure?",
+                    "completion_criteria": "Trace sort input and query construction controls",
+                    "priority": 1,
+                    "files": ["src/main/java/com/example/service/UserService.java"],
                     "kind": "service-layer",
                     "rationale": "this is where the concatenated query lives",
                 },
                 {
                     "scope_id": WEB_SCOPE,
-                    "title": "controllers",
+                    "title": "user listing × input validation",
+                    "question": "Which callers can control sorting?",
+                    "completion_criteria": "Identify callers and request validation",
+                    "priority": 2,
+                    "files": ["src/main/java/com/example/controller/UserController.java"],
                     "kind": "web-route",
                     "rationale": "the entry point that carries the sort parameter",
                 },
@@ -985,7 +1094,8 @@ def test_the_round_bound_stops_the_closure_loop(tmp_path: Path) -> None:
     for round_tag, scanned in by_round.items():
         assert len(scanned) == len(set(scanned)), f"round {round_tag} scanned a scope twice"
         assert set(scanned) <= set(planned)
-    assert by_round["0"] == planned, "round 0 dispatches every planned scope"
+    priorities = {w.scope_id: w.priority for w in board.work if w.kind.value in {"file_review", "investigation"}}
+    assert by_round["0"] == sorted(planned, key=priorities.get), "round 0 dispatches every scope in priority order"
     # Every later round re-dispatches exactly what the previous closure left INSUFFICIENT. With a
     # fake tool layer that never returns a `read`, that is *every* scope which owns files -- the
     # service scope because it keeps finding new sites, and the web-route and config scopes because
@@ -1013,7 +1123,8 @@ def test_the_round_bound_stops_the_closure_loop(tmp_path: Path) -> None:
 
 def planned_scopes(board, *, ids: bool = False):
     """The scopes the run opened work for -- i.e. everything it dispatched discovery to."""
-    return [item.scope_id for item in board.work] if ids else len(board.work)
+    work = [item for item in board.work if item.kind.value in ("file_review", "investigation")]
+    return [item.scope_id for item in work] if ids else len(work)
 
 
 def test_a_rejected_candidate_reaches_the_report_with_its_reason(tmp_path: Path) -> None:
@@ -1356,7 +1467,12 @@ def test_the_report_contains_the_trail_the_coverage_table_and_the_rejections(tmp
     assert "the column name is validated against an allow-list" in text
     assert "预算" in text or "budget" in text
     assert "discovery:scope-a:r0" in text
-    assert "read the service" in text
+    assert "abnormal-runs.md" in text, "the report has to say where the full transcript went"
+    # The transcript itself is beside the report, not inside it: measured on the module audit, the
+    # inlined transcripts of 14 abnormal runs were 665 KB of a 1080 KB report.
+    sidecar = report.abnormal_runs_markdown(board)
+    assert "read the service" in sidecar
+    assert "discovery:scope-a:r0" in sidecar
     assert "discovery did not finish" in text
     assert "the query lives here" in text
     assert "提前结束" in text
@@ -1675,14 +1791,448 @@ def test_the_representative_is_the_instance_with_the_most_to_say() -> None:
 
 
 def test_the_validator_is_told_which_other_instances_it_speaks_for() -> None:
-    """A verdict that silently covers five candidates is a decision whose scope nobody can see."""
-    only = _claim("scope-a")
+    """A verdict that silently covers five candidates is a decision whose scope nobody can see.
+
+    And the *entries* of those instances travel with them: one record of a sink can name an anonymous
+    route and another a guarded one, so a note that carried only titles would leave the validator to
+    guess which auth level the merged verdict is speaking about.
+    """
+    only = _claim("scope-a", entry_points=["POST /admin-api/file/upload (FileController.java:38)"])
     assert agents.group_note([only]) == ""
     note = agents.group_note([only, _claim("scope-b"), _claim("scope-c")])
 
     assert "3 separately recorded instances" in note
     assert _claim("scope-b").candidate_id in note
-    assert "a verdict here covers all of them" in note
+    assert "reachable and at what auth level" in note
+    assert "POST /admin-api/file/upload (FileController.java:38)" in note, (
+        "the entry points of the instances are what the merge must not lose"
+    )
+    # Every entry the instances named, in first-seen order, deduped -- this is what the finding and
+    # the attack path are built from.
+    assert agents.instance_entry_points(
+        [only, _claim("scope-b", entry_points=["GET /app-api/file/presigned-url (FileController.java:98)"]), only]
+    ) == [
+        "POST /admin-api/file/upload (FileController.java:38)",
+        "GET /app-api/file/presigned-url (FileController.java:98)",
+    ]
+
+
+def test_claim_batches_pack_by_shared_reading_and_leave_deep_claims_alone() -> None:
+    """The batching rule, pinned on the shapes it exists for.
+
+    Measured basis (`upp-module-infra`): 139 validation runs for 98 claims, 196 s each, and reading
+    was the repeated part -- `FileController.java` alone was read 261 times across the run. Claims from
+    one controller share that reading; a claim whose evidence spans many files does not share anything,
+    and is where the multi-file chains live (the SSRF chain crossed four files), so it keeps its own
+    run.
+    """
+    shared = _claim("scope-a", file="FileController.java", line=38)
+    same_file = _claim("scope-b", file="FileController.java", line=98)
+    deep = _claim(
+        "scope-c",
+        file="A.java",
+        line=1,
+        evidence=["A.java:1", "B.java:2", "C.java:3", "D.java:4", "E.java:5"],
+    )
+    unrelated = _claim("scope-d", file="JobServiceImpl.java", line=10)
+
+    batches = agents.pack_claim_batches(
+        [[shared], [same_file], [deep], [unrelated]],
+        files_of=lambda candidate: material.files_for(candidate),
+        max_batch=4,
+        max_files=3,
+    )
+    packed = [[agents.group_representative(g).candidate_id for g in batch] for batch in batches]
+
+    shared_id, same_id = shared.candidate_id, same_file.candidate_id
+    assert [shared_id, same_id] in packed, "claims reading one file belong in one run"
+    assert [deep.candidate_id] in packed, "a five-file chain runs alone"
+    assert [unrelated.candidate_id] in packed, "no overlap, no shared run"
+    assert len(packed) == 3, "four claims, three runs -- and one of them is the deep one"
+
+
+def test_a_batch_verdict_must_name_a_claim_in_the_batch() -> None:
+    """`needs_dataflow` is an escalation, not a dropped claim, and a stranger id is not admissable."""
+    from services.harness.agents import _parse_verdict_batch
+
+    parsed = _parse_verdict_batch(
+        {
+            "verdicts": [
+                {"candidate_id": "C-1", "verdict": "confirmed", "confidence": 0.8, "reasons": ["r"]},
+                {"candidate_id": "C-2", "verdict": "needs_dataflow", "confidence": 0.0, "reasons": []},
+                {"candidate_id": "C-9", "verdict": "confirmed", "confidence": 0.9, "reasons": []},
+                {"candidate_id": "C-1", "verdict": "rejected", "confidence": 0.5, "reasons": []},
+                {"candidate_id": "C-3", "verdict": "nonsense", "confidence": 0.5, "reasons": []},
+            ]
+        },
+        known=["C-1", "C-2", "C-3"],
+    )
+    assert [v.candidate_id for v in parsed.verdicts] == ["C-1"]
+    assert parsed.verdicts[0].evidence_kind == EvidenceKind.SEMANTIC, (
+        "a batch run has no trace tool, so every verdict it can give rests on reading"
+    )
+    assert parsed.escalate == ["C-2"]
+
+
+def test_the_candidate_entry_points_survive_discovery_and_the_finding() -> None:
+    """`entry_points` is per instance, and the merge must not be the place it disappears."""
+    from services.harness.agents import _parse_candidates
+
+    parsed = _parse_candidates(
+        {
+            "candidates": [
+                {
+                    "title": "anonymous upload",
+                    "vulnerability_type": "path_traversal",
+                    "file": "AppFileController.java",
+                    "line": 39,
+                    "entry_points": ["POST /app-api/infra/file/upload (AppFileController.java:38)"],
+                }
+            ]
+        },
+        scope_id="scope-web-file-app",
+    )
+    assert parsed[0].entry_points == ["POST /app-api/infra/file/upload (AppFileController.java:38)"]
+
+    # Two records of one sink, reached differently: merged for judging, both entries kept.
+    guarded = parsed[0].model_copy(
+        update={"candidate_id": "C-guarded", "entry_points": ["POST /admin-api/infra/file/upload (AdminFileController.java:52)"]}
+    )
+    merged = [parsed[0], guarded]
+    assert agents.validation_group_key(parsed[0]) == agents.validation_group_key(guarded)
+    assert agents.instance_entry_points(merged) == [
+        "POST /app-api/infra/file/upload (AppFileController.java:38)",
+        "POST /admin-api/infra/file/upload (AdminFileController.java:52)",
+    ]
+    # The attack-path task is the stage that *produces* `entry_points`, so it has to be handed them.
+    task = agents.attack_path_task(
+        SimpleNamespace(workspace="/w"),
+        parsed[0],
+        CandidateVerdict(
+            candidate_id="C-1", verdict=VerdictKind.CONFIRMED, evidence_kind=EvidenceKind.SEMANTIC
+        ),
+        members=merged,
+    )
+    assert "union" in task
+    assert "POST /admin-api/infra/file/upload (AdminFileController.java:52)" in task
+
+
+def test_batching_judges_two_claims_in_one_run_without_merging_their_decisions(
+    tmp_path: Path,
+) -> None:
+    """The end-to-end property batching is allowed to change, and the ones it must not.
+
+    Measured basis: on `upp-module-infra` 139 validation runs decided 98 claims at 196 s each, and 110
+    of the run's 274 minutes went to this stage -- with `FileController.java` read 261 times across the
+    run. Two *different* claims in one file are the case that pays: one run reads the file once.
+
+    What must not move: each claim keeps its **own** verdict, confidence and reasons (not one verdict
+    copied), and both candidates carry a verdict so neither scope stays INSUFFICIENT.
+    """
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    first = candidate_payload(line=3)
+    second = candidate_payload(line=9, title="second concatenation in the same file")
+    # Assignment, not `script`: `two_scope_client` already queued one answer for this scope, and two
+    # *different* claims are what this test is about.
+    client.by_agent[(agents.DISCOVERY, SERVICE_SCOPE)] = [
+        discovery_answer(first, second),
+        discovery_answer(first, second),
+    ]
+    ids = [
+        agents.stable_candidate_id(SERVICE_SCOPE, payload["file"], payload["line"], "sql_injection")
+        for payload in (first, second)
+    ]
+    client.script(
+        agents.VALIDATION_BATCH,
+        "batch(2)",
+        final(
+            verdicts=[
+                {
+                    "candidate_id": ids[0],
+                    "verdict": "confirmed",
+                    "confidence": 0.9,
+                    "reasons": ["line 3 reaches the query unfiltered"],
+                },
+                {
+                    "candidate_id": ids[1],
+                    "verdict": "rejected",
+                    "confidence": 0.2,
+                    "reasons": ["line 9 is a parameterised call"],
+                },
+            ]
+        ),
+    )
+    client.stub_agent(
+        agents.ATTACK_PATH,
+        final(reachable=True, entry_points=["GET /users"], impact="read", confidence=0.7),
+    )
+
+    result = pipeline(
+        tmp_path, client, config=HarnessConfig(max_rounds=1, claim_batch_size=4)
+    ).run()
+    board = result.blackboard
+
+    batch_calls = [call for call in counter.calls if call[0] == agents.VALIDATION_BATCH]
+    single_calls = [call for call in counter.calls if call[0] == agents.VALIDATION]
+    assert len(batch_calls) == 1, "two claims from one file are one run"
+    assert single_calls == [], "and it is not additionally paid for per claim"
+
+    decided = {v.candidate_id: v for v in board.verdicts}
+    assert set(decided) == set(ids), "both claims decided"
+    assert decided[ids[0]].verdict is VerdictKind.CONFIRMED
+    assert decided[ids[1]].verdict is VerdictKind.REJECTED
+    assert decided[ids[0]].confidence == 0.9 and decided[ids[1]].confidence == 0.2, (
+        "each claim keeps its own confidence -- one verdict is not copied to the other"
+    )
+    assert "parameterised" in " ".join(decided[ids[1]].reasons)
+    assert all(v.evidence_kind is EvidenceKind.SEMANTIC for v in board.verdicts), (
+        "a batch run has no trace tool, so its verdicts rest on reading and say so"
+    )
+    # Both claims were in the task text with their ids, and the batch was told they are separate.
+    assert ids[0] in batch_calls[0][2] and ids[1] in batch_calls[0][2]
+    assert "one claim's evidence must never be used to settle another" in batch_calls[0][2]
+
+
+def test_a_batch_that_cannot_settle_a_claim_sends_it_back_out_alone(tmp_path: Path) -> None:
+    """`needs_dataflow` is an escalation, and a dropped claim is not allowed to be the outcome.
+
+    A batch has no `dataflow_verify` on purpose -- one run cannot attribute one trace to four claims,
+    and a mis-attributed path is worse than no path. So the claim that needs one is re-run as a single
+    validation, which has the tool.
+    """
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    first = candidate_payload(line=3)
+    second = candidate_payload(line=9, title="needs a trace")
+    client.by_agent[(agents.DISCOVERY, SERVICE_SCOPE)] = [
+        discovery_answer(first, second),
+        discovery_answer(first, second),
+    ]
+    ids = [
+        agents.stable_candidate_id(SERVICE_SCOPE, payload["file"], payload["line"], "sql_injection")
+        for payload in (first, second)
+    ]
+    client.script(
+        agents.VALIDATION_BATCH,
+        "batch(2)",
+        final(
+            verdicts=[
+                {"candidate_id": ids[0], "verdict": "confirmed", "confidence": 0.8, "reasons": ["read"]},
+                {"candidate_id": ids[1], "verdict": "needs_dataflow", "confidence": 0.0, "reasons": []},
+            ]
+        ),
+    )
+    client.stub_agent(agents.VALIDATION, validation_answer("rejected", confidence=0.4))
+    client.stub_agent(
+        agents.ATTACK_PATH,
+        final(reachable=True, entry_points=["GET /users"], impact="read", confidence=0.7),
+    )
+
+    board = pipeline(
+        tmp_path, client, config=HarnessConfig(max_rounds=1, claim_batch_size=4)
+    ).run().blackboard
+
+    decided = {v.candidate_id: v for v in board.verdicts}
+    assert set(decided) == set(ids), "the escalated claim is decided, not dropped"
+    assert decided[ids[1]].verdict is VerdictKind.REJECTED
+    assert len([call for call in counter.calls if call[0] == agents.VALIDATION]) == 1
+
+
+def test_a_location_decided_once_is_not_paid_for_again_in_a_later_round(tmp_path: Path) -> None:
+    """The 41 extra runs, pinned: a claim is a *location*, and the ledger has already decided it.
+
+    Measured on `upp-module-infra`: 139 validation runs for 98 distinct claims. The 41 extra are the
+    same position re-registered by a scope that got to it in a later round -- `find_verdict` is asked
+    about the new `candidate_id`, gets None, and the location is judged a second time.
+
+    The new instance must still end up with a verdict: a candidate without one keeps its scope
+    INSUFFICIENT forever, which is the trap that makes "just skip it" wrong.
+    """
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    service_here = candidate_payload(line=3)
+    elsewhere = candidate_payload(line=20, title="another site on the same page")
+    # Round 0: the service scope files line 3, the web scope files line 20. Round 1: the web scope
+    # reaches line 3 -- the location the service scope already paid to decide.
+    client.by_agent[(agents.DISCOVERY, SERVICE_SCOPE)] = [
+        discovery_answer(service_here),
+        discovery_answer(),
+    ]
+    client.by_agent[(agents.DISCOVERY, WEB_SCOPE)] = [
+        discovery_answer(elsewhere),
+        discovery_answer(service_here),
+    ]
+    client.stub_agent(agents.VALIDATION, validation_answer("confirmed", confidence=0.7))
+    client.stub_agent(
+        agents.ATTACK_PATH,
+        final(reachable=True, entry_points=["GET /users"], impact="read", confidence=0.7),
+    )
+
+    board = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=1)).run().blackboard
+
+    validation_calls = [call for call in counter.calls if call[0] == agents.VALIDATION]
+    assert len(validation_calls) == 2, (
+        "two locations were decided; the web scope's second record of line 3 must not be a third run"
+    )
+    by_line = {candidate.line: candidate for candidate in board.candidates}
+    assert set(by_line) == {3, 20}
+    late = bb.find_verdict(board, by_line[3].candidate_id)
+    assert late is not None, "the later instance still carries a verdict"
+    assert late.confidence == 0.7
+    assert any("没有为同一位置重复付费" in reason for reason in late.reasons), (
+        "and the report says the decision was inherited rather than re-made"
+    )
+    assert len([v for v in board.verdicts if v.candidate_id == by_line[3].candidate_id]) == 1
+
+
+def test_a_scope_that_keeps_failing_stops_being_dispatched(tmp_path: Path) -> None:
+    """`max_scope_retries`, from the measurement that motivated it.
+
+    On the `upp-module-infra` audit 3 scopes ended `budget`/`error` in **every one of the 4 rounds**,
+    and each round re-dispatched all three -- 9 agent runs whose outcome was known before they
+    started. One retry stays (a 504 that killed a run says nothing about the scope); beyond it the
+    scope is left INSUFFICIENT and the note says so, because "we stopped paying for this" and "we
+    looked and it was clean" must not look the same in the report.
+    """
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    client.by_agent[(agents.DISCOVERY, SERVICE_SCOPE)] = [
+        RuntimeError("gateway exploded"),
+        RuntimeError("gateway exploded"),
+        RuntimeError("gateway exploded"),
+    ]
+    client.script(agents.VALIDATION, WEB_SCOPE, validation_answer("confirmed"))
+    client.script(agents.ATTACK_PATH, WEB_SCOPE, final(reachable=True, impact="read", confidence=0.7))
+
+    coordinator = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=3, max_scope_retries=1))
+    board = coordinator.run().blackboard
+
+    # Counted from the client, not from `board.runs`: a run that raised while calling the model never
+    # reaches the ledger, and that is exactly the shape being counted.
+    service_calls = [
+        call for call in counter.calls if call[0] == agents.DISCOVERY and call[1] == SERVICE_SCOPE
+    ]
+    assert len(service_calls) == 2, "one retry, then the scope stops being paid for"
+    entry = next(e for e in board.coverage if e.scope_id == SERVICE_SCOPE)
+    assert entry.state is CoverageState.INSUFFICIENT, "the honest record is that it was never covered"
+    assert "没有任何 discovery" in entry.reason
+    assert any("stopped being re-dispatched" in note for note in coordinator.dataflow_notes), (
+        coordinator.dataflow_notes
+    )
+
+
+def test_a_round_that_finds_almost_nothing_does_not_buy_another_round(tmp_path: Path) -> None:
+    """The marginal-yield stop, and the two things it must not stop.
+
+    Measured per round on the module audit: +82, +60, +28, +22 new candidates, the last two costing 25
+    minutes and returning 19 of 161 confirmed findings. The clause is a ratio so a large repository is
+    not punished for finding more per round than a small one.
+    """
+    coordinator = pipeline(tmp_path, two_scope_client(), config=HarnessConfig(max_rounds=3))
+    coordinator.blackboard.candidates = [
+        Candidate(
+            candidate_id=f"C-{index}",
+            scope_id="scope-x",
+            title="t",
+            vulnerability_type="sql_injection",
+            file=f"f{index}.java",
+            line=1,
+        )
+        for index in range(100)
+    ]
+    assert coordinator._round_is_worth_it({"s": 30}, ["scope-x"]) is True, "30/100 clears 25%"
+    assert coordinator._round_is_worth_it({"s": 10}, ["scope-x"]) is False, "10/100 does not"
+
+    # An unread backlog is a known target, not a marginal yield: never stopped by this clause.
+    bb.set_coverage(
+        coordinator.blackboard,
+        "scope-x",
+        CoverageState.INSUFFICIENT,
+        reason=(
+            f"第 2 轮：本 scope 还有 3 个文件从未被完整读取（a.java、b.java、c.java）；"
+            f"{coordinator_mod.UNREAD_REASON_MARKER}"
+        ),
+    )
+    assert coordinator._round_is_worth_it({"s": 0}, ["scope-x"]) is True
+
+    # And the clause can be switched off, which is what restores the old behaviour.
+    coordinator.config.min_round_yield_ratio = 0.0
+    assert coordinator._round_is_worth_it({"s": 0}, ["scope-y"]) is True
+
+
+def test_attack_paths_are_batched_without_sharing_reachability(tmp_path: Path) -> None:
+    """Two confirmed claims in one file, one run, and reachability is *not* shared.
+
+    Measured basis: 72 attack-path runs for 161 confirmed candidates (34 minutes). Confirmed claims
+    from one file share the entry points this stage exists to find, so they are packed the same way
+    validation packs them -- but "the route reaching this sink" says nothing about the next one, so
+    each path has to come back on its own.
+    """
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    first = candidate_payload(line=3)
+    second = candidate_payload(line=9, title="second concatenation in the same file")
+    client.by_agent[(agents.DISCOVERY, SERVICE_SCOPE)] = [
+        discovery_answer(first, second),
+        discovery_answer(first, second),
+    ]
+    ids = [
+        agents.stable_candidate_id(SERVICE_SCOPE, payload["file"], payload["line"], "sql_injection")
+        for payload in (first, second)
+    ]
+    client.script(
+        agents.VALIDATION_BATCH,
+        "batch(2)",
+        final(
+            verdicts=[
+                {"candidate_id": ids[0], "verdict": "confirmed", "confidence": 0.9, "reasons": ["a"]},
+                {"candidate_id": ids[1], "verdict": "confirmed", "confidence": 0.9, "reasons": ["b"]},
+            ]
+        ),
+    )
+    client.script(
+        agents.ATTACK_PATH_BATCH,
+        "batch(2)",
+        final(
+            paths=[
+                {
+                    "candidate_id": ids[0],
+                    "reachable": True,
+                    "entry_points": ["GET /admin-api/users"],
+                    "impact": "full table read",
+                    "confidence": 0.8,
+                },
+                {
+                    "candidate_id": ids[1],
+                    "reachable": False,
+                    "entry_points": [],
+                    "impact": "internal only",
+                    "confidence": 0.6,
+                },
+            ]
+        ),
+    )
+
+    board = pipeline(
+        tmp_path, client, config=HarnessConfig(max_rounds=1, claim_batch_size=4)
+    ).run().blackboard
+
+    assert len([c for c in counter.calls if c[0] == agents.ATTACK_PATH_BATCH]) == 1
+    assert [c for c in counter.calls if c[0] == agents.ATTACK_PATH] == [], (
+        "the batch answers both, so neither is paid for again"
+    )
+    paths = {path.candidate_id: path for path in board.attack_paths}
+    assert set(paths) == set(ids)
+    assert paths[ids[0]].reachable is True and paths[ids[1]].reachable is False, (
+        "each claim keeps its own reachability"
+    )
+    assert paths[ids[0]].entry_points == ["GET /admin-api/users"]
+    assert paths[ids[1]].entry_points == []
+    severities = {finding.candidate_id: finding.severity for finding in board.findings}
+    assert severities[ids[0]] != severities[ids[1]], (
+        "reachability is what severity is derived from, so the two must not come out equal"
+    )
 
 
 def test_two_scopes_filing_one_site_get_one_validation_and_one_finding(tmp_path: Path) -> None:
@@ -2422,7 +2972,10 @@ def test_a_planner_created_scope_carries_the_files_the_planner_named(
                     "title": "planner scope",
                     "kind": "service-layer",
                     "rationale": "created by the planner",
-                    "files": [service_file, "nonexistent.py"],
+                    "question": "Can the caller control query structure?",
+                    "completion_criteria": "Trace caller to query construction",
+                    "priority": 1,
+                    "files": [service_file],
                 }
             ],
             excluded=[],
@@ -2565,7 +3118,9 @@ def test_the_prep_survey_is_on_the_board_before_the_first_model_call(tmp_path: P
     stage_starts = [
         event["stage"] for event in events if event["kind"] == "stage" and event["state"] == "start"
     ]
-    assert stage_starts[:2] == ["prep", "recon"], f"stages started in the wrong order: {stage_starts}"
+    assert stage_starts[:3] == ["prep", "recon", "security_inventory"], (
+        f"stages started in the wrong order: {stage_starts}"
+    )
 
     board = result.blackboard
     assert board.project is not None and board.project.languages.get("java") == 2
@@ -2629,118 +3184,6 @@ def test_the_pre_scans_route_markers_reach_recon_as_leads_but_not_the_board(
     assert "route_markers_in_code" not in _user_task(counter, agents.THREAT_MODEL)
 
 
-class BarrierClient(ScriptedClient):
-    """A model that will not answer an opening agent until *both* opening agents have asked.
-
-    That is the observable difference between "the two stages run concurrently" and "they run one after
-    the other". Sequentially, the first agent waits on a barrier the second never reaches; the barrier
-    breaks and the run fails loudly rather than passing slowly, which is what a timing assertion would
-    have done -- flakily.
-    """
-
-    def __init__(self, counter: CallCounter | None = None) -> None:
-        super().__init__(counter)
-        self.barrier = threading.Barrier(2, timeout=10)
-        #: How many model calls got *through* the barrier. Two means both opening agents were inside
-        #: `complete` at the same moment; a sequential pipeline leaves this at zero or breaks the
-        #: barrier, which is why the count -- not the absence of an exception -- is the assertion.
-        self.waited = 0
-
-    def complete(self, system: str, user: str) -> ChatResult:
-        if _which_agent(system) in (agents.RECON, agents.THREAT_MODEL):
-            self.barrier.wait()
-            self.waited += 1
-        return super().complete(system, user)
-
-
-def test_recon_and_threat_modelling_actually_overlap(tmp_path: Path) -> None:
-    """Both opening agents run at the same time -- in every pass the stage makes.
-
-    Concurrency is not a speed tweak: the blackboard is the only channel between them, so an overlap is
-    what lets one see the other's facts while both are still working. Both passes are checked, because
-    the second pass is the *normal* shape of this stage: an agent can only read the peer's final answer
-    after that answer was merged, and one of the two runs always ends last.
-    """
-    counter = CallCounter()
-    client = BarrierClient(counter)
-    for agent, answer in opening_answers().items():
-        client.script(agent, "workspace", answer, answer)
-    client.script(
-        agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale="nothing further")
-    )
-    client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
-
-    coordinator = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=1))
-    coordinator.attach_trail()
-    result = coordinator.run()
-
-    assert not client.barrier.broken, (
-        "a broken barrier means one opening agent never reached the model while the other waited"
-    )
-    assert client.waited == 4, (
-        "both opening agents must have been inside the model call at the same time, in both passes"
-    )
-    ran = {run.agent for run in result.blackboard.runs}
-    assert {agents.RECON, agents.THREAT_MODEL} <= ran
-    assert all(run.stop_reason == "finished" for run in result.blackboard.runs)
-
-    events = _events(coordinator)
-    opening = {agents.RECON, agents.THREAT_MODEL}
-
-    def pass_seqs(index: int) -> tuple[list[int], list[int]]:
-        """The start and end sequence numbers of one pass's opening runs, read off their ledger ids."""
-        suffix = "" if index == 1 else f":p{index}"
-        ids = {f"{agent}:workspace{suffix}" for agent in opening}
-        starts = sorted(
-            e["seq"] for e in events if e["kind"] == "agent_start" and e["run_id"] in ids
-        )
-        ends = sorted(
-            e["seq"] for e in events if e["kind"] == "agent_end" and e["run_id"] in ids
-        )
-        return starts, ends
-
-    for index in (1, 2):
-        starts, ends = pass_seqs(index)
-        assert len(starts) == len(ends) == 2, f"pass {index} must have run both opening agents"
-        assert max(starts) < min(ends), (
-            f"pass {index}'s two agents did not overlap; sequential stages interleave"
-        )
-
-
-def test_the_overlap_assertion_would_notice_a_sequential_opening(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The barrier above has teeth: run the opening stages one after the other and it breaks.
-
-    Without this, "the two stages overlap" could pass because the instrument never fired -- a barrier
-    nobody waits on is not broken either. Only the opening stage is driven here; the rest of the
-    pipeline is not what this is about.
-    """
-    def sequential(self) -> None:
-        self._prepare()
-        self._run_recon()
-        self._run_threat_model()
-
-    monkeypatch.setattr(HarnessCoordinator, "_recon_and_threat_model", sequential)
-    client = BarrierClient()
-    client.barrier = threading.Barrier(2, timeout=1)
-    client.script(
-        agents.RECON, "workspace",
-        final(languages={}, build_systems=[], entry_points=[], components=[],
-              trust_boundaries=[], notes=[]),
-    )
-    client.script(
-        agents.THREAT_MODEL, "workspace",
-        final(assets=[], actors=[], threats=[], out_of_scope=[], notes=[]),
-    )
-
-    coordinator = pipeline(tmp_path, client, config=HarnessConfig())
-    with pytest.raises(threading.BrokenBarrierError):
-        coordinator._recon_and_threat_model()
-
-    assert client.waited == 0, "a sequential opening cannot get two agents through a two-party barrier"
-
-
 def test_a_recorded_fact_lands_on_the_board_while_the_agent_is_still_investigating(
     tmp_path: Path,
 ) -> None:
@@ -2781,6 +3224,14 @@ def test_a_recorded_fact_lands_on_the_board_while_the_agent_is_still_investigati
     )
     client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
     client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
+    client.stub_agent(
+        agents.SECURITY_INVENTORY,
+        final(
+            entry_points=[], authorization_controls=[], dangerous_capabilities=[],
+            configurations=[], dependencies=[], state_controls=[],
+            coverage_gaps=[], files_reviewed=[],
+        ),
+    )
 
     coordinator = HarnessCoordinator(
         workspace=root,
@@ -2857,7 +3308,7 @@ def test_every_record_kind_the_tool_offers_can_actually_be_written(tmp_path: Pat
         "threat": json.dumps({"id": "T-1", "title": "SQLi in search", "asset": "items"}),
         "lead": json.dumps({"to_scope": "scope-b", "why": "the same query builder is reused there"}),
     }
-    assert sorted(payloads) == sorted(KINDS), "a kind was added or removed: cover it here"
+    assert sorted(payloads) == sorted(set(KINDS) - {"evidence", "candidate", "gap"}), "a kind was added or removed: cover it here"
 
     for kind, text in payloads.items():
         outcome = coordinator._record({"kind": kind, "text": text, "scope": "scope-a"})
@@ -2909,38 +3360,19 @@ def test_a_record_the_contract_cannot_hold_is_refused_with_a_reason(tmp_path: Pa
     assert "重复" in second["note"]
 
 
-def test_the_threat_model_reads_what_recon_recorded_beside_it(tmp_path: Path, monkeypatch) -> None:
-    """The blackboard is a *shared* medium: the peer's mid-run write is readable while it is running.
+def test_the_threat_model_does_not_see_what_recon_publishes(tmp_path: Path) -> None:
+    """Recon records survive, but cannot enter the independently frozen threat-model prompt.
 
-    This is the half that the write-only version was missing. Each agent's task text is fixed when its
-    run starts, so without a read the threat model could never see a component recon recorded one step
-    later -- the fact would reach the planner and the report, which run afterwards, and never its peer.
+    Both opening tasks are built from the deterministic survey before the concurrent runs start.
+    Security Inventory later reconciles their final outputs.
 
-    The gate makes the race deterministic: the threat model's first model call waits until recon's
-    component is on the board, which is exactly the "one step behind" situation the tool exists for.
-    Real tool layer, real writer, real `record` -- a fake `invoke` would prove none of it.
+    Real tool layer, real writer, real `record` — a fake `invoke` would prove none of it.
     """
-    recorded = threading.Event()
-    write = HarnessCoordinator._record
-
-    def spying_record(self, record):
-        outcome = write(self, record)
-        if record.get("kind") == "component":
-            recorded.set()
-        return outcome
-
-    monkeypatch.setattr(HarnessCoordinator, "_record", spying_record)
-
     component = {"id": "scope-svc-peer", "name": "service layer", "kind": "service-layer",
                  "path": "src/main/java/com/example/service"}
 
-    class WaitingClient(ScriptedClient):
-        def complete(self, system: str, user: str) -> ChatResult:
-            if _which_agent(system) == agents.THREAT_MODEL and not recorded.is_set():
-                assert recorded.wait(5), "recon's component never reached the blackboard"
-            return super().complete(system, user)
-
-    client = WaitingClient()
+    counter = CallCounter()
+    client = ScriptedClient(counter)
     client.script(
         agents.RECON, "workspace",
         turn("record", kind="component", text=json.dumps(component)),
@@ -2949,12 +3381,19 @@ def test_the_threat_model_reads_what_recon_recorded_beside_it(tmp_path: Path, mo
     )
     client.script(
         agents.THREAT_MODEL, "workspace",
-        turn("board", section="components"),
         final(assets=[], actors=[], threats=[{"id": "T-1", "title": "SQLi", "asset": "users"}],
               out_of_scope=[], notes=[]),
     )
     client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
     client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
+    client.stub_agent(
+        agents.SECURITY_INVENTORY,
+        final(
+            entry_points=[], authorization_controls=[], dangerous_capabilities=[],
+            configurations=[], dependencies=[], state_controls=[],
+            coverage_gaps=[], files_reviewed=[],
+        ),
+    )
 
     coordinator = HarnessCoordinator(
         workspace=workspace(tmp_path),
@@ -2965,18 +3404,12 @@ def test_the_threat_model_reads_what_recon_recorded_beside_it(tmp_path: Path, mo
     )
     result = coordinator.run()
 
-    threat_run = next(run for run in result.blackboard.runs if run.agent == agents.THREAT_MODEL)
-    read_step = next(
-        step for step in threat_run.steps if step.call is not None and step.call.tool is ToolName.BOARD
-    )
-    assert read_step.result is not None and read_step.result.ok, (
-        "the board read must succeed through the real tool layer and the real view builder"
-    )
-    assert "scope-svc-peer" in read_step.result.summary, (
-        "the peer's recorded component must be in what the threat model reads"
-    )
-    assert read_step.index < len(threat_run.steps), "it read the board before finishing"
-    # And the final answer still went through as its own claim.
+    # Recon's run-time publication must not enter the already-frozen threat-model task.
+    threat_task = next(user for agent, _scope, user in counter.calls if agent == agents.THREAT_MODEL)
+    assert "scope-svc-peer" not in threat_task
+    # The recorded fact survived the staged answer, and the threat model's own claim merged beside it.
+    recorded = {item["id"] for item in result.blackboard.architecture.components}
+    assert "scope-svc-peer" in recorded
     assert "T-1" in [threat.get("id") for threat in result.blackboard.threats.threats]
 
 
@@ -3056,6 +3489,14 @@ def test_threat_modelling_still_runs_when_recon_produces_nothing(tmp_path: Path)
     )
     client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
     client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
+    client.stub_agent(
+        agents.SECURITY_INVENTORY,
+        final(
+            entry_points=[], authorization_controls=[], dangerous_capabilities=[],
+            configurations=[], dependencies=[], state_controls=[],
+            coverage_gaps=[], files_reviewed=[],
+        ),
+    )
 
     coordinator = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=1))
     result = coordinator.run()
@@ -3072,7 +3513,7 @@ def test_threat_modelling_still_runs_when_recon_produces_nothing(tmp_path: Path)
     assert "survey:" in threat_task, "the threat model must be told which facts it can trust"
 
 
-def test_record_is_given_to_the_opening_agents_and_to_nobody_else() -> None:
+def test_record_is_given_only_to_opening_and_discovery_agents() -> None:
     """Writes go through one tool, held by the two agents that have no other channel.
 
     Discovery and validation report through their own schema, which the coordinator turns into ledger
@@ -3083,357 +3524,97 @@ def test_record_is_given_to_the_opening_agents_and_to_nobody_else() -> None:
     assert ToolName.RECORD in agents.AGENTS[agents.RECON].tools
     assert ToolName.RECORD in agents.AGENTS[agents.THREAT_MODEL].tools
     for spec in agents.AGENTS.values():
-        if spec.name in (agents.RECON, agents.THREAT_MODEL):
+        if spec.name in (agents.RECON, agents.THREAT_MODEL, agents.DISCOVERY):
             continue
         assert ToolName.RECORD not in spec.tools, f"{spec.name} must not be able to write"
 
 
-def test_the_shared_medium_is_writable_and_readable_by_the_same_two_agents() -> None:
-    """`record` and `board` come as a pair, and only where the concurrency argument holds.
+def test_the_write_and_read_surfaces_match_the_single_round_design() -> None:
+    """`record` goes to the agents that have no other channel; `board` to the one that consumes updates.
 
-    A writer without a reader is a log, not sharing: the peer's task text is fixed when its run starts,
-    so `board` is the only way one opening agent can see what the other recorded a step ago. The later
-    stages get neither: they run against a board that is already populated and they spend on code, and
-    a discovery agent handed the ability to read the whole board would ration its steps against state
-    instead of against the repository.
+    Since the opening went single-round (2026-09-18) the two opening agents no longer read each other:
+    the threat model's task is *built from* what recon published, so `board` moved to where a peer
+    actually writes mid-run — discovery, whose planner updates arrive while it works (phase 2's inbox).
+    Everything else runs against a board that is already populated and spends on code.
     """
-    for name in (agents.RECON, agents.THREAT_MODEL):
+    for name in (agents.RECON, agents.THREAT_MODEL, agents.DISCOVERY):
         spec = agents.AGENTS[name]
-        assert ToolName.RECORD in spec.tools and ToolName.BOARD in spec.tools, name
+        assert ToolName.RECORD in spec.tools, name
+    assert ToolName.BOARD in agents.AGENTS[agents.DISCOVERY].tools, (
+        "discovery is the agent whose planner updates arrive mid-run"
+    )
     for spec in agents.AGENTS.values():
-        if spec.name in (agents.RECON, agents.THREAT_MODEL):
+        if spec.name in (agents.RECON, agents.THREAT_MODEL, agents.DISCOVERY):
             continue
         assert ToolName.BOARD not in spec.tools, f"{spec.name} has no peer to read"
 
 
-# ─────────────────────── the opening converges on what each agent has actually read
+# ─────────────────────── the opening is single-round by design
 
 
-def opening_convergence_client(client: ScriptedClient | None = None) -> ScriptedClient:
-    """An opening pair whose second pass is the re-read the convergence rule asks for.
-
-    Both agents publish a final answer in pass 1, and neither can have read the other's final while
-    both were still running: a run ends at its `final`, so the peer's final always lands after at least
-    one of them stopped looking. That is why pass 2 exists, and why the default `max_opening_passes` is
-    2 rather than 1 -- one pass can publish the pair's answers, but only a second look can consume
-    them. The second-pass answer is a `board` read followed by the same payload, which is exactly what
-    a converged pair produces: nothing new to publish.
-    """
-    client = client or ScriptedClient()
-    answers = opening_answers()
-    client.script(
-        agents.RECON,
-        "workspace",
-        answers[agents.RECON],
-        turn("board", section="components"),
-        answers[agents.RECON],
-    )
-    client.script(
-        agents.THREAT_MODEL,
-        "workspace",
-        turn("board", section="components"),
-        answers[agents.THREAT_MODEL],
-        answers[agents.THREAT_MODEL],  # only used if the stage wrongly re-dispatches it
-    )
-    client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
-    client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
-    return client
-
-
-def test_the_opening_converges_and_only_the_agent_that_was_behind_is_redispatched(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The stage stops when both have read the peer's material, and re-runs only the one who has not.
-
-    Real tool layer, because the whole rule is built on what a real `board` call reports: the watermark
-    is the board revision the tool served, read back out of the ledger. A fake `invoke` returns no
-    revision, so a test against the fake layer would prove the loop runs and nothing about whether it
-    can ever converge.
-
-    The gate makes the redispatched set exact rather than a race: the threat model's first model call
-    waits until recon's final answer has been merged, so it ends pass 1 up to date while recon has read
-    nothing at all.
-    """
-    gate = threading.Event()
-    publish = HarnessCoordinator._publish
-
-    def gated_publish(self, by, kinds, label):
-        publish(self, by, kinds, label)
-        if by == agents.RECON:
-            gate.set()
-
-    monkeypatch.setattr(HarnessCoordinator, "_publish", gated_publish)
-
-    class WaitingClient(ScriptedClient):
-        def complete(self, system: str, user: str) -> ChatResult:
-            if _which_agent(system) == agents.THREAT_MODEL and not gate.is_set():
-                assert gate.wait(5), "recon's final answer never reached the blackboard"
-            return super().complete(system, user)
-
-    client = opening_convergence_client(WaitingClient())
-    coordinator = HarnessCoordinator(
-        workspace=workspace(tmp_path),
-        config=HarnessConfig(max_rounds=1, max_opening_passes=2),
-        client=client,
-        out_dir=tmp_path / "out",
-        run_id="run-opened",
-    )
-    result = coordinator.run()
-
-    opening = result.blackboard.opening
-    assert opening is not None
-    assert opening.converged is True, opening.note
-    assert opening.unread == {}, "nothing may be left unread when the stage says it converged"
-    assert opening.passes == 2
-
-    ran = [
-        (run.agent, run.run_id)
-        for run in result.blackboard.runs
-        if run.agent in (agents.RECON, agents.THREAT_MODEL)
-    ]
-    assert ran == [
-        (agents.RECON, "recon:workspace"),
-        (agents.THREAT_MODEL, "threat_model:workspace"),
-        (agents.RECON, "recon:workspace:p2"),
-    ], "only recon was behind after pass 1, so only recon is re-dispatched"
-
-
-def test_a_pass_that_adds_nothing_new_ends_the_opening(tmp_path: Path) -> None:
-    """The loop stops when a pass produces nothing substantive -- and it does not need a `board` call.
-
-    The first version required each agent to *read* the peer's material through the tool, which measured
-    willingness to call a tool rather than what the agent had been given: a model that ignored `board`
-    stayed "behind" forever, so the stage always ran to its cap and reported "未收敛" on runs where
-    nothing was wrong. Delivery is what the coordinator owns -- the re-dispatch task text *is* the delta
-    -- so an agent counts as up to date once it has been handed the material or has read that far
-    itself. Here neither agent ever calls `board` and the pair still converges: pass 2 re-states the same
-    answers, publishes nothing new, and the stage stops at 2 passes out of a cap of 3.
-    """
-    client = ScriptedClient()
-    for agent, answer in opening_answers().items():
-        client.script(agent, "workspace", answer, answer)
-    client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
-    client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
-
-    coordinator = HarnessCoordinator(
-        workspace=workspace(tmp_path),
-        config=HarnessConfig(max_rounds=1),
-        client=client,
-        out_dir=tmp_path / "out",
-        run_id="run-converged",
-    )
-    result = coordinator.run()
-
-    opening = result.blackboard.opening
-    assert opening is not None
-    assert opening.converged is True, opening.note
-    assert opening.passes == 2, "the cap is 3; converging on 2 is the point"
-    assert opening.unread == {}
-    assert not [run for run in result.blackboard.runs if run.run_id.endswith(":p3")]
-
-    # Counted too, so the screen and the report can show it without parsing prose.
-    assert coordinator.trail.counters(result.blackboard)["opening_unread"] == 0
-
-
-def test_an_opening_that_keeps_producing_new_material_hits_the_cap_and_says_so(
+def test_the_opening_runs_each_agent_exactly_once_and_does_not_cross_read(
     tmp_path: Path,
 ) -> None:
-    """Hitting the pass cap is a recorded gap, not a silent "done".
+    """The 2026-09-18 design change, pinned: recon once, threat model once, **no convergence loop**.
 
-    Measured on the demo: recon's second pass recorded four trust boundaries (`request.args` reaching a
-    concatenated query, `repo.connect` opening a cwd-relative `app.db`) that the threat model had not
-    seen when the cap stopped the stage. A stage that could not tell that apart from a converged pair
-    would report the same thing for both -- and the threat model would look like it had been written
-    against recon's architecture map when it had not.
+    The loop this replaces ran up to `max_opening_passes`, re-dispatching whichever agent had unread
+    peer publications; on the real module audit it ran 3 passes and still reported `unread=2`, and on
+    the demo pass 2's publications were rephrasings of what both sides had already seen. Reconciling
+    the two outputs is now the AI security-inventory stage's job, which runs after both.
+
+    Both prompts are frozen from the deterministic survey before either agent starts. Completion order
+    is intentionally irrelevant; Security Inventory is the first stage allowed to reconcile them.
     """
-    client = ScriptedClient()
-    for pass_index in (1, 2):
-        # Each pass publishes something *new*, which is what keeps the peer behind: an opening that never
-        # runs out of things to say is exactly the case a cap exists for.
-        client.script(
-            agents.RECON,
-            "workspace",
-            final(
-                languages={"java": 2},
-                build_systems=["maven"],
-                entry_points=[],
-                components=[{"id": f"scope-new-{pass_index}", "name": f"area {pass_index}"}],
-                trust_boundaries=[f"boundary {pass_index}"],
-                notes=[],
-            ),
-        )
-        client.script(
-            agents.THREAT_MODEL,
-            "workspace",
-            final(
-                assets=[],
-                actors=[],
-                threats=[{"id": f"T-{pass_index}", "title": f"threat {pass_index}", "asset": "x"}],
-                out_of_scope=[],
-                notes=[],
-            ),
-        )
-    client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
-    client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    # two_scope_client already stubs the inventory and discovery stages; this test only pins the
+    # opening's shape, so the planner's scripted scopes are fine.
 
-    coordinator = HarnessCoordinator(
-        workspace=workspace(tmp_path),
-        config=HarnessConfig(max_rounds=1, max_opening_passes=2),
-        client=client,
-        out_dir=tmp_path / "out",
-        run_id="run-unconverged",
-    )
+    coordinator = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=1))
     result = coordinator.run()
 
     opening = result.blackboard.opening
     assert opening is not None
-    assert opening.converged is False
-    assert opening.passes == 2, "the cap is what stopped it"
-    assert opening.unread, "the report has to be able to name what was never read"
-    assert "未收敛" in opening.note and "上限" in opening.note
-    assert coordinator.trail.counters(result.blackboard)["opening_unread"] > 0
+    assert opening.passes == 1
+    assert opening.converged is True
+    assert "单轮" in opening.note and "不互读" in opening.note
 
-
-def test_one_opening_pass_is_available_for_a_run_that_wants_it_cheap(tmp_path: Path) -> None:
-    """The cap is a knob, and `1` means what it says: publish once, do not pair up afterwards."""
-    client = ScriptedClient()
-    for agent, answer in opening_answers().items():
-        client.script(agent, "workspace", answer, answer)
-    client.script(agents.PLANNER, "plan", final(scopes=[], excluded=[], rationale=""))
-    client.stub_agent(agents.DISCOVERY, final(candidates=[], notes=[]))
-
-    coordinator = HarnessCoordinator(
-        workspace=workspace(tmp_path),
-        config=HarnessConfig(max_rounds=1, max_opening_passes=1),
-        client=client,
-        out_dir=tmp_path / "out",
-        run_id="run-one-pass",
+    ran = [run.agent for run in result.blackboard.runs if run.agent in (agents.RECON, agents.THREAT_MODEL)]
+    assert sorted(ran) == sorted([agents.RECON, agents.THREAT_MODEL])
+    calls = [agent for agent, _scope, _user in counter.calls]
+    assert calls.index(agents.RECON) < calls.index(agents.SECURITY_INVENTORY)
+    assert calls.index(agents.THREAT_MODEL) < calls.index(agents.SECURITY_INVENTORY)
+    threat_task = next(user for agent, _scope, user in counter.calls if agent == agents.THREAT_MODEL)
+    assert "GET /users" not in threat_task, "threat modelling must not consume Recon's answer"
+    assert not [run for run in result.blackboard.runs if ":p2" in run.run_id], (
+        "no pass-suffixed re-dispatch may exist"
     )
-    result = coordinator.run()
-
-    opening = result.blackboard.opening
-    assert opening is not None and opening.passes == 1
-    assert opening.converged is False, (
-        "one pass cannot converge: an agent's final is published after its peer stopped looking"
-    )
-    assert not [run for run in result.blackboard.runs if run.run_id.endswith(":p2")]
 
 
-def test_only_substantive_writes_make_the_peer_stale(tmp_path: Path) -> None:
-    """What makes the other opening agent stale is what could change its reading of the code.
+def test_the_inventory_stage_reconciles_what_the_opening_published(tmp_path: Path) -> None:
+    """The reason the opening no longer cross-reads: reconciliation moved to its own stage.
 
-    Two sides, and the second one is the one a real run taught:
-
-    * **In**: components, trust boundaries, entry points and threats. A new component or a new entry
-      point can change what the peer concludes, so the peer is re-dispatched to look.
-    * **Out**: notes, leads, assets and actors. Notes and leads are commentary. Assets and actors are
-      *descriptions of the same few things*, so two agents writing them always produce more of them --
-      measured on the demo, pass 2 published an asset, an actor, a note and a lead, all rephrasings, and
-      the stage reported "未收敛" as if there were work waiting when nothing unread could have changed
-      either answer. Those four are not dropped (the planner and the report read the final board); they
-      just no longer buy another agent run.
-
-    An agent is also never stale on its own writes: the point is to read the other one.
+    The security-inventory agent's task carries recon's project/architecture **and** the threat model,
+    so anything the old convergence loop was trying to achieve — one agent's output informing the
+    other — happens here, once, with source reads to verify.
     """
-    coordinator = pipeline(tmp_path, ScriptedClient(), config=HarnessConfig(max_rounds=1))
-    seed = coordinator.blackboard.revision
-    watermarks = {agents.RECON: seed, agents.THREAT_MODEL: seed}
-    coordinator._current.agent = agents.THREAT_MODEL  # as if the threat model were writing
-
-    for kind, text in (("note", "uses sqlite3 directly"), ("asset", "the users table"),
-                       ("actor", "anonymous internet user")):
-        coordinator._record({"kind": kind, "text": text, "scope": "workspace"})
-    coordinator._record({
-        "kind": "lead",
-        "text": json.dumps({"to_scope": "scope-root", "why": "dead sqlite3 import lives there"}),
-        "scope": "workspace",
-    })
-    assert coordinator._opening_backlog(watermarks)[agents.RECON] == [], (
-        "commentary and descriptions must not make the peer stale"
-    )
-
-    for kind, text, expected in (
-        ("component", json.dumps({"id": "scope-a", "name": "svc"}), ["components"]),
-        ("trust_boundary", "HTTP query parameter q", ["trust_boundaries"]),
-        ("entry_point", "GET /search (handler.py:6)", ["entry_points"]),
-        (
-            "threat",
-            json.dumps({"id": "T-1", "title": "SQLi", "asset": "users"}),
-            ["threats"],
+    counter = CallCounter()
+    client = two_scope_client(counter)
+    client.stub_agent(
+        agents.SECURITY_INVENTORY,
+        final(
+            entry_points=[{"name": "GET /users", "file": "UserController.java", "line": 1}],
+            authorization_controls=[], dangerous_capabilities=[], configurations=[],
+            dependencies=[], state_controls=[], coverage_gaps=[], files_reviewed=[],
         ),
-    ):
-        before = len(coordinator._opening_backlog(watermarks)[agents.RECON])
-        coordinator._record({"kind": kind, "text": text, "scope": "workspace"})
-        backlog = coordinator._opening_backlog(watermarks)[agents.RECON]
-        assert len(backlog) == before + 1, f"{kind} must make the peer stale"
-        assert backlog[-1]["kinds"] == expected
-
-    assert coordinator._opening_backlog(watermarks)[agents.THREAT_MODEL] == [], (
-        "an agent is never stale on its own writes"
     )
 
-    # A duplicate publishes nothing, so a repeated fact cannot keep the loop alive either.
-    coordinator._record({"kind": "entry_point", "text": "GET /search (handler.py:6)", "scope": "workspace"})
-    assert len(coordinator._opening_backlog(watermarks)[agents.RECON]) == 4
+    board = pipeline(tmp_path, client, config=HarnessConfig(max_rounds=1)).run().blackboard
 
-
-def test_the_read_watermark_comes_from_the_tool_call_not_from_the_model() -> None:
-    """The watermark is a ledger fact: the revision a real `board` call served, or nothing.
-
-    Same rule as the coverage table, which counts real `read` calls rather than a model's claim to have
-    looked. A run that says it read the board without calling the tool has a watermark of None, and the
-    opening stage treats it as behind -- which is what "confirmation has to be evidence" means here.
-    """
-    from services.harness.coordinator import _board_revision_seen
-
-    run = AgentRun(run_id="recon:workspace", agent=agents.RECON, scope_id="workspace")
-    assert _board_revision_seen(run) is None
-
-    run.steps.append(
-        AgentStep(
-            index=1,
-            thought="读黑板",
-            call=ToolCall(tool=ToolName.BOARD, arguments={"section": "components"}),
-            result=ToolResult(
-                tool=ToolName.BOARD,
-                ok=True,
-                summary="{}",
-                data={"section": "components", "revision": 7},
-            ),
-        )
-    )
-    assert _board_revision_seen(run) == 7
-
-    run.steps.append(
-        AgentStep(
-            index=2,
-            thought="又一次",
-            call=ToolCall(tool=ToolName.BOARD, arguments={"section": "threats"}),
-            result=ToolResult(
-                tool=ToolName.BOARD,
-                ok=True,
-                summary="{}",
-                data={"section": "threats", "revision": 5},
-            ),
-        )
-    )
-    assert _board_revision_seen(run) == 7, "the highest revision read is the watermark"
-
-    run.steps.append(
-        AgentStep(
-            index=3,
-            thought="读失败",
-            call=ToolCall(tool=ToolName.BOARD, arguments={"section": "components"}),
-            result=ToolResult(
-                tool=ToolName.BOARD,
-                ok=False,
-                summary="拒绝",
-                error="board_reader_absent",
-                data={},
-            ),
-        )
-    )
-    assert _board_revision_seen(run) == 7, "a refused read served nothing and must not count"
+    inventory_task = next(user for agent, _s, user in counter.calls if agent == agents.SECURITY_INVENTORY)
+    assert "architecture" in inventory_task and "threat_model" in inventory_task
+    assert board.security_inventory is not None
+    assert board.security_inventory.entry_points[0]["name"] == "GET /users"
 
 
 # ─────────────────────── one area, many places: nothing may be lost at one id
@@ -3822,6 +4003,43 @@ def test_a_truncated_final_is_recovered_and_not_thrown_away() -> None:
 
     # A value cut off mid-string cannot be recovered, and is not guessed at.
     assert _parse_turn('{"thought": "t", "final": {"verdict": "confi')[0] is None
+
+
+def test_a_truncated_bare_batch_answer_still_yields_the_verdicts_that_were_written() -> None:
+    """What the quick run over the file subtree exposed, pinned.
+
+    `claim_batch_size=4` with the output ceiling at 8192 produced `batch(4)` answers that came back at
+    *exactly* 8192 output tokens, 73-102 s each, over and over until the run errored -- and every one
+    of them died the same way. The model wrote the schema's object directly, with no `"final"`
+    envelope (`{"thought": …, "verdicts": [ … ]}`), so a repair that only looked for `"final"` found
+    nothing to work with and the four claims stayed undecided.
+
+    A partial answer is the correct outcome here: the verdicts that were written are kept per claim,
+    and the coordinator re-runs whatever the batch did not answer.
+    """
+    from services.harness.agents import VALIDATION_BATCH_SCHEMA, _parse_verdict_batch
+    from services.harness.react import _parse_turn
+
+    answer = (
+        '{"thought": "judging four claims", "verdicts": ['
+        '{"candidate_id": "C-1", "verdict": "confirmed", "confidence": 0.8, "reasons": ["read it"]},'
+        '{"candidate_id": "C-2", "verdict": "rejected", "confidence": 0.4, "reasons": ["guarded"]},'
+        '{"candidate_id": "C-3", "verdict": "confir'
+    )
+    parsed, error, note = _parse_turn(answer, output_schema=VALIDATION_BATCH_SCHEMA)
+    assert error is None, "a truncated batch answer must not be a syntax error"
+    assert parsed is not None and parsed["_truncated"] is True
+    batch = _parse_verdict_batch(parsed["final"], known=["C-1", "C-2", "C-3", "C-4"])
+    assert [v.candidate_id for v in batch.verdicts] == ["C-1", "C-2"], (
+        "the two written verdicts survive; the half-written one is not guessed at"
+    )
+    assert batch.verdicts[0].verdict is VerdictKind.CONFIRMED
+    assert batch.verdicts[1].verdict is VerdictKind.REJECTED
+    assert "截断" in note
+
+    # Without a schema there is no way to tell the answer from its envelope, so the bare fallback is
+    # not offered -- otherwise `{"thought": "t"}` would be accepted as a stage's answer.
+    assert _parse_turn('{"thought": "t", "verdicts": [{"candidate_id": "C-1"')[0] is None
 
 
 def test_a_salvaged_final_is_spent_only_when_the_run_would_otherwise_produce_nothing() -> None:

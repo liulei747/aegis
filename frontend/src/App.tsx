@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api/client.ts";
 import { apiBase, apiBaseLabel } from "./api/config.ts";
-import type { BundleSummary, JobList } from "./api/types.ts";
+import type { BundleSummary, JobList, ProjectRecord } from "./api/types.ts";
 import { Banner, usePolled, useRoute, type Route } from "./components.tsx";
 import { isActive } from "./format.ts";
 import {
@@ -125,6 +125,11 @@ export function App() {
   // 屏都会再取一遍。
   const jobs = usePolled<JobList>(() => api.jobs(), [], { pollMs: POLL_MS });
   const bundles = usePolled<{ bundles: BundleSummary[] }>(() => api.bundles(), [], {
+    pollMs: SLOW_POLL_MS,
+  });
+  // 项目注册表也要轮询。两个 AI 模块的选择器**必须**能看见刚建好、还没有任何任务与分析包的
+  // 项目 —— 只从包与任务派生的话，用户建完项目、上传完文件，到深度审计页会发现选不到它。
+  const projects = usePolled<{ projects: ProjectRecord[] }>(() => api.projects(), [], {
     pollMs: SLOW_POLL_MS,
   });
 
@@ -293,6 +298,7 @@ export function App() {
             <VerdictsScreen
               bundles={bundles.data?.bundles ?? []}
               jobs={jobs.data?.jobs ?? []}
+              projects={projects.data?.projects ?? []}
               bundleId={route.bundleId}
               onOpenBundle={(bundleId) => navigate(`/bundle/${bundleId}`)}
             />
@@ -305,6 +311,7 @@ export function App() {
               workspace={route.workspace}
               onOpenAudit={() => navigate("/audit")}
               onOpenVerdicts={() => navigate("/verdicts")}
+              onOpenJob={(jobId) => navigate(`/job/${jobId}`)}
             />
           ) : null}
 
@@ -315,6 +322,8 @@ export function App() {
               jobId={route.jobId}
               jobs={jobs.data?.jobs ?? []}
               bundles={bundles.data?.bundles ?? []}
+              projects={projects.data?.projects ?? []}
+              workspace={route.workspace}
               onOpen={(jobId) => navigate(jobId ? `/audit/${jobId}` : "/audit")}
             />
           ) : null}

@@ -42,6 +42,7 @@ from aegis_contracts.harness import (
     CandidateVerdict,
     EvidenceKind,
     ProjectContext,
+    SecurityInventory,
     ThreatModel,
     ToolCall,
     ToolName,
@@ -62,10 +63,20 @@ log = get_logger(__name__)
 
 RECON = "recon"
 THREAT_MODEL = "threat_model"
+SECURITY_INVENTORY = "security_inventory"
 PLANNER = "planner"
+PLAN_UPDATE = "plan_update"
 DISCOVERY = "discovery"
 VALIDATION = "validation"
+#: Validation of several *different* claims in one run, each with its own verdict. Separate from
+#: `VALIDATION` because the schema, the tool allow-list and the parser all differ -- a batch has no
+#: `dataflow_verify` and must name the claim each verdict belongs to.
+VALIDATION_BATCH = "validation_batch"
 ATTACK_PATH = "attack_path"
+#: Attack paths for several *different* confirmed claims in one run, each with its own path. Separate
+#: from `ATTACK_PATH` for the same reason the validation batch is separate: a different schema and a
+#: different parser, and the answer has to name the claim each path belongs to.
+ATTACK_PATH_BATCH = "attack_path_batch"
 
 
 # ─────────────────────────────────────────────────────────── output schemas
@@ -191,6 +202,34 @@ THREAT_MODEL_SCHEMA: dict[str, Any] = {
     },
 }
 
+_SECURITY_INVENTORY_ROW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["name", "file", "line", "evidence", "why"],
+    "properties": {
+        "name": {"type": "string"},
+        "file": {"type": "string"},
+        "line": {"type": "integer", "minimum": 1},
+        "evidence": {"type": "string"},
+        "why": {"type": "string"},
+    },
+}
+
+SECURITY_INVENTORY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["entry_points", "authorization_controls", "dangerous_capabilities",
+                 "configurations", "dependencies", "state_controls", "coverage_gaps",
+                 "files_reviewed"],
+    "properties": {
+        key: {"type": "array", "items": _SECURITY_INVENTORY_ROW_SCHEMA}
+        for key in ("entry_points", "authorization_controls", "dangerous_capabilities",
+                    "configurations", "dependencies", "state_controls")
+    } | {
+        "coverage_gaps": {"type": "array", "items": {"type": "string"}},
+        "files_reviewed": {"type": "array", "items": {"type": "string"}},
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
 PLANNER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["scopes", "rationale"],
@@ -199,16 +238,18 @@ PLANNER_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["scope_id", "title", "rationale"],
+                "required": ["scope_id", "title", "question", "rationale", "files", "completion_criteria", "priority"],
                 "properties": {
                     "scope_id": {
                         "type": "string",
                         "description": (
-                            "Reuse the survey's scope id when you keep the scope; invent a stable, "
-                            "descriptive id when you split or add one."
+                            "Stable descriptive investigation id; never use scope-coverage-* ids."
                         ),
                     },
                     "title": {"type": "string"},
+                    "question": {"type": "string", "description": "Concrete operation/asset × security property question"},
+                    "completion_criteria": {"type": "string"},
+                    "priority": {"type": "integer", "minimum": 1, "maximum": 3},
                     "kind": {
                         "type": "string",
                         "description": "web-route | service-layer | data-access | config | batch-task | entrypoint | other",
@@ -224,7 +265,7 @@ PLANNER_SCHEMA: dict[str, Any] = {
                     "files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "the files this scope covers, workspace-relative",
+                        "description": "Concrete source starting files, workspace-relative; not file ownership",
                     },
                 },
             },
@@ -269,6 +310,18 @@ DISCOVERY_SCHEMA: dict[str, Any] = {
                         "description": "what in the code made this worth recording; cite what you read",
                     },
                     "evidence": {"type": "array", "items": {"type": "string"}},
+                    "entry_points": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "The entries that reach this site, one string per entry, shaped "
+                            "`GET /admin-api/infra/file/upload (AppFileController.java:38)` or "
+                            "`channel callback POST /payment/notify/yike`. Name every entry you can "
+                            "see, including the ones on other controllers or in other modules: the "
+                            "harness merges candidates by sink location, and these lists are how the "
+                            "differences between two records of one sink survive the merge."
+                        ),
+                    },
                 },
             },
         },
@@ -295,6 +348,45 @@ VALIDATION_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
             "description": "REQUIRED for both verdicts. For rejected: exactly why it is not a finding.",
+        },
+    },
+}
+
+#: The batched form of `VALIDATION_SCHEMA`: one run, one verdict per claim, and every verdict has to
+#: name the claim it belongs to. The `needs_dataflow` verdict is what keeps batching from costing
+#: capability: a claim that can only be settled by a traced path is sent back out as a single run
+#: (which has `dataflow_verify`), instead of being forced into a semantic guess.
+VALIDATION_BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["verdicts"],
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "required": ["candidate_id", "verdict", "confidence", "reasons"],
+                "properties": {
+                    "candidate_id": {
+                        "type": "string",
+                        "description": "the candidate id this verdict is about, copied verbatim",
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["confirmed", "rejected", "needs_dataflow"],
+                    },
+                    "confidence": {"type": "number", "description": "0..1"},
+                    "reasons": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "for this claim only. Each entry that was listed for it gets a line: "
+                            "reachable or not, and at what auth level. Do not cite another claim's "
+                            "evidence here."
+                        ),
+                    },
+                },
+            },
         },
     },
 }
@@ -355,16 +447,13 @@ Rules:
 * Prefer breadth first: a file listing and a couple of targeted reads beat reading one file deeply.
 * Write as you go. The moment a language count, a build system, an entry point, a component or a trust
   boundary is confirmed, put it on the blackboard with `record` (`component`, `entry_point`,
-  `trust_boundary`, `note`). Your final JSON is your conclusion; the blackboard is what the agent
-  running *beside you* can actually see, and it sees nothing you have not recorded.
+  `trust_boundary`, `note`). Your final JSON is your conclusion; incremental records preserve useful
+  facts if the run ends before its final answer.
 * Two granularities, and mixing them loses data: a `component` is an **area** (one row per directory,
   module or scope id, and reuse the `scope-…` id the pre-scan already used for it), while a concrete
   endpoint is an `entry_point` -- `GET /search (handler.py:6)`, one call per endpoint. Twenty routes are
   twenty entry points, not twenty components: a second component under an area's id becomes a *site* on
   that row, and while nothing is lost that way, the planner plans areas.
-* Read as well as write: `board` shows what has been confirmed so far, including what the other opening
-  agent recorded a step ago. Call it before you duplicate work someone else has already done, and use
-  the component `id`s it shows rather than inventing parallel ones for the same directory.
 * Use `record` for notes about anything that limits what you could establish -- a generated directory, a
   vendored dependency, a language you could not parse.
 * Output the JSON object described by the schema. No prose around it.
@@ -398,11 +487,30 @@ Rules:
 * Record as you go: an asset, an actor or a threat worth keeping goes onto the blackboard with
   `record` (`asset`, `actor`, `threat`) as soon as it is grounded, not only in your final JSON. A
   cross-scope lead you do not want to chase yourself is `record` with kind `lead`.
-* Reconnaissance is running beside you and its task was fixed before it started, so `board`
-  (`section=components`) is how you see the components **it** has confirmed since -- use its `id`s for
-  your threats instead of inventing your own. Do this before you name components and before you finish;
-  a threat attached to a component nobody else has heard of is a threat the planner cannot open work on.
+* Work from the supplied deterministic survey and verify any component your threat depends on directly
+  in source. Reconnaissance runs independently; do not wait for it or consume its findings.
 * Output the JSON object described by the schema. No prose around it.
+"""
+
+SECURITY_INVENTORY_PROMPT = """\
+You are the security-inventory agent. Reconnaissance and threat modelling have each completed one
+independent pass. Build the concrete security surface map that the planner will use.
+
+Enumerate, with source locations and evidence:
+* entry_points -- HTTP/RPC routes, message consumers, scheduled jobs, CLI/process entry points;
+* authorization_controls -- authentication, roles, object ownership, tenant boundaries and bypasses;
+* dangerous_capabilities -- SQL/query execution, command/process execution, outbound requests,
+  filesystem access, parsing/deserialization, template rendering and cryptographic operations;
+* configurations -- security switches, exposed management/debug surfaces, CORS/CSRF/TLS/session
+  settings, credentials and environment-dependent defaults;
+* dependencies -- declared direct dependencies and versions relevant to the exposed surface;
+* state_controls -- transactions, state transitions, idempotency, replay, locking and concurrency.
+
+Each row must be a JSON object with at least `name`, `file`, `line`, `evidence`, and `why`. Use an
+empty list only after checking that category. Read code/manifests to close gaps in Recon; do not copy
+generic threats as facts. `coverage_gaps` must state anything you could not enumerate. This inventory
+is planning context, not a vulnerability list: do not claim exploitability or emit candidates.
+Output only the JSON object described by the schema.
 """
 
 DISCOVERY_PROMPT = """\
@@ -433,8 +541,10 @@ You are the validation agent of a security review harness. You are given exactly
 Your job is to decide whether it is real, and to name the kind of evidence that decision needs.
 
 Decide `confirmed` or `rejected`, and choose `evidence_kind`:
-* `semantic` -- reading the code, its callers and its callees settles it. Use your `read` and
-  `shell_command` tools to look at the site, the methods around it, and the callers.
+* `semantic` -- reading the code, its callers and its callees settles it. Use your `read`, `grep`
+  and `shell_command` tools to look at the site, the methods around it, and the callers. `grep` is
+  the one to reach for when you are looking for a control, a caller or a sibling; it searches the
+  workspace in one call and does not count as reading a file.
 * `dataflow` -- only a traced source-to-sink path settles it. Then you MUST call
   `dataflow_verify` with the candidate's file and line. The tool derives the sink itself from the
   code; you cannot and must not tell it what the sink is.
@@ -451,6 +561,67 @@ Then answer with your verdict:
   upgrade a failed verification into a confirmation.
 * Output the JSON object described by the schema. No prose around it.
 """
+
+VALIDATION_BATCH_PROMPT = """\
+You are the validation batch agent of a security review harness. You are given **several separate
+candidates in one run**. Each one gets its own verdict, and the rules below are what keeps several
+decisions from becoming one:
+
+* Judge every candidate in the list, and answer with one entry of `verdicts` per candidate, with
+  `candidate_id` copied verbatim. A candidate you leave out stays undecided and has to be paid for
+  again in a separate run.
+* **One candidate's evidence may never settle another.** They were put in one run because they share
+  source files, not because they share a weakness: a control that defuses one leaves the other
+  exactly where it was. If you find yourself writing "same as above", the entries are wrong.
+* `reasons` are per candidate and must name what you verified *for that candidate*.
+* You have no `dataflow_verify` in this run, and that is deliberate: one trace cannot be attributed
+  to several candidates. A candidate that can only be settled by a traced path gets
+  `"verdict": "needs_dataflow"` -- say so and let the harness re-run it alone, with the tool. Do not
+  guess at a path and do not call a semantic reading a trace.
+* `confidence` is per candidate.
+* Output the JSON object described by the schema. No prose around it.
+
+## The single-candidate standard, unchanged
+
+""" + VALIDATION_PROMPT
+
+
+#: The batched form of `ATTACK_PATH_SCHEMA`. One run, one attack path per claim, each naming its own
+#: claim. Same reason as the validation batch: the reading is shared (these candidates were confirmed
+#: at sinks in the same files, reached by the same entry points), the judgement is not.
+ATTACK_PATH_BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["paths"],
+    "properties": {
+        "paths": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "required": ["candidate_id", "reachable", "impact", "confidence"],
+                "properties": {
+                    "candidate_id": {
+                        "type": "string",
+                        "description": "the candidate id this path is about, copied verbatim",
+                    },
+                    "reachable": {"type": "boolean"},
+                    "entry_points": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "for THIS candidate: the union across the instances listed",
+                    },
+                    "preconditions": {"type": "array", "items": {"type": "string"}},
+                    "auth_conditions": {"type": "array", "items": {"type": "string"}},
+                    "state_conditions": {"type": "array", "items": {"type": "string"}},
+                    "impact": {"type": "string"},
+                    "alternative_paths": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number", "description": "0..1, about reachability"},
+                },
+            },
+        },
+    },
+}
+
 
 ATTACK_PATH_PROMPT = """\
 You are the attack-path agent of a security review harness. You are given one *confirmed*
@@ -478,6 +649,26 @@ Rules:
 """
 
 
+ATTACK_PATH_BATCH_PROMPT = """\
+You are the attack-path batch agent of a security review harness. You are given **several separate
+confirmed candidates in one run**. Each one gets its own attack path, and the rules below are what
+keeps several answers from becoming one:
+
+* One entry of `paths` per candidate, with `candidate_id` copied verbatim. A candidate you leave out
+  stays without a path, and the report says its reachability was never established.
+* `reachable`, `entry_points`, `impact` and `confidence` are **per candidate**. They share source
+  files because the harness put them together, not because they share reachability: the same route
+  reaching one sink says nothing about the next.
+* `entry_points` for each candidate must be the **union** across the instances named for it, not only
+  the first one you looked at. If one instance is reachable anonymously and another only by an admin,
+  that difference *is* the severity -- put it in `auth_conditions`.
+* Output the JSON object described by the schema. No prose around it.
+
+## The single-candidate standard, unchanged
+
+""" + ATTACK_PATH_PROMPT
+
+
 PLANNER_PROMPT = """\
 You are the planning stage of a security review harness. You are given the repository's
 architecture, its threat model, and a survey of its directories. Your job is to decide where the
@@ -488,11 +679,11 @@ you open, the rationale must name what is being investigated and what makes it w
 which asset it touches, which threat it could carry, or which trust boundary it sits on.
 
 Rules:
-* Derive the scopes from what this system *is*: one per route group, component or trust boundary.
-  Not a fixed number, and not a fixed shape -- a repository with four controllers and one shared
-  service has five places to look, and saying so is the deliverable.
-* Reuse the survey's `scope_id` when you keep a scope; invent a stable, descriptive id when you
-  split or add one. Splitting a scope that is too large is expected and welcome.
+* Each scope investigates a concrete business operation or asset × security property.
+  Controller/service/mapper and SSRF/injection are labels, not reasons to scan the whole tree again.
+* Give each scope a stable id, a question, source starting files, rationale, completion_criteria
+  and priority (1 highest, 3 lowest). File-review ownership is fixed by the coordinator.
+* Proactively explore the threat model, including questions not yet raised by file reviews.
 * The survey's scopes come from directory names, which is weak evidence. Confirm, correct or
   replace them -- and where you keep one unchanged, say in the rationale that the evidence is
   directory names.
@@ -711,48 +902,99 @@ class AgentSpec:
 
 
 AGENTS: dict[str, AgentSpec] = {
+    PLAN_UPDATE: AgentSpec(
+        name=PLAN_UPDATE,
+        prompt="You are the Planner. Process only the supplied known leads. Return decisions; never remove file review tasks. "
+        "Use link for the same question on an existing investigation, create only for an independent concrete question, "
+        "defer or dismiss with a reason. Do not invent further questions. Each decision needs lead_id, action, reason. "
+        "link needs work_id; create needs title, files, completion_criteria, optional priority (1 highest, 3 lowest). "
+        "priority needs work_id and priority; merge needs source_work_id and work_id, only identical unstarted "
+        "investigations with the same question and files can merge. Never merge a file-review task. "
+        "Titles should be operation/asset × security property.",
+        tools=(),
+        schema={"type": "object", "required": ["decisions"], "properties": {
+            "decisions": {"type": "array", "items": {"type": "object", "required": ["lead_id", "action", "reason"],
+                "properties": {key: {"type": "string"} for key in
+                    ("lead_id", "action", "reason", "work_id", "source_work_id", "title", "completion_criteria")}
+                | {"priority": {"type": "integer", "minimum": 1, "maximum": 3},
+                   "files": {"type": "array", "items": {"type": "string"}}}}}},
+        },
+        max_output_items=40,
+    ),
     RECON: AgentSpec(
         name=RECON,
         prompt=RECON_PROMPT,
         tools=(
             ToolName.LIST_FILES,
             ToolName.READ,
+            ToolName.GREP,
             ToolName.SHELL,
             ToolName.RECORD,
-            ToolName.BOARD,
         ),
         schema=RECON_SCHEMA,
     ),
     THREAT_MODEL: AgentSpec(
         name=THREAT_MODEL,
         prompt=THREAT_MODEL_PROMPT,
-        tools=(ToolName.READ, ToolName.LIST_FILES, ToolName.RECORD, ToolName.BOARD),
+        tools=(ToolName.READ, ToolName.GREP, ToolName.LIST_FILES, ToolName.RECORD),
         schema=THREAT_MODEL_SCHEMA,
+    ),
+    SECURITY_INVENTORY: AgentSpec(
+        name=SECURITY_INVENTORY,
+        prompt=SECURITY_INVENTORY_PROMPT,
+        tools=(ToolName.READ, ToolName.GREP, ToolName.LIST_FILES, ToolName.SHELL),
+        schema=SECURITY_INVENTORY_SCHEMA,
+        max_output_items=200,
     ),
     PLANNER: AgentSpec(
         name=PLANNER,
         prompt=PLANNER_PROMPT,
-        tools=(ToolName.READ, ToolName.LIST_FILES, ToolName.SHELL),
+        tools=(ToolName.READ, ToolName.GREP, ToolName.LIST_FILES, ToolName.SHELL),
         schema=PLANNER_SCHEMA,
         max_output_items=40,
     ),
     DISCOVERY: AgentSpec(
         name=DISCOVERY,
-        prompt=DISCOVERY_PROMPT,
-        tools=(ToolName.READ, ToolName.LIST_FILES, ToolName.SHELL),
+        prompt=DISCOVERY_PROMPT + "\nPublish evidence, candidates and independent leads immediately with record. "
+        "Record unfinished checks using kind=gap: unread/basic_check/relationship/tool_failure, "
+        "with question,file,line,reason. Before finishing, resolve each known gap with state=resolved "
+        "and evidence_refs to recorded source facts, or retain its concrete breakpoint. "
+        "Use board before key tracing and before finishing to read task updates. "
+        "Evidence uses JSON {file,line,text,category: source_fact|hypothesis}; candidates use the final candidate fields. "
+        "Leads use {to_scope,question,file,line,evidence_refs,why}. Follow cross-file relations needed for your "
+        "current question yourself; only independent questions become leads. Never spawn agents. "
+        "Discovery cannot publish validation conclusions.",
+        tools=(ToolName.READ, ToolName.GREP, ToolName.LIST_FILES, ToolName.SHELL, ToolName.RECORD, ToolName.BOARD),
         schema=DISCOVERY_SCHEMA,
     ),
     VALIDATION: AgentSpec(
         name=VALIDATION,
         prompt=VALIDATION_PROMPT,
-        tools=(ToolName.READ, ToolName.SHELL, ToolName.DATAFLOW_VERIFY),
+        tools=(ToolName.READ, ToolName.GREP, ToolName.SHELL, ToolName.DATAFLOW_VERIFY),
         schema=VALIDATION_SCHEMA,
+    ),
+    VALIDATION_BATCH: AgentSpec(
+        name=VALIDATION_BATCH,
+        prompt=VALIDATION_BATCH_PROMPT,
+        # No `dataflow_verify` on purpose: one run cannot attribute one trace to four claims, and a
+        # mis-attributed path is worse than no path. A claim that needs one says `needs_dataflow` and
+        # gets its own run, which has the tool.
+        tools=(ToolName.READ, ToolName.GREP, ToolName.SHELL),
+        schema=VALIDATION_BATCH_SCHEMA,
+        max_output_items=6,
     ),
     ATTACK_PATH: AgentSpec(
         name=ATTACK_PATH,
         prompt=ATTACK_PATH_PROMPT,
-        tools=(ToolName.READ, ToolName.LIST_FILES, ToolName.SHELL),
+        tools=(ToolName.READ, ToolName.GREP, ToolName.LIST_FILES, ToolName.SHELL),
         schema=ATTACK_PATH_SCHEMA,
+    ),
+    ATTACK_PATH_BATCH: AgentSpec(
+        name=ATTACK_PATH_BATCH,
+        prompt=ATTACK_PATH_BATCH_PROMPT,
+        tools=(ToolName.READ, ToolName.GREP, ToolName.LIST_FILES, ToolName.SHELL),
+        schema=ATTACK_PATH_BATCH_SCHEMA,
+        max_output_items=6,
     ),
 }
 
@@ -839,34 +1081,36 @@ def prep_payload(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-#: Handed to an opening agent that is being re-dispatched, with the publications it has not read.
-#: This is the "delta sequence" of AutoGen's termination conditions
-#: (https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/termination.html)
-#: and the "prerequisite dependencies" of MetaGPT's shared pool
-#: (https://arxiv.org/abs/2308.00352 §3.2), in the form this harness can act on: the peer's material
-#: that appeared after this agent's last read of the board, and nothing else. Handing over the whole
-#: board again would pay for a full re-read of the repository to reach the same conclusion.
-REOPENING_DELTA = (
-    "这是**第二轮**：与你并发的那个 agent 在你上次读黑板之后又发布了下述内容，你还没读过它们。"
-    "请判断它们是否改变你的结论——需要修正就更正，不需要就原样重述你的答案。"
-    "要核对其中任何一条，仍然可以读代码或用 board 看黑板当前状态。不要从头重新调查一遍仓库。"
-)
+def security_inventory_payload(
+    inventory: Any, *, per_section: int | None = 8
+) -> dict[str, Any]:
+    """The inventory as planner input: counts plus full rows or a bounded preview.
 
-
-def opening_delta_block(backlog: list[dict]) -> str:
-    """The re-dispatch task section for one opening agent, or an empty string on the first pass."""
-    if not backlog:
-        return ""
-    items = [
-        {
-            "board_revision": item.get("revision"),
-            "by": item.get("by"),
-            "fields": item.get("kinds"),
-            "what": item.get("label"),
+    `None` (the stage did not run -- a dry run, or the opening produced nothing) becomes an empty
+    dict, and the planner's prompt says so by being short. The full lists stay on the blackboard;
+    The coordinator passes ``per_section=None`` because Planner has no ``board`` tool and therefore
+    needs the complete inventory. The bounded default remains useful for reports and callers that only
+    need a preview.
+    """
+    if inventory is None:
+        return {}
+    sections = (
+        "entry_points",
+        "authorization_controls",
+        "dangerous_capabilities",
+        "configurations",
+        "dependencies",
+        "state_controls",
+    )
+    out: dict[str, Any] = {}
+    for name in sections:
+        items = list(getattr(inventory, name, []) or [])
+        out[name] = {
+            "count": len(items),
+            "items": items if per_section is None else items[:per_section],
         }
-        for item in backlog
-    ]
-    return "\n".join([REOPENING_DELTA, _json({"未读的新内容": items})])
+    out["coverage_gaps"] = list(getattr(inventory, "coverage_gaps", []) or [])
+    return out
 
 
 def recon_task(
@@ -903,7 +1147,7 @@ def recon_task(
 def threat_model_task(blackboard: Blackboard, *, delta: str = "") -> str:
     return "\n".join(
         [
-            "Reconnaissance findings for this repository:",
+            "Deterministic survey context for this repository:",
             _json(
                 {
                     "project": _dump(blackboard.project),
@@ -911,17 +1155,26 @@ def threat_model_task(blackboard: Blackboard, *, delta: str = "") -> str:
                     "workspace": blackboard.workspace,
                 }
             ),
-            "Reconnaissance is running *at the same time* as you, so the map above is what exists on "
-            "the blackboard right now, not its final answer, and it may gain components while you work. "
-            "Do not wait for it and do not assume it is empty: it is already seeded with the "
-            "orchestrator's pre-scan and with everything recon has recorded so far. Call `board` to see "
-            "what recon has recorded *since* this task was written.",
+            "Reconnaissance runs independently from the same frozen survey. Verify threat-relevant "
+            "facts directly in source; you cannot consume Recon's output in this stage.",
             SURVEYED_ORIGIN,
             *([delta] if delta else []),
             INCREMENTAL_RECORD,
             "Produce the threat model, including what is explicitly out of scope.",
         ]
     )
+
+
+def security_inventory_task(blackboard: Blackboard) -> str:
+    return "\n".join([
+        f"Workspace root: {blackboard.workspace}",
+        "Reconnaissance and threat-model outputs:",
+        _json({"project": _dump(blackboard.project),
+               "architecture": _dump(blackboard.architecture),
+               "threat_model": _dump(blackboard.threats)}),
+        "Reconcile these outputs against source and manifests. Enumerate the security surface fully; "
+        "record uncertainty in coverage_gaps instead of guessing.",
+    ])
 
 
 def stored_read(blackboard: Blackboard, file: str) -> AgentStep | None:
@@ -1138,6 +1391,14 @@ def discovery_task(
     lines = [
         f"Scope: {item.scope_id} -- {item.title}",
         f"Why this scope was opened: {item.rationale}",
+        f"Question: {item.question or item.title}",
+        f"Completion criteria: {item.completion_criteria}",
+        f"Priority: {item.priority} (1 highest)",
+        "Unread source intervals [start,end inclusive; null means EOF]. On continuation use read "
+        "offset/limit to finish these intervals; re-read other lines only when needed for the check: "
+        + _json(item.unread_ranges),
+        "Known gaps (continue these exact checks; preserve unresolved questions): "
+        + _json([gap.model_dump(mode="json") for gap in item.gaps if gap.state != "resolved"]),
         f"Workspace root: {blackboard.workspace}",
     ]
     already = [*(reused or []), *(prefetched or [])]
@@ -1347,12 +1608,107 @@ def validation_task(
     return "\n".join(lines)
 
 
+def validation_batch_task(
+    blackboard: Blackboard,
+    items: list[tuple[Candidate, list[Candidate]]],
+    *,
+    material_budget: int = 0,
+) -> str:
+    """One task holding several *different* claims, each judged on its own.
+
+    Why this is not "validation with fewer runs": every claim keeps its own verdict, its own
+    confidence and its own reasons, and the three rules that make that checkable are stated in the
+    task rather than left to the model's judgement --
+
+    * each verdict names the claim it belongs to, verbatim;
+    * a claim that needs a traced path says `needs_dataflow` instead of guessing (the coordinator
+      re-runs it alone, with `dataflow_verify` available);
+    * one claim's evidence may not be used as another's.
+
+    What the run shares is the *reading*: the packets of the claims in the batch overlap on the same
+    files, and that overlap is why they were put together (`material.files_for` decides, not the file
+    name alone).
+    """
+    lines = [
+        f"You are judging {len(items)} separate candidates in one run. They are separate claims: "
+        "each needs its own verdict in `verdicts`, and one claim's evidence must never be used to "
+        "settle another.",
+        f"Workspace root: {blackboard.workspace}",
+        "",
+        "## The claims",
+    ]
+    for index, (candidate, members) in enumerate(items, start=1):
+        lines.append("")
+        lines.append(f"### Claim {index} -- `{candidate.candidate_id}`")
+        lines.append(_json(_dump(candidate)))
+        note = group_note(members)
+        if note:
+            lines.append(note)
+    packet = _material_many(blackboard, [candidate for candidate, _ in items], budget=material_budget)
+    if packet:
+        lines.append("")
+        lines.append(packet)
+    lines.append("")
+    lines.append(
+        "Answer with `verdicts`: one entry per claim above, `candidate_id` copied exactly, and "
+        "`reasons` that list every entry point the claim itself carries. Use `needs_dataflow` for a "
+        "claim you cannot settle by reading -- do not guess at a path."
+    )
+    return "\n".join(lines)
+
+
+def attack_path_batch_task(
+    blackboard: Blackboard,
+    items: list[tuple[Candidate, list[Candidate], CandidateVerdict]],
+    *,
+    material_budget: int = 0,
+) -> str:
+    """One task holding several confirmed claims, each getting its own attack path.
+
+    The shared part is the *reading* -- confirmed candidates from one controller share their entry
+    points, their callers and their configuration; the per-claim part is reachability, which is not
+    shared and is the entire output of this stage.
+    """
+    lines = [
+        f"You are establishing attack paths for {len(items)} separate confirmed candidates in one "
+        "run. Each one needs its own path in `paths`, and one candidate's reachability must never be "
+        "used as another's.",
+        f"Workspace root: {blackboard.workspace}",
+        "",
+        "## The confirmed candidates",
+    ]
+    for index, (candidate, members, verdict) in enumerate(items, start=1):
+        lines.append("")
+        lines.append(f"### Candidate {index} -- `{candidate.candidate_id}`")
+        lines.append(_json(_dump(candidate)))
+        lines.append("Validation verdict:\n" + _json(_dump(verdict)))
+        note = group_note(members)
+        if note:
+            lines.append(note)
+            lines.append(
+                "`entry_points` for this candidate must be the **union** across those instances, and "
+                "an instance reached anonymously versus one reached by an admin belongs in "
+                "`auth_conditions`."
+            )
+    packet = _material_many(blackboard, [candidate for candidate, _, _ in items], budget=material_budget)
+    if packet:
+        lines.append("")
+        lines.append(packet)
+    lines.append("")
+    lines.append(
+        "Answer with `paths`: one entry per candidate above, `candidate_id` copied exactly. "
+        "`confidence` is about reachability, not about the bug."
+    )
+    return "\n".join(lines)
+
+
 def attack_path_task(
     blackboard: Blackboard,
     candidate: Candidate,
     verdict: CandidateVerdict,
     *,
     material_budget: int = 0,
+    members: list[Candidate] | None = None,
 ) -> str:
     parts = [
         f"Scope: {candidate.scope_id} -- candidate {candidate.candidate_id}",
@@ -1361,10 +1717,62 @@ def attack_path_task(
         "Validation verdict:\n" + _json(_dump(verdict)),
         f"Workspace root: {blackboard.workspace}",
     ]
+    note = group_note(members or [candidate])
+    if note:
+        # The entries of the *other* instances are the whole reason this stage gets the group: it is
+        # the stage that produces `entry_points`, and until now it was handed one instance of a claim
+        # whose other records named different entries.
+        parts.append(
+            note
+            + "\n\n`entry_points` must be the **union** across those instances, not only the ones "
+            "reachable from the representative. If one instance's entry is anonymous and another's is "
+            "guarded, that difference is the finding's severity -- put it in `auth_conditions`."
+        )
     packet = _material(blackboard, candidate, dataflow=verdict.dataflow, budget=material_budget)
     if packet:
         parts.append(packet)
     return "\n".join(parts)
+
+
+def _material_many(blackboard: Blackboard, candidates: list[Candidate], *, budget: int) -> str:
+    """The packets of several claims, merged so a shared file is inlined once.
+
+    Batching only pays if the *reading* is shared too: four claims from one controller each rendering
+    their own copy of that controller would spend four times the context to say the same thing. Blocks
+    are therefore deduped by `(file, start, end)` -- the same range is the same bytes -- and the
+    merged packet is what the batch run is handed.
+    """
+    if budget <= 0 or not candidates:
+        return ""
+    from services.harness.material import candidate_material, lines_from_run
+
+    merged: list[Any] = []
+    notes: list[str] = []
+    seen: set[tuple[str, int, int]] = set()
+    for candidate in candidates:
+        try:
+            packet = candidate_material(
+                Path(str(blackboard.workspace)),
+                candidate,
+                dataflow=None,
+                budget=budget,
+                lines_of=lambda name: lines_from_run(blackboard, name),
+            )
+        except Exception as exc:  # noqa: BLE001 - material is an optimisation, never a blocker
+            log.warning("harness: could not build material for %s (%s)", candidate.candidate_id, exc)
+            continue
+        for block in packet.blocks:
+            key = (block.file, block.start, block.end)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(block)
+        notes.extend(note for note in packet.notes if note not in notes)
+    if not merged:
+        return ""
+    from services.harness.material import Material
+
+    return Material(blocks=merged, notes=notes).render()
 
 
 def _material(
@@ -1488,7 +1896,18 @@ def parse_output(
     the error says which of the two happened -- the coordinator puts that in the coverage reason.
     """
     if run_result.stop_reason != "finished":
-        return None, f"agent stopped with stop_reason={run_result.stop_reason or 'unknown'}"
+        detail = next(
+            (
+                step.thought.removeprefix("model call failed: ").strip()
+                for step in reversed(run_result.steps)
+                if step.thought.startswith("model call failed:")
+            ),
+            "",
+        )
+        suffix = f"：{detail}" if detail else ""
+        return None, (
+            f"agent stopped with stop_reason={run_result.stop_reason or 'unknown'}{suffix}"
+        )
     payload = run_result.output
     if not payload:
         return None, "agent finished without a final answer"
@@ -1503,12 +1922,32 @@ def parse_output(
                 out_of_scope=_strs(payload.get("out_of_scope")),
                 notes=_strs(payload.get("notes")),
             ), None
+        if agent == SECURITY_INVENTORY:
+            return SecurityInventory(
+                entry_points=_dicts(payload.get("entry_points")),
+                authorization_controls=_dicts(payload.get("authorization_controls")),
+                dangerous_capabilities=_dicts(payload.get("dangerous_capabilities")),
+                configurations=_dicts(payload.get("configurations")),
+                dependencies=_dicts(payload.get("dependencies")),
+                state_controls=_dicts(payload.get("state_controls")),
+                coverage_gaps=_strs(payload.get("coverage_gaps")),
+                files_reviewed=_strs(payload.get("files_reviewed")),
+                notes=_strs(payload.get("notes")),
+            ), None
+        if agent == PLAN_UPDATE:
+            return (payload, None) if isinstance(payload.get("decisions"), list) else (None, "missing decisions")
         if agent == PLANNER:
             return _parse_plan(payload), None
         if agent == DISCOVERY:
             return _parse_candidates(payload, scope_id=scope_id), None
         if agent == VALIDATION:
             return _parse_verdict(payload, run_result), None
+        if agent == VALIDATION_BATCH:
+            # The batch's own membership is checked by the coordinator, which is the only place that
+            # knows it -- see `_parse_verdict_batch`.
+            return _parse_verdict_batch(payload), None
+        if agent == ATTACK_PATH_BATCH:
+            return _parse_attack_path_batch(payload), None
         if agent == ATTACK_PATH:
             return AttackPath(
                 candidate_id=scope_id,  # the candidate id, passed in as the run's scope
@@ -1609,6 +2048,7 @@ def _parse_candidates(payload: dict[str, Any], *, scope_id: str) -> list[Candida
                 method=_opt_str(raw.get("method")),
                 rationale=str(raw.get("rationale") or ""),
                 evidence=_strs(raw.get("evidence")),
+                entry_points=_strs(raw.get("entry_points")),
                 discovered_by=DISCOVERY,
             )
         )
@@ -1664,18 +2104,50 @@ def group_note(members: list[Candidate]) -> str:
     The other instances are named, not hidden. A verdict that silently covers five candidates is a
     decision whose scope the reader cannot see, and the extra entry points are often the reason the
     verdict should differ between them.
+
+    `entry_points` is why this block carries more than a title: two records of one sink can be
+    reached by an anonymous route and by a guarded one, and a validator that is not told which is
+    which will either over- or under-call the severity. Merging is a cost decision; losing the
+    entries would be a quality decision, and this is the line between them.
     """
     if len(members) <= 1:
         return ""
-    others = [
-        f"  - {member.candidate_id}（scope={member.scope_id}）: {' '.join((member.title or '').split())[:120]}"
-        for member in members[1:]
-    ]
-    return (
+    lines = [
         f"This candidate stands for {len(members)} separately recorded instances of the same site "
-        f"(same file, line and type). The others are listed below: a verdict here covers all of "
-        f"them, so say in `reasons` if the difference between them matters.\n" + "\n".join(others)
-    )
+        f"(same file, line and type). The verdict you give covers all of them, so `reasons` must "
+        f"account for every entry point listed below -- say explicitly which entries are reachable "
+        f"and at what auth level, and if the difference between two entries changes the verdict, say "
+        f"that in `reasons`.",
+        "",
+    ]
+    for index, member in enumerate(members):
+        marker = "（你正在判的这条）" if index == 0 else ""
+        lines.append(
+            f"- `{member.candidate_id}`（scope={member.scope_id}）{marker}: "
+            f"{' '.join((member.title or '').split())[:160]}"
+        )
+        if member.entry_points:
+            for entry in member.entry_points:
+                lines.append(f"    - entry: {entry}")
+        if member.rationale:
+            lines.append(f"    - why it was recorded: {' '.join(member.rationale.split())[:200]}")
+    return "\n".join(lines)
+
+
+def instance_entry_points(members: list[Candidate]) -> list[str]:
+    """Every entry point the instances of one claim named, deduped and in first-seen order.
+
+    Used where a merge would otherwise be lossy in one direction only: findings and attack paths are
+    built from the *representative* instance, so without this the entries the other records named
+    disappear from the report even though they were paid for.
+    """
+    out: list[str] = []
+    for member in members:
+        for entry in member.entry_points:
+            text = " ".join(str(entry).split())
+            if text and text not in out:
+                out.append(text)
+    return out
 
 
 def stable_candidate_id(scope_id: str, file: str, line: int | None, vulnerability_type: str) -> str:
@@ -1693,6 +2165,147 @@ def stable_candidate_id(scope_id: str, file: str, line: int | None, vulnerabilit
     ).hexdigest()[:10]
     slug = "".join(ch if ch.isalnum() else "-" for ch in f"{scope_id}-{vulnerability_type}")
     return f"C-{slug[:40].strip('-')}-{digest}"
+
+
+def pack_claim_batches(
+    groups: list[list[Candidate]],
+    *,
+    files_of: Any,
+    max_batch: int = 4,
+    max_files: int = 6,
+) -> list[list[list[Candidate]]]:
+    """Pack claim groups into runs that share their reading, without touching the claims.
+
+    The unit that must not change is the *claim*: a batch carries several whole groups, and each
+    group's verdict is still decided once and copied to its instances. What batching adds is that
+    four claims whose packets draw on the same files are read once instead of four times.
+
+    Three rules, each of them measured rather than aesthetic:
+
+    * **overlap decides.** A claim joins a batch only when its file set intersects the batch's
+      (`material.files_for`). Packing by order instead would produce a batch whose members share
+      nothing, which costs the same as four runs and confuses the "shared reading" claim.
+    * **a deep claim runs alone.** One that names more than `max_files` files, or whose evidence names
+      files outside the workspace, is its own run: it is where the multi-file chains live, and those
+      are the findings worth the most (the SSRF chain in the measured audit crossed four files).
+    * **a batch is bounded twice** -- by `max_batch` claims and by the size of the union of their file
+      sets -- so the packet stays a packet instead of becoming the repository.
+    """
+    batches: list[list[list[Candidate]]] = []
+    sets: list[set[str]] = []
+    for group in groups:
+        files = {name for member in group for name in files_of(member)}
+        if len(files) > max_files:
+            batches.append([group])
+            sets.append(files)
+            continue
+        placed = False
+        for index, batch in enumerate(batches):
+            if len(batch) >= max_batch or not (files & sets[index]):
+                continue
+            if len(sets[index] | files) > max_files:
+                continue
+            batch.append(group)
+            sets[index] |= files
+            placed = True
+            break
+        if not placed:
+            batches.append([group])
+            sets.append(set(files))
+    return batches
+
+
+@dataclass
+class BatchVerdicts:
+    """One batch run's answer: the verdicts it decided, and the claims it sent back out."""
+
+    verdicts: list[CandidateVerdict]
+    #: Candidate ids the run answered `needs_dataflow` for. They are re-run as single validations,
+    #: which have the trace tool -- the alternative was forcing a semantic guess into a verdict.
+    escalate: list[str]
+
+
+def _parse_verdict_batch(payload: dict[str, Any], known: list[str] | None = None) -> BatchVerdicts:
+    """Validation-batch's answer, with unknown or duplicated claim ids dropped rather than guessed.
+
+    A verdict whose `candidate_id` is not one of the claims in *this* batch is not admissable: the run
+    was handed a fixed list, and an id from outside it means the model answered about something else.
+    Dropping it and saying so is the honest handling -- admitting it would attach a decision to a
+    claim nobody looked at. `known = None` skips the membership check, which is what the parser used
+    by `parse_output` does: it has the payload but not the batch, and the coordinator that owns the
+    batch re-checks the ids against it.
+    """
+    out: list[CandidateVerdict] = []
+    escalate: list[str] = []
+    seen: set[str] = set()
+    for raw in payload.get("verdicts") or []:
+        if not isinstance(raw, dict):
+            continue
+        candidate_id = str(raw.get("candidate_id") or "").strip()
+        if not candidate_id:
+            log.warning("harness: batch verdict without a candidate_id; dropped")
+            continue
+        if known is not None and candidate_id not in known:
+            log.warning("harness: batch verdict names unknown claim %r; dropped", candidate_id)
+            continue
+        if candidate_id in seen:
+            log.warning("harness: batch verdict repeats claim %r; the second is dropped", candidate_id)
+            continue
+        seen.add(candidate_id)
+        raw_verdict = str(raw.get("verdict") or "").strip().lower()
+        if raw_verdict == "needs_dataflow":
+            escalate.append(candidate_id)
+            continue
+        if raw_verdict not in {kind.value for kind in VerdictKind}:
+            log.warning("harness: batch verdict %r has unknown verdict %r", candidate_id, raw_verdict)
+            continue
+        out.append(
+            CandidateVerdict(
+                candidate_id=candidate_id,
+                verdict=VerdictKind(raw_verdict),
+                # A batch has no trace tool, so every verdict it can give rests on reading. Saying so
+                # here rather than trusting an `evidence_kind` the schema does not even offer.
+                evidence_kind=EvidenceKind.SEMANTIC,
+                dataflow=None,
+                reasons=_strs(raw.get("reasons")),
+                confidence=_confidence(raw.get("confidence")),
+            )
+        )
+    return BatchVerdicts(verdicts=out, escalate=escalate)
+
+
+def _parse_attack_path_batch(payload: dict[str, Any]) -> list[AttackPath]:
+    """A batch attack-path answer, as one `AttackPath` per claim it names.
+
+    Claims the run did not answer are simply absent -- the caller re-runs them alone, exactly as it
+    does for a single run that produced nothing. Inventing an "unreachable" path for a candidate
+    nobody answered would be the one thing this stage must not do: `reachable=False` is a claim about
+    the code, not a placeholder for "no answer".
+    """
+    out: list[AttackPath] = []
+    seen: set[str] = set()
+    for raw in payload.get("paths") or []:
+        if not isinstance(raw, dict):
+            continue
+        candidate_id = str(raw.get("candidate_id") or "").strip()
+        if not candidate_id or candidate_id in seen:
+            log.warning("harness: batch attack path %r is missing or repeated; dropped", candidate_id)
+            continue
+        seen.add(candidate_id)
+        out.append(
+            AttackPath(
+                candidate_id=candidate_id,
+                reachable=bool(raw.get("reachable", False)),
+                entry_points=_strs(raw.get("entry_points")),
+                preconditions=_strs(raw.get("preconditions")),
+                auth_conditions=_strs(raw.get("auth_conditions")),
+                state_conditions=_strs(raw.get("state_conditions")),
+                impact=str(raw.get("impact") or ""),
+                alternative_paths=_strs(raw.get("alternative_paths")),
+                confidence=_confidence(raw.get("confidence")),
+            )
+        )
+    return out
 
 
 def _parse_verdict(payload: dict[str, Any], run_result: AgentRun) -> CandidateVerdict:
@@ -1744,9 +2357,8 @@ def _parse_verdict(payload: dict[str, Any], run_result: AgentRun) -> CandidateVe
 def _parse_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """The planner's answer, normalised to the keys the coordinator reads.
 
-    Scope entries are validated to the minimum the coordinator needs -- an id and a rationale -- and
-    a scope without a rationale is dropped rather than admitted. The rationale is the entire reason
-    this stage exists; a scope without one is a scope nobody can audit later.
+    Reject incomplete investigation contracts. The coordinator separately checks source paths
+    against inventory and protects the reserved file-review namespace.
     """
     scopes: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1755,7 +2367,14 @@ def _parse_plan(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         scope_id = str(raw.get("scope_id") or "").strip()
         rationale = str(raw.get("rationale") or "").strip()
-        if not scope_id or not rationale or scope_id in seen:
+        required_text = ("title", "question", "completion_criteria")
+        priority = raw.get("priority")
+        files = raw.get("files")
+        if (not scope_id or not rationale or scope_id in seen
+                or any(not isinstance(raw.get(key), str) or not raw[key].strip() for key in required_text)
+                or type(priority) is not int or priority not in (1, 2, 3)
+                or not isinstance(files, list) or not files
+                or any(not isinstance(name, str) or not name.strip() for name in files)):
             continue
         seen.add(scope_id)
         scopes.append(
@@ -1765,6 +2384,9 @@ def _parse_plan(payload: dict[str, Any]) -> dict[str, Any]:
                 "kind": str(raw.get("kind") or "").strip().lower(),
                 "path": str(raw.get("path") or ""),
                 "rationale": rationale,
+                "question": raw["question"].strip(),
+                "completion_criteria": raw["completion_criteria"].strip(),
+                "priority": priority,
                 "files": _strs(raw.get("files")),
             }
         )
@@ -1793,6 +2415,12 @@ def _strs(value: Any) -> list[str]:
     if isinstance(value, dict):
         return [json.dumps(value, ensure_ascii=False)]
     return []
+
+
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def _opt_str(value: Any) -> str | None:

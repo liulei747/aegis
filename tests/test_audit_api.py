@@ -77,6 +77,20 @@ def _write_trail(settings, job_id: str, events: list[dict]) -> Path:
     return path
 
 
+def test_task_snapshots_are_available_before_agent_start(audit_client, workspace: Path) -> None:
+    from aegis_contracts.harness import WorkItem
+
+    job_id = _submit_audit(audit_client, workspace)
+    task = WorkItem(work_id="W-1", scope_id="scope-a", title="文件权限", rationale="外部入口")
+    _write_trail(get_settings(), job_id, [{"kind": "work_item", "work": task.model_dump(mode="json")}])
+    response = audit_client.get(f"/v1/audit/{job_id}/trail?after_seq=0")
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert events[0]["kind"] == "work_item"
+    assert events[0]["work"]["state"] == "planned"
+    assert events[0]["work"]["title"] == "文件权限"
+
+
 def test_submitting_an_audit_queues_a_job_of_that_kind(audit_client, workspace: Path) -> None:
     """An audit is a job like any other, so it inherits dedup, force and cancel for free."""
     job_id = _submit_audit(audit_client, workspace)

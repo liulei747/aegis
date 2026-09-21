@@ -55,8 +55,16 @@ MERGE_GAP = 6
 #: of `read` round trips, and small enough that the packet cannot crowd out the transcript.
 DEFAULT_BUDGET = 12_000
 
-#: Never inline a single block larger than this: one long function must not consume the packet.
-MAX_BLOCK_LINES = 160
+#: Never inline a single block larger than this: one long function must not consume the packet. The
+#: *byte* budget below still caps everything -- a 400-line block that does not fit `remaining` is
+#: truncated by `_block` -- so this is a second, cruder guard rather than the real one.
+#:
+#: Raised from 160 after measuring the files that actually carry claims. On the `upp-module-infra`
+#: audit the 98 claims sit in 38 files, every one of them ≤ 9,861 characters (median 3,628), and
+#: **8 of the 38 are 194-239 lines** -- i.e. they fit the 12,000-character budget whole and were being
+#: cut by this line cap instead. A validator that is handed the first 160 lines of `FileServiceImpl`
+#: and told "use `read` for the rest" spends a turn doing it; the packet could have carried it.
+MAX_BLOCK_LINES = 400
 
 
 @dataclass
@@ -116,6 +124,42 @@ class Material:
             out.append("")
             out.append(f"> 注意：{note}")
         return "\n".join(out)
+
+
+#: A file named inside free text (`evidence`, `rationale`): `path/to/Thing.java:41`, `Thing.java`,
+#: `src/main/java/.../Thing.java (line 12)`. Deliberately conservative -- it must end in a source
+#: suffix and contain no spaces -- because this feeds *scheduling* (which claims can share a run),
+#: and a wrong file here only costs a shared packet, while a right one saves a whole run.
+_NAMED_FILE = re.compile(
+    r"(?P<file>[A-Za-z0-9_./\\-]+\.(?:java|py|js|ts|tsx|jsx|go|rb|php|cs|kt|scala|xml|yml|yaml|json|properties|sql))"
+)
+
+
+def files_for(candidate: Candidate, dataflow: DataflowEvidence | None = None) -> list[str]:
+    """The files a candidate's evidence lives in, without building the packet.
+
+    This is what makes batching by *material* possible instead of by file: a claim whose evidence
+    names a controller, a service and a mapper needs all three, and two claims that share two of them
+    can share one run's reads. Cheap by construction (no disk, no packet) because it runs for every
+    pending claim on every round.
+    """
+    found: list[str] = []
+
+    def add(name: str) -> None:
+        text = str(name).strip().replace("\\", "/")
+        if text and text not in found:
+            found.append(text)
+
+    add(candidate.file)
+    if dataflow is not None:
+        for step in dataflow.path:
+            match = _NODE.match(str(step))
+            if match:
+                add(match.group("file"))
+    for blob in (candidate.evidence or []) + ([candidate.rationale] if candidate.rationale else []):
+        for match in _NAMED_FILE.finditer(str(blob)):
+            add(match.group("file"))
+    return found
 
 
 def _read_lines(workspace: Path, file: str) -> list[str] | None:

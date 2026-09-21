@@ -55,9 +55,35 @@ test("固定页面不依赖于路径段", () => {
 test("审计页有 id 看运行，没有 id 就是提交页", () => {
   // 和 `job`/`bundle` 不同：那两屏少了 id 会退回列表页，因为一个没有主键的详情屏没法渲染。
   // 审计没有 id 时是一个完整可用的屏（提交表单 + 最近运行列表），所以它保留为 `jobId: null`。
-  assert.deepEqual(parseRoute("#/audit"), { screen: "audit", jobId: null });
-  assert.deepEqual(parseRoute("#/audit/J-abc"), { screen: "audit", jobId: "J-abc" });
-  assert.deepEqual(parseRoute("#/audit/"), { screen: "audit", jobId: null });
+  assert.deepEqual(parseRoute("#/audit"), { screen: "audit", jobId: null, workspace: null });
+  assert.deepEqual(parseRoute("#/audit/J-abc"), {
+    screen: "audit",
+    jobId: "J-abc",
+    workspace: null,
+  });
+  assert.deepEqual(parseRoute("#/audit/"), { screen: "audit", jobId: null, workspace: null });
+});
+
+test("`#/audit/w/<路径>` 是带预选项目的提交页", () => {
+  // 前缀段 `w` 而不是让 workspace 占第二段：第二段历史上就是 job id，两者形状上无法区分，
+  // 靠 `J-` 前缀去猜等于把两个概念绑在一个位置上。
+  assert.deepEqual(parseRoute("#/audit/w/%2Fdata%2Fprojects%2Fx"), {
+    screen: "audit",
+    jobId: null,
+    workspace: "/data/projects/x",
+  });
+  // 路径本身含 `/`，所以必须先分段再解码 —— 整串先解码会把它切成三段，路由会读到 `data`。
+  assert.deepEqual(parseRoute("#/audit/w/%2Fa%2Fb%2Fc"), {
+    screen: "audit",
+    jobId: null,
+    workspace: "/a/b/c",
+  });
+  // `w` 后面什么都没有：仍然是一个可用的提交页，只是没有预选。
+  assert.deepEqual(parseRoute("#/audit/w"), {
+    screen: "audit",
+    jobId: null,
+    workspace: null,
+  });
 });
 
 test("无法识别的路由落在总览，而不是空白页", () => {

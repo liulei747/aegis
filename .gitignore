@@ -10,6 +10,7 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+secaudit-scans/
 
 # --- local runtime state -------------------------------------------------
 # `var/` is runtime output, but `var/jdtls/` is the local jdtls snapshot the compose build
@@ -51,3 +52,4 @@ benchamrk/
 .vscode/
 .DS_Store
 Thumbs.db
+

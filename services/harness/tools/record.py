@@ -36,6 +36,9 @@ from services.harness.tools.support import str_argument
 #: and its dispatch have to agree, and two lists in two places is how a kind gets documented but not
 #: implemented.
 KINDS: dict[str, str] = {
+    "gap": "当前任务缺口 JSON {kind: unread|basic_check|relationship|tool_failure,question,file,line,evidence_refs,state: pending|resolved,reason}；解决已分配缺口用 {gap_id,state: resolved,evidence_refs,reason}，需本任务源码事实证据",
+    "evidence": "调查证据 JSON {file,line,text,category: source_fact|hypothesis,candidate_id?}；关联候选的新源码事实触发证据版本复核",
+    "candidate": "候选 JSON，与最终 candidates 单项字段一致（不是验证结论）",
     "note": "自由文本事实，记在该 scope/项目的 notes 里（如“用的是 sqlite，没有 ORM”）",
     "component": (
         "架构**区域**：一个目录/模块/scope 一行，id 复用预扫描给的 `scope-…`；"
@@ -50,7 +53,7 @@ KINDS: dict[str, str] = {
     "asset": "被保护的资产，**一个短名词短语**（如 `users 表`），不要写成句子（解释放 threat 的 note）",
     "actor": "攻击者模型，**一个短名词短语**（如 `匿名互联网用户`），不要写成长句",
     "threat": "威胁：{id, title, asset, note}",
-    "lead": "跨 scope 线索：{to_scope, why}（记下来交给那个 scope，而不是自己追过去）",
+    "lead": "独立问题线索：{to_scope,question,file,line,evidence_refs,why}；当前问题所需跨文件追踪自行继续",
 }
 
 

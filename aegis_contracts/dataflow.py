@@ -122,6 +122,15 @@ class FlowBundle(BaseModel):
         ),
     )
     engine: str = Field(default="joern", description="Who produced this, for the audit trail.")
+    #: Which CPG frontend built the graph this bundle came from. Carried because an empty flow has
+    #: two causes a reader cannot otherwise separate: the anchor matched no node, and the graph was
+    #: built in the wrong language. `source_candidates == 0` plus a frontend that does not match
+    #: the workspace is the second case, and saying so is what keeps it from reading as
+    #: "the value cannot reach the sink".
+    frontend: str = Field(
+        default="",
+        description="CPG frontend that built the graph, e.g. `pysrc2cpg` / `javasrc2cpg`.",
+    )
     source_kind: str = Field(
         default="call",
         description=(

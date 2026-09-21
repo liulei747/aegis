@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -39,6 +39,13 @@ class ToolName(str, Enum):
     READ = "read"
     LIST_FILES = "list_files"
     SHELL = "shell_command"
+    #: Regex search across the workspace, as a tool rather than as a shell command. Measured on the
+    #: `upp-module-infra` audit: of 5198 agent steps, 1344 were `shell_command` and most of them were
+    #: a search -- one round trip to build the command, one to read its output -- while the same
+    #: search as a native tool is one call with a bounded, structured result. It also removes the
+    #: only reason an agent needed a shell at all for the common case, which is the case a reviewer
+    #: should be able to reason about by reading one tool instead of a command policy.
+    GREP = "grep"
     DATAFLOW_VERIFY = "dataflow_verify"
     #: The one tool that *writes*. Everything else reads the repository; this records a fact on the
     #: blackboard, immediately, where every other agent can see it. It exists because the opening
@@ -153,11 +160,56 @@ class ThreatModel(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class SecurityInventory(BaseModel):
+    """Security-relevant surfaces established by the inventory agent after opening analysis."""
+
+    entry_points: list[dict[str, Any]] = Field(default_factory=list)
+    authorization_controls: list[dict[str, Any]] = Field(default_factory=list)
+    dangerous_capabilities: list[dict[str, Any]] = Field(default_factory=list)
+    configurations: list[dict[str, Any]] = Field(default_factory=list)
+    dependencies: list[dict[str, Any]] = Field(default_factory=list)
+    state_controls: list[dict[str, Any]] = Field(default_factory=list)
+    coverage_gaps: list[str] = Field(default_factory=list)
+    files_reviewed: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class WorkItemState(str, Enum):
     PLANNED = "planned"
     RUNNING = "running"
     DONE = "done"
     ABANDONED = "abandoned"
+    BLOCKED = "blocked"
+    CANCELED = "canceled"
+
+
+class WorkItemKind(str, Enum):
+    FILE_REVIEW = "file_review"
+    INVESTIGATION = "investigation"
+    VALIDATION = "validation"
+    ATTACK_PATH = "attack_path"
+
+
+class WorkAttempt(BaseModel):
+    run_id: str
+    agent: str
+    started_at: datetime = Field(default_factory=_utcnow)
+    finished_at: datetime | None = None
+    stop_reason: str = ""
+    steps: int = 0
+    error: str = ""
+
+
+class WorkGap(BaseModel):
+    gap_id: str
+    kind: Literal["unread", "basic_check", "relationship", "tool_failure"]
+    question: str
+    file: str
+    line: int = Field(ge=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+    state: Literal["pending", "resolved", "blocked"] = "pending"
+    reason: str = ""
+    lead_id: str = ""
 
 
 class WorkItem(BaseModel):
@@ -175,6 +227,21 @@ class WorkItem(BaseModel):
     opened_at: datetime = Field(default_factory=_utcnow)
     closed_at: datetime | None = None
     steps_used: int = 0
+    kind: WorkItemKind = WorkItemKind.INVESTIGATION
+    files: list[str] = Field(default_factory=list)
+    completion_criteria: str = ""
+    question: str = ""
+    priority: int = Field(default=2, ge=1, le=3)
+    status_reason: str = ""
+    candidate_ids: list[str] = Field(default_factory=list)
+    attempts: list[WorkAttempt] = Field(default_factory=list)
+    read_files: int = 0
+    unread_ranges: dict[str, list[tuple[int, int | None]]] = Field(default_factory=dict)
+    pending_updates: list[str] = Field(default_factory=list)
+    gaps: list[WorkGap] = Field(default_factory=list)
+    gap_continuations: int = 0
+    no_progress_continuations: int = 0
+    merged_into: str = ""
 
 
 class CoverageState(str, Enum):
@@ -206,6 +273,7 @@ class EvidenceKind(str, Enum):
 class Candidate(BaseModel):
     """Something worth checking. Not yet a finding."""
 
+    evidence_version: int = 1
     candidate_id: str
     scope_id: str
     title: str
@@ -217,6 +285,12 @@ class Candidate(BaseModel):
     rationale: str = ""
     #: Free-form pointers to what made this worth recording (tool results, snippets).
     evidence: list[str] = Field(default_factory=list)
+    #: The entries that reach this site, as discovery named them (`GET /admin-api/x
+    #: (XController.java:41)`). Kept per *instance*, not per claim, on purpose: candidates merge by
+    #: sink location, and two records of one sink routinely name different entries -- one anonymous,
+    #: one guarded. Merging those into a single verdict is right; forgetting that the anonymous entry
+    #: exists is not, so the list rides along to the validator, the attack-path agent and the finding.
+    entry_points: list[str] = Field(default_factory=list)
     discovered_by: str = ""
     discovered_at: datetime = Field(default_factory=_utcnow)
 
@@ -244,6 +318,7 @@ class VerdictKind(str, Enum):
 
 
 class CandidateVerdict(BaseModel):
+    evidence_version: int = 1
     candidate_id: str
     verdict: VerdictKind
     evidence_kind: EvidenceKind
@@ -260,6 +335,7 @@ class AttackPath(BaseModel):
     anyone can make it happen, which is where most real-world severity comes from.
     """
 
+    evidence_version: int = 1
     candidate_id: str
     reachable: bool = False
     entry_points: list[str] = Field(default_factory=list)
@@ -299,11 +375,10 @@ class FinalFinding(BaseModel):
 
 
 class CrossScopeLead(BaseModel):
-    """A thread that crossed a scope boundary.
+    """An independent question for the coordinator's persistent planning inbox.
 
-    Recorded rather than followed immediately: the coordinator is the only thing allowed to
-    decide what to spend budget on, and an agent that chases its own lead is how a scan ends up
-    deep in one corner with no coverage anywhere else.
+    Cross-file tracing needed for the current question stays with its investigator;
+    only independent questions need scheduling. Legacy records default to pending.
     """
 
     lead_id: str
@@ -313,6 +388,26 @@ class CrossScopeLead(BaseModel):
     detail: str = ""
     raised_by: str = ""
     raised_at: datetime = Field(default_factory=_utcnow)
+    question: str = ""
+    file: str = ""
+    line: int | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    source_work_id: str = ""
+    status: str = "pending"
+    linked_work_id: str = ""
+    processing_reason: str = ""
+    sequence: int = 0
+
+
+class InvestigationRecord(BaseModel):
+    record_id: str
+    work_id: str
+    scope_id: str
+    category: str = "hypothesis"
+    file: str
+    line: int
+    text: str
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 # ─────────────────────────────────────────────────────────── transcript
@@ -343,6 +438,11 @@ class AgentRun(BaseModel):
     #: Why it stopped: `finished`, `budget`, `error` or `no_tool`. A run that ended because the
     #: step budget ran out produced whatever it had, and the report has to say so.
     stop_reason: str = ""
+    #: True when the answer this run ended on was **recovered from a reply the output limit cut in
+    #: half** (`react._salvage_final`). The fields are the model's, but lists may stop early, so a
+    #: reader has to be able to tell a salvaged answer from a complete one. Set only when the
+    #: fallback was actually spent -- a run that retried and answered properly is not salvaged.
+    salvaged: bool = False
     output: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=_utcnow)
     finished_at: datetime | None = None
@@ -382,18 +482,24 @@ class Blackboard(BaseModel):
     updates are expressed as appends and merges rather than as whole-object replacements.
     """
 
+    execution_budget: dict[str, Any] = Field(default_factory=dict)
     run_id: str
     workspace: str
     revision: int = 0
     project: ProjectContext | None = None
     architecture: ArchitectureMap | None = None
     threats: ThreatModel | None = None
+    #: AI-established security surface inventory; still context, not candidates or findings.
+    security_inventory: SecurityInventory | None = None
     work: list[WorkItem] = Field(default_factory=list)
     coverage: list[CoverageEntry] = Field(default_factory=list)
     candidates: list[Candidate] = Field(default_factory=list)
     verdicts: list[CandidateVerdict] = Field(default_factory=list)
+    verdict_history: list[CandidateVerdict] = Field(default_factory=list)
+    attack_path_history: list[AttackPath] = Field(default_factory=list)
     attack_paths: list[AttackPath] = Field(default_factory=list)
     leads: list[CrossScopeLead] = Field(default_factory=list)
+    investigation_records: list[InvestigationRecord] = Field(default_factory=list)
     findings: list[FinalFinding] = Field(default_factory=list)
     #: Every agent run, in order. The report's "how do you know" section is built from these.
     runs: list[AgentRun] = Field(default_factory=list)

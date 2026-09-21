@@ -908,7 +908,8 @@ AI        判断"路径上的转换是否足够"
    > 四种锚点形式各跑一遍，全部只有一条 20 元素、跨 4 文件的流。形状仍然必须支持，但
    > "demo 有两条"已经是一段记忆 —— 见 `docs/DATAFLOW_CONTRACT.md` §4 第 1 条。
 3. **引擎坏了要降级且留痕**。`dataflow_unavailable` prune 记录原因，然后回退到爬取 ——
-   绝不能把"JVM 挂了"表现得像"没找到路径"。
+   绝不能把"JVM 挂了"表现得像"没找到路径"。**"问题没落在图上"同理**（锚点匹配 0 个节点、
+   sink 推导不出来）：它也回退到爬取，而不是交出一张单方法切片 —— 见下面"两类五种没有流"。
 
 #### 实测数字
 
@@ -1003,25 +1004,44 @@ rule 只有 `id / shortDescription / defaultConfiguration / properties{tags}`，
 2. **传错了行号**：最初把**焦点方法的起始行**（`query_user` 的第 4 行）传给推导，于是它
    选中第 5 行的 `connect` 而不是 finding 第 6 行对应的 `execute`。必须传 **finding 自己的行**。
 
-#### 三种"没有流"必须分清
+#### 两类五种"没有流"必须分清
 
-| 情形 | 表现 | 含义 |
-|---|---|---|
-| 引擎证明无路径 | `flows=[]` 且 `sink_anchor != ""` | 代码安全，**不要调用模型** |
-| 没有 sink 可查 | `flows=[]` 且 `sink_anchor == ""` | **我们不知道要找什么** —— 配置缺口 |
-| 引擎失败 | 抛异常 | 记 `dataflow_unavailable`，降级爬取 |
+空流有两个来源：**关于代码的结论**，和**关于问题的陈述**。分界线是锚点有没有落在图上 ——
+**没落上的一律回退到爬取，落上的不回退**（回退对"证明无路径"是引入噪声，对"问题没落图"
+是保住已经建好的调用图）。
 
-后两者混起来，会把**配置缺口**说成**健康报告** —— 所以 builder 产生不同的 prune：
-`dataflow_sink_unresolved` vs `dataflow_no_path`，`tests/test_dataflow.py` 各有断言。
+| 情形 | 表现 | 含义 | builder |
+|---|---|---|---|
+| 引擎证明无路径 | `flows=[]`，两个锚点都落在图上 | 代码安全，**不要调用模型** | `dataflow_no_path`，不回退 |
+| 来源锚点没匹配到节点 | `flows=[]` 且 `source_candidates == 0` | **问题没落在图上** | `dataflow_source_unmatched`，回退爬取 |
+| 汇聚点锚点没匹配到节点 | `flows=[]` 且 `sink_candidates == 0` | 同上，在 sink 一侧 | `dataflow_sink_unmatched`，回退爬取 |
+| 没有 sink 可推导 | `flows=[]` 且 `sink_anchor == ""` | **我们不知道要找什么** | `dataflow_sink_unresolved`，回退爬取 |
+| 引擎失败 | 抛异常 | 分析没跑成 | `dataflow_unavailable`，回退爬取 |
+
+把"问题没落图"说成"健康报告"，是这一节存在的理由；而**不回退同样危险**：修之前这三种"没落图"
+全都只交出单方法切片，LSP 已经建好的整张调用图被一个空图悄悄换掉，其中"来源锚点匹配 0 个节点"
+还被叫成 `dataflow_no_path`。触发场景是有记录的，不是设想：`services/harness/tools/dataflow.py`
+的 docstring 记着 `var/projects` 里那个 Java 项目上 Python 形状的锚点匹配 **0 个节点**（修法与
+边界见 `docs/DATAFLOW_CONTRACT.md` §5 与 §9.5）。`tests/test_dataflow.py` 对五种各有断言。
 
 #### 仍未做
 
-- **source 仍是配置项**（`AEGIS_DATAFLOW__SOURCE`）。它不像 sink 有位置可依：finding 说的是
-  "危险发生在哪"，不是"不可信输入从哪进来"，那需要规则语义或框架知识。
+- **Java 只差"在真实项目上跑一次对照"。** 前端与锚点都已与语言无关（前端按后缀普查选，锚点交给
+  引擎的 `anchoredAuto` 对着图判定 —— 见 `docs/DATAFLOW_CONTRACT.md` §1.1.1 与 §8），而且**实测
+  不需要依赖 jar 就能出跨文件流**：三文件夹具里故意引用没有 jar 的 `HttpServletRequest`，
+  建图 rc=0，`Repo.java:2 userId → Repo.java:4 Db.execute(sql) → Db.java:3 sql` 正常追出来。
+  `--inference-jar-paths` 是**可选精度优化**，不是开关 —— 注意它叫这个名，`javasrc2cpg`
+  **没有** `--classpath` 这个选项（`--help` 已核对）。
+  `/health` 的 `deep_analysis.taint` 仍然写死 `["python"]`，这在今天只是"没有人在真实 Java
+  项目上跑过"的保守表述；要改需要在 `payment-sys` 上做一次对照（同一批候选，看 `evidence_kind`
+  里出现多少 `dataflow`）。
+- **sink 仍是位置推导的启发式**（source 已不再是"配置项"：harness 一律发 `anchor_kind="auto"`，
+  `DataflowConfig.source` 只在"命中方法只有 receiver"时兜底）。
 - **未从规则源文件读 `pattern-sinks`**（见上）。
 - **推导候选多于一个时未降级**：现在取第一个并记录其余候选，正确做法应是要求人工确认。
 - **`attach_bodies` 没被流水线消费**：正文仍由 `MethodReader` 从 `MethodSymbol` 读
-  （两条路读到同样的字节），属重复。
+  （两条路读到同样的字节），属重复。它是最后一段 Python-only 的定位代码（只找 `def name(`），
+  但因为无人消费，对结论没有影响。
 - **未接进 prompt 渲染器**：`render.py` 只多了 provider 图例行；拼装样例在
   `var/joern/ask_with_dataflow.py`（做成一个 block 是下一步）。
 
@@ -1494,8 +1514,9 @@ import **恰好 1 条**（`domain.py` 用 `estimate_tokens`，是已知的分层
 
 ```
 prep（确定性预扫描，不调模型）
-  → recon ∥ threat_model（并发，可多轮，直到互相读完）
-  → planner（把区域分给子 agent）
+  → recon ∥ threat_model（并发，各一轮，任务冻结且互不读取）
+  → security_inventory（AI 汇总两者并读源码补全安全面）
+  → planner（把具体安全问题放入待办）
   → discovery（按 scope + 覆盖率分组并发，可多轮收敛）
   → validation（每个候选一个 run，含 dataflow_verify）
   → attack_path（每个确认候选一个 run）
@@ -1505,7 +1526,7 @@ prep（确定性预扫描，不调模型）
 所有 agent 共用**一块黑板**（`Blackboard`）读写：读用 `board` 工具（分节、有上限），写用 `record`
 工具（8 种 kind，只能追加）。过程可观测：`run_dir/trail.jsonl` 是逐事件的 JSONL，前端每 2 秒增量拉。
 
-**这一层的关键不是"接了个模型"，而是三件被实测逼出来的事**：agent 之间真的互相读（开场收敛循环）、
+**这一层的关键不是"接了个模型"，而是三件被实测逼出来的事**：开场角色独立调查并由安全清单统一核对、
 黑板上的字段各有一种粒度（区域 / 位点 / 入口点）、模型写出畸形的回答时 harness 仍能把它变成工作
 （解析恢复），而不是浪费掉一整轮。
 
@@ -1550,38 +1571,15 @@ work / coverage / candidates / verdicts / attack_paths / leads / findings / runs
    `ToolContext.board`（读一节）。工具层"够不到没被交给它的东西"这条规则在这里是承重的：模型不能
    清空候选台账，也读不到覆盖率表。
 
-## 14.3 开场阶段：prep → 并发 → **收敛循环**（本层最值得读的一段）
+## 14.3 开场阶段：prep → 独立并发 → AI Security Inventory
 
-**`prep` 是独立阶段，先于任何模型调用**（`_prepare`）。它做确定性预扫描并写黑板：
-语言计数、构建系统、候选 scope（角色化：controller/service/dao/config/root…）与每个 scope 的完整文件清单，
-以及 `origin: "survey"` 的区域行。它同时把快照留在 `self._snapshot`，**planner 复用同一份**（不再二次走树）。
+`prep` 先执行确定性目录勘察，生成语言、构建系统、候选区域和入口文件标记；入口标记只是 Recon 的查找线索，不作为安全事实写入黑板。
 
-> 路由标记不进黑板。预扫描还会 grep 入口标记，但它的答案是**文件级**的（"这个文件注册了 REST 控制器"），
-> 那是"去哪看"的线索，不是"哪些请求能到达"的答案。写进黑板会和 agent 的路由级结论混在一张表里，
-> 而且谁也合并不了（文件 ≠ 文件:行）。实测：51 文件的 Spring 基准上，预扫描贡献 13 条文件级命中、
-> recon 自己给出 42 条路由级条目，混在一起 55 条 / 实际 42 条路由。现在它们只出现在 recon 的任务文本里，
-> 名字就叫 `route_markers_in_code`，并附一句"逐条枚举真实路由，不要抄这些标记"。
+Recon 和 Threat Model 的任务在任一模型调用开始前，由同一份 survey 快照生成，然后并发且各执行一轮。两者没有 `board` 读取能力，也不会把对方的增量记录拼进自己的 prompt。Recon 负责描述实际系统结构，Threat Model 独立提出资产、攻击者、边界与威胁。这避免了旧收敛循环反复改写同一批内容，以及三轮仍然无法证明完全收敛的问题。
 
-**recon 与 threat_model 并发跑**（`ThreadPoolExecutor`，两个线程），各自边查边用 `record` 写黑板。
-两个 agent 的 task 文本在开跑时就固定了，所以"对方后来写了什么"只能靠 `board` 工具读——这就是下一段。
+两者完成后，`security_inventory` agent 才读取它们的最终结论，并继续读取源码和 manifest，列出入口、权限控制、危险能力、配置、依赖和状态控制。每条记录必须带 `name/file/line/evidence/why`；不能确认的内容进入 `coverage_gaps`。Planner 没有 `board` 工具，因此 Coordinator 把完整 Inventory（不是前 8 条样例）放进 Planner prompt。
 
-**收敛循环（opening convergence）**：一轮结束后，看每个 agent"还没拿到"的**实质内容**；落后的那个
-（通常只有一个）再跑一轮，任务是**增量**而不是重查仓库。规则如下，全部有实测依据：
-
-| 规则 | 取值 | 为什么 |
-| --- | --- | --- |
-| 什么算"实质内容" | 组件 / 信任边界 / 入口点 / 威胁 | note/lead 是评论；assets/actors 是同一批东西的散文描述，两个 agent 永远写不完（实测：第 2 轮只新增了 1 个 asset、1 个 actor、1 条 note、1 条 lead，却让整轮报"未收敛"） |
-| 水位线怎么算 | **交付即算**：agent 的 task 文本覆盖到的 revision，或它自己 `board` 调用真实拿到的 revision，取大者 | 早期版本只认 `board` 调用，于是"不调工具的模型永远落后"，循环必然跑满上限并报假警报（假工具层的单元测试立刻暴露：没有 revision 就永远不收敛） |
-| 上限 | `max_opening_passes = 3` | 结构性而非慷慨：一个 agent 的 run 在它给出 `final` 时结束，所以第 N 轮发布的东西只能第 N+1 轮被读到。上限 2 在结构上不可能收敛 |
-| 怎么报告 | `Blackboard.opening = {passes, converged, watermarks, unread, note}`，并进计数器（`opening_passes`/`opening_unread`） | "未收敛"是本次运行的**缺口**，必须与"已完成"区分；前端审计页和报告都会显示 |
-
-**实测（51 文件 benchmark，MiniMax-M2.7）**：3 轮收敛，`unread = 0`，开场 6 个 run / 109 步 / 7 分钟。
-**实测（5 文件 demo，同一机制）**：3 轮收敛；另一次 2 轮时 `unread=1`（recon 第 2 轮新记了 4 条信任边界，
-威胁模型还没读到）——报告如实写"未收敛"。
-
-**开场 pass ≥ 2 的黑板复用**：pass 1 是唯一允许从磁盘读的读者；pass 2 起是構造性的重读，所以
-`_opening_reuse()` 用 `agents.replayable_reads` 把 pass 1 已经完整读过的文件从黑板上取出来
-作为初始步注入。实测四文件项目上，重派发会每 pass 重读同一批四个文件。
+`Blackboard.opening` 为兼容报告仍保留，但含义是“独立单轮开场执行完成”，不再表达两个 agent 的互读水位或收敛证明。
 
 ## 14.4 覆盖率闭环与验证分组（沿用并加固）
 
@@ -1853,3 +1851,67 @@ V12 DocumentService.java:62       loadArchive() 零调用点
 `probe_model.py`、`probe_realistic.py`、`audit_cost.py`、`count_unparsed.py`、`watch_audit.py`、
 `check_run.py`、`verify_rerun_archive.py`、`demo_opening.py`、`show_opening_records.py`、
 `show_prompt_cost.py`；部署镜像内的冒烟是 `var/work/smoke_opening.py`。
+
+## 14.14 成本与产出优化（2026-09-17，依据 `upp-module-infra` 那次 274 分钟审计）
+
+> 基线：单模块（177 个 Java 文件）审计 **274.3 min / 305 run / 1609 次模型调用 / 5.81M 输出 token**，
+> 报告 1.08 MB、黑板 40 MB、轨迹 7.9 MB。对照组是同一台机器上 `securit-audit` 预设（Codex Security
+> 移植）对**整仓 2341 个 Java 文件**的一轮：81 min / 1050 次调用 / 636k 输出 token / 1793 次工具调用。
+> 两边同模型（`glm-5.3-flash`），所以差距是结构性的，不是模型。以下保留当时的测量结论；
+> 一次性测量脚本已在清理仓库时删除。
+
+| # | 改动 | 实测依据 | 效果（按同一份真实数据算） |
+| --- | --- | --- | --- |
+| ① | `services/harness/react.py`：截断的 `final` 抢救（`_repair_truncated_json` + `_salvage_final` + 持有/回退 + `AgentRun.salvaged`）；`AIConfig.max_tokens`（默认 8192） | 456 个"空工具步"里 305 个是正常收尾；**151 个真重试中 87 个是回答被输出上限截断、模型其实已写出 `final`**；14 个"零产出"run **全部**以截断 final 收尾 | 14 个 run 恢复阶段产出；87 次重试收到"写短一点"的纠正；截断从源头减少 |
+| ② | 并发 4 → 8（`.env` / `.env.example` / compose） | 实测有效并发 4.07；`glm-5.3-flash` 复测 2–4 s/调用、6/6 可用 | 并行段近 2× |
+| ③ | 入口点全保留：`Candidate.entry_points`、`group_note` 逐实例列入口+鉴权、attack_path 取并集、`affected_locations` 带每条实例的入口 | `_attack_paths` 此前**连 group_note 都没传**，产出 `entry_points` 的 agent 看不到其它实例 | 合并的 36 组里，实例间不同入口不再丢失 |
+| ④ | 按 material 文件集重叠合批验证（`material.files_for`、`pack_claim_batches`、`VALIDATION_BATCH` 角色/schema/parser、`needs_dataflow` 回退） | 139 个 validation run 判 98 个 claim，196 s/run；68 个 claim 只按 sink 文件重叠就能装成 36 个 run | 98 → 44 run（保守边界 66） |
+| ⑤ | 验证幂等按 claim key：已判定位置的新实例**继承**结论 | 139 − 98 = **41 个重复付费的 run**（判重只看 `candidate_id`） | 41 → 0 |
+| ⑥ | attack_path 合批（`ATTACK_PATH_BATCH`，逐条给可达性，未答上的退回单跑） | 72 个 attack_path run 对 161 个 confirmed | 72 → ~25 |
+| ⑦ | 轮次终止改判据：`max_scope_retries=1`（失败 scope 不再无条件重派，coverage 仍记 INSUFFICIENT）、`min_round_yield_ratio=0.25`（边际产出停轮，未读文件积压不拦） | 3 个 scope 在**全部 4 轮**都 budget/error；每轮 +82/+60/+28/+22 个新候选，r2+r3 花 25 min 只换 161 条里的 19 条 | 尾部两轮 25 min |
+| ⑧ | 原生 `grep` 工具（`tools/grep.py`，7 个工具）；`material.MAX_BLOCK_LINES` 160 → 400 | 5198 步里 1344 步是 `shell_command`，多数是搜索；98 个 claim 所在 38 个文件全部 ≤ 9,861 字符，其中 **8 个是 194–239 行**，本来放得进 12000 字符预算却被行数上限截断 | 一次搜索一个调用；这 8 个文件的材料不再被截断 |
+| ⑨ | 产出瘦身：异常 run 全文改 `abnormal-runs.md` 另存（报告 §6.1 改为一行一 run + 指针）；`blackboard.save` 写盘前 `_slim_for_disk`（每个文件只留最新一次完整读取的 `lines`、省略处计数、`data` 长列表留前缀并记数、紧凑 JSON） | 报告 1.08 MB 里 **§6.1 占 665 KB（62%）**、§2 占 305 KB；黑板 38.2 MB 里 runs 占 29.7 MB、2902 个 read 步各存两份正文 | 报告 1.08 → ~0.4 MB；黑板 38.2 → **~14.1 MB**（−63%） |
+
+**新开关**：`AEGIS_AI_MAX_TOKENS`（0 = 交给厂商）、`AEGIS_AI_CONCURRENCY=8`、
+`AEGIS_HARNESS_CLAIM_BATCH_SIZE`（1 = 一 claim 一 run；≥2 时验证与攻击路径都按文件集重叠合批）、
+`--claim-batch-size`。`HarnessConfig.claim_batch_size` 默认 1：合批改变"一次判定 run 是什么"，
+按项目惯例要显式打开再用一轮真实审计确认。
+
+**闸门**：`ruff` 干净；`pytest` **704 passed / 15 skipped / 1 failed**，唯一失败是既有的
+`test_scan_jobs.py::test_cancel_endpoint_stops_a_running_scan`（本机扫描太快、cancel 来不及；
+把我的改动 stash 掉同样失败）。
+
+**过程事故（已修复，记在这里以免重犯）**：清理重复常量时用 PowerShell `Set-Content` 改过一次
+`services/harness/coordinator.py`，文件被重新编码写坏（UTF-8 损坏）。已 `git checkout` 还原并按原文
+逐条重做；此后源码只用编辑工具改。教训：**不要用 shell 重写源码文件**。
+
+### 14.14.1 小样本复核（2026-09-17，`framework/file` 21 个文件，31 分钟，跑到验证中期手动停止）
+
+当时按逐角色对照了 run 数、agent 分钟、平均秒、调用数、输出 token、**token/调用**、工具分布、
+读取强度与产物大小。这次的数字：
+
+| 指标 | 基线（整模块，274 min） | 小样本（21 文件，31 min） |
+| --- | --- | --- |
+| 工具分布 | read 2940、**shell_command 1344**、list_files 345、grep 0 | read 242、**grep 47、shell_command 1** |
+| 读取强度 | 2934 次 / 203 文件 = 14.5 次每文件 | 242 次 / 21 文件 = **11.5 次每文件** |
+| 候选 → 位置（重复倍率） | 192 → 98（1.96×） | 37 → 22（**1.68×**） |
+| 验证 | 139 run / 98 claim（0.7 claim/run） | **9 个 batch run / 22 claim（2.4 claim/run）** |
+| 输出 token/调用 | 3,611（validation 3,536） | 5,111（validation_batch **5,838**） |
+| 开场 | 3 轮、unread=2、6 run | 3 轮、unread=1、6 run（未改动的代码，作对照） |
+| 抢救 final | —（当时还没有） | 1 个 run（`discovery:scope-file-client-core`） |
+
+**这次小跑抓到一个真缺陷并修掉**：`claim_batch_size=4` 配上 `max_tokens=8192` 时，`batch(4)` 的回答
+**每次都正好 8192 输出 token**（73–102 s），截断→重试→再截断，最后整轮 `error`、4 条 claim 无裁决。
+两个原因、两处修复：① 输出上限不够（4 条裁决放不进 8192）→ `AIConfig.max_tokens` 默认 8192 → **16384**；
+② 模型把 schema 对象**直接写在正文里**（没有 `final` 外壳），而抢救器只找 `"final"`，截断的裸 payload
+完全救不回来 → `_salvage_final` 现在也修裸 payload（但**只在有 `required` schema 时**才试，否则无法
+把答案和外壳区分开）。两者都有测试。
+
+**还没解决的**（下一条要做的）：输出纪律。这次 token/调用反而更高（5,111 vs 3,611），最高的正是
+batch 回答（5,838）——"把答案写短"这一半还只在提示词层面说过，没有强制。
+
+## 14.15 统一任务清单与下一会话交接（2026-09-17）
+
+统一任务第一阶段已完成并部署到 Docker 的 worker、gateway、frontend。运行详情页新增任务列表、详情、执行历史和关联黑板摘要；旧审计没有新任务事件，新审计在规划完成后出现待办。
+
+具体已完成范围见 [AI_TASKS_PHASE1.md](AI_TASKS_PHASE1.md)。**后续会话优先阅读 [AI_AUDIT_NEXT_SESSION.md](AI_AUDIT_NEXT_SESSION.md)**：包含未完成事项、Discovery 实时发布、线索收件箱、动态 Planner 触发/水位线/停止条件、验收及部署步骤。动态规划与线索自动派发尚未实现，不能将任务可视化视为调度闭环已经完成。

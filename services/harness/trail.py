@@ -44,6 +44,7 @@ log = get_logger(__name__)
 #: as `unknown` with the original under `raw_kind`, which shows up on the screen as a gap in this
 #: file's contract rather than as a crash in the middle of a review.
 EVENT_KINDS: tuple[str, ...] = (
+    "work_item",  # authoritative task snapshot, published whenever its lifecycle changes
     "stage",  # a coordinator stage started or finished
     "agent_start",  # one agent run began (which agent, which scope, which task)
     "agent_step",  # one turn: thought + tool call + arguments + tool result
@@ -64,6 +65,7 @@ EVENT_KINDS: tuple[str, ...] = (
 #: repository review is a bundle assembly.
 STAGES: tuple[str, ...] = (
     "prep",
+    "security_inventory",
     "recon",
     "threat_model",
     "plan",

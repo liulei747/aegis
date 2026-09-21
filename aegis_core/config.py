@@ -1,4 +1,4 @@
-﻿"""Runtime settings. Everything is env-overridable (prefix ``AEGIS_``)."""
+"""Runtime settings. Everything is env-overridable (prefix ``AEGIS_``)."""
 
 from __future__ import annotations
 
@@ -61,6 +61,17 @@ class AIConfig(BaseModel):
     #: reliability for wall-clock, and a per-call failure is recorded either way.
     concurrency: int = Field(default=1, ge=1, le=16)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    #: Output-token ceiling sent as `max_tokens`. Zero means "let the provider decide".
+    #:
+    #: 16384, and the number comes from two measurements rather than from taste. First, on
+    #: `upp-module-infra`, 87 of 151 retry turns were answers the output limit had cut in half -- the
+    #: model had written a `final`, the strict parse threw it away, and the retry re-emitted it.
+    #: Second, a *batched* judging run needs N times a single answer: in the quick run over the file
+    #: subtree, the `batch(4)` runs came back at exactly 8192 output tokens (73-102 s each) and looped
+    #: on truncation until the run errored -- four verdicts do not fit in 8192. Pair it with
+    #: `HarnessConfig.claim_batch_size`: 8192 covers one claim, 16384 covers up to four.
+    #: `max_tokens = 0` restores "let the provider decide" for a gateway that rejects the key.
+    max_tokens: int = Field(default=16384, ge=0, le=200_000)
     #: Cap on contexts analysed in one run, so a 200-context bundle cannot quietly become 200
     #: paid calls. Whoever raises it is choosing to spend.
     max_contexts: int = Field(default=25, ge=1)
@@ -88,6 +99,10 @@ class DataflowConfig(BaseModel):
     #: pydantic ignores unknown keywords silently, so a stale `image=` would not even error.
     #: `cache_dir` stays: it is read *inside* the worker, for the shared CPG cache and scratch.
     cache_dir: Path = Path("./var/dataflow")
+    #: Per Joern invocation -- **the CPG build included**, which is the one that bites: measured
+    #: 2341 Java files -> 418 s and a 15 MB graph, i.e. 70% of this default. A larger Java
+    #: repository needs it raised *before* its first query. The worker turns the timeout into a
+    #: named `JoernError` naming this knob, rather than letting it escape as a 500.
     timeout_s: int = Field(600, gt=0, description="Per Joern invocation (build or query).")
     source: str = Field(
         default="request.args.get",
@@ -107,6 +122,43 @@ class DataflowConfig(BaseModel):
     worker_start_timeout_s: float = Field(default=120.0, gt=0)
     #: Port the worker's own HTTP API listens on, inside the container.
     worker_http_port: int = Field(default=8105, ge=1024, le=65535)
+
+    # --- worker: which CPG frontend builds the graph -------------------
+    #: Frontend per source suffix. The worker picks by a **suffix census** of the workspace rather
+    #: than being told, because a workspace reaches it as a path and its language is a fact about
+    #: the tree.
+    #:
+    #: Getting this wrong is not a slow answer, it is a wrong one: a graph built by the wrong
+    #: frontend is empty, every question comes back "the anchor matches no node", and before
+    #: `dataflow_source_unmatched` existed that was reported as "the value cannot reach the sink".
+    #: `.java` is listed because the image ships all fifteen frontends -- measured,
+    #: `ls /opt/joern/joern-cli/frontends/` -- so the only thing that ever limited this to Python
+    #: was the single hardcoded `cpg_bin`. Override with JSON:
+    #: `AEGIS_DATAFLOW__CPG_FRONTENDS={".py":"pysrc2cpg",".java":"javasrc2cpg"}`. Drop a suffix to
+    #: have the worker refuse that language **by name** instead of building the wrong graph.
+    cpg_frontends: dict[str, str] = Field(
+        default_factory=lambda: {".py": "pysrc2cpg", ".java": "javasrc2cpg"}
+    )
+    #: Where a frontend name resolves from, inside the worker container. This is the Joern image's
+    #: own layout; a name is looked up as `<frontends_dir>/<name>/bin/<name>`.
+    frontends_dir: Path = Path("/opt/joern/joern-cli/frontends")
+    #: Extra argv per suffix, appended verbatim after the frontend's own argv. For Java this is the
+    #: **type-information** classpath, and the flag is `--inference-jar-paths` (a comma-separated
+    #: list of jar paths) -- **not** `--classpath`, which `javasrc2cpg` does not have. Verified
+    #: against `javasrc2cpg --help` in the worker image.
+    #:
+    #: It is a **refinement, not a prerequisite.** Measured on a three-file Java fixture that
+    #: references `HttpServletRequest` with no servlet jar available: the graph builds (rc=0) and a
+    #: cross-file flow still comes out, because a call node is created from the source text whether
+    #: or not its type resolves -- so the source anchor matches by name, not by type. What the jars
+    #: add is better type inference (interface dispatch, overload resolution), which is accuracy
+    #: rather than reachability.
+    #:
+    #: A list rather than a string because an argument containing a space must not be split.
+    #:
+    #: Example:
+    #: `AEGIS_DATAFLOW__CPG_FRONTEND_ARGS={".java":["--inference-jar-paths","/deps/a.jar,/deps/b.jar"]}`.
+    cpg_frontend_args: dict[str, list[str]] = Field(default_factory=dict)
 
     # --- fleet (caller side) ------------------------------------------
     #: How many workers the deployment runs. Affinity divides the project hash by this, so

@@ -23,6 +23,7 @@ from pathlib import Path
 
 from aegis_core.logging import setup_logging
 from services.harness import trail as trail_mod
+from services.harness.budget import LIMIT_FIELDS, environment_limits
 from services.harness.coordinator import HarnessConfig, HarnessCoordinator
 
 #: Exit code for "the AI stage is not configured". Distinct from 1 so a script can tell a
@@ -53,12 +54,24 @@ def _run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", default=None, help="输出目录（默认 <workspace>/var/harness）")
     parser.add_argument("--model", default=None, help="覆盖 AEGIS_AI__MODEL")
     parser.add_argument("--max-rounds", type=int, default=None, help="discovery→closure 的最大轮数")
-    parser.add_argument("--max-scopes", type=int, default=None, help="单轮最多计划多少个 scope")
+    parser.add_argument("--max-scopes", type=int, default=None, help="Discovery 派发批次大小；不丢弃待办")
+    for name, convert in LIMIT_FIELDS.items():
+        parser.add_argument("--" + name.replace("_", "-"), type=convert, default=None)
     parser.add_argument(
         "--candidates-per-scope", type=int, default=None, help="每个 scope 最多记录多少候选"
     )
     parser.add_argument("--steps-per-agent", type=int, default=None, help="每个 agent 的最大步数")
     parser.add_argument("--concurrency", type=int, default=None, help="并发模型/agent 数")
+    parser.add_argument(
+        "--claim-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "一次判定 run 最多处理几条不同的 claim（默认 1 = 一条一 run），验证与攻击路径共用。"
+            "每条 claim 仍有自己的 verdict/confidence/reasons；"
+            "需要污点路径的 claim 会以 needs_dataflow 退回单跑。"
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -85,6 +98,7 @@ def _config(args: argparse.Namespace, settings) -> HarnessConfig:
     config = HarnessConfig(
         dry_run=bool(args.dry_run),
         concurrency=int(settings.ai.concurrency),
+        **environment_limits(),
     )
     if getattr(args, "max_rounds", None) is not None:
         config.max_rounds = max(1, args.max_rounds)
@@ -96,6 +110,11 @@ def _config(args: argparse.Namespace, settings) -> HarnessConfig:
         config.steps_per_agent = max(1, args.steps_per_agent)
     if getattr(args, "concurrency", None) is not None:
         config.concurrency = max(1, args.concurrency)
+    if getattr(args, "claim_batch_size", None) is not None:
+        config.claim_batch_size = max(1, args.claim_batch_size)
+    for name in LIMIT_FIELDS:
+        if getattr(args, name, None) is not None:
+            setattr(config, name, getattr(args, name))
     return config
 
 

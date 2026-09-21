@@ -12,8 +12,8 @@
  * （`routes.ts`、`audit.ts` 都是这个原因）。
  */
 
-import type { BundleSummary, JobSummary } from "./api/types.ts";
-import { projectsFrom, UNKNOWN_WORKSPACE, type Project } from "./format.ts";
+import type { BundleSummary, JobSummary, ProjectRecord } from "./api/types.ts";
+import { byRecentActivity, projectsFrom, UNKNOWN_WORKSPACE, type Project } from "./format.ts";
 
 export interface ProjectChoice {
   /** 提交给后端的路径。深度审计与组装任务都用它。 */
@@ -89,12 +89,50 @@ export function projectChoices(projects: Project[]): ProjectChoice[] {
   });
 }
 
-/** 从 API 已经返回的三份列表算出选项。选择器与项目页共用这一个入口。 */
+/**
+ * 从 API 已经返回的**三份**列表算出选项。选择器与项目页共用这一个入口。
+ *
+ * 第三份（注册表，`GET /v1/projects`）不是可选的。`projectsFrom` 是从**分析包与任务上记录的
+ * workspace** 反推项目的，所以一个刚建好、上传完文件、还没跑过任何东西的项目在那份派生数据里
+ * **根本不存在** —— 于是深度审计的项目下拉里选不到它，用户只能以为项目建失败了。
+ *
+ * 这正是 `format.ts::mergeProjects` 的注释早就点名的那个坑（「只看派生 —— 刚建好、还没分析完的
+ * 项目不显示」）；项目页补了注册表，两个 AI 模块的选择器当时漏了。两边现在都从注册表并一次。
+ */
 export function choicesFrom(
   bundles: BundleSummary[],
   jobs: JobSummary[],
+  records: ProjectRecord[] = [],
 ): ProjectChoice[] {
-  return projectChoices(projectsFrom(bundles, jobs));
+  const derived = projectsFrom(bundles, jobs);
+  const registry = new Map(
+    records.filter((record) => record.workspace).map((record) => [record.workspace, record] as const),
+  );
+  const known = new Set(derived.map((project) => project.workspace));
+
+  // 只有注册表条目、没有包也没有任务的项目：它们是一个**可以审计的目录**，而这正是选择器要的。
+  // `lastActivity` 取注册时间，这样刚建的项目排在最前 —— 用户刚刚建完它，那多半就是他想要的那个。
+  const fresh: Project[] = [...registry.values()]
+    .filter((record) => !known.has(record.workspace))
+    .map((record) => ({
+      workspace: record.workspace,
+      name: record.name,
+      bundles: [],
+      jobs: [],
+      bundleCount: 0,
+      jobCount: 0,
+      contextCount: 0,
+      lastActivity: record.created_at ?? null,
+    }));
+
+  // 注册表里的名字是用户/仓库给的，比路径末段准 —— 已有的项目也一起改名，与
+  // `format.ts::mergeProjects` 保持同一条规则，否则同一个项目在项目页与选择器里叫两个名字。
+  const merged = [...derived, ...fresh].map((project) => {
+    const record = registry.get(project.workspace);
+    return record ? { ...project, name: record.name } : project;
+  });
+
+  return projectChoices(byRecentActivity(merged));
 }
 
 /** 默认选谁：第一个可用的项目。不可用的行留在列表里，但不会被自动选中。 */

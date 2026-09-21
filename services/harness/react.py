@@ -121,7 +121,9 @@ def clear_tool_layer_cache() -> None:
     tool_layer.cache_clear()
 
 
-def tool_schemas(tools: list[ToolName] | None = None) -> list[dict]:
+def tool_schemas(
+    tools: list[ToolName] | None = None, *, agent: str = ""
+) -> list[dict]:
     """The JSON schemas to show the model, narrowed to the tools this agent may call."""
     try:
         _, _, _, _, schemas = tool_layer()
@@ -136,11 +138,27 @@ def tool_schemas(tools: list[ToolName] | None = None) -> list[dict]:
     if not tools:
         return list(available)
     allowed = {_name(tool) for tool in tools}
-    return [
+    selected = [
         schema
         for schema in available
         if _name(schema.get("name") or (schema.get("function") or {}).get("name")) in allowed
     ]
+    if agent == "discovery":
+        # Discovery writes a deliberately smaller contract than the opening agents. Showing the
+        # global RECORD enum here invited it to call `note` and `entry_point`, only for the
+        # coordinator to reject those calls after they had already consumed a turn.
+        for schema in selected:
+            if _name(schema.get("name")) != ToolName.RECORD.value:
+                continue
+            properties = schema.get("parameters", {}).get("properties", {})
+            kind = properties.get("kind")
+            if isinstance(kind, dict):
+                kind["enum"] = ["candidate", "evidence", "gap", "lead"]
+                kind["description"] = (
+                    "Discovery 只能记录 candidate、evidence、gap、lead；"
+                    "项目概况、入口和普通 note 由开场勘察负责"
+                )
+    return selected
 
 
 def _name(value: Any) -> str:
@@ -221,12 +239,13 @@ def render_system_prompt(
     tools: list[ToolName],
     output_schema: dict | None,
     extra: str = "",
+    agent: str = "",
 ) -> str:
     """The full system message: the agent's own prompt, the contract, the tools, the schema."""
     parts = [system_prompt.strip(), REACT_CONTRACT.strip()]
     if extra.strip():
         parts.append(extra.strip())
-    schemas = tool_schemas(tools)
+    schemas = tool_schemas(tools, agent=agent)
     if schemas:
         parts.append(
             "Callable tools (JSON schemas):\n" + json.dumps(schemas, ensure_ascii=False, indent=2)
@@ -374,6 +393,7 @@ def run_agent(
         tools=tools,
         output_schema=output_schema,
         extra=extra_system,
+        agent=agent,
     )
     allowed = [_name(tool) for tool in tools]
 
@@ -384,6 +404,19 @@ def run_agent(
         run.finished_at = _now()
         return run
 
+    def finish_or_spend_salvage(reason: str) -> AgentRun:
+        """End the run -- with the truncated `final` if one was held, and say that it was.
+
+        A stage that produced a half-written answer is better than a stage that produced nothing,
+        *provided the report can tell the two apart*: `run.salvaged` is what says so, and it is set
+        here rather than inferred later from the answer's shape.
+        """
+        if pending:
+            run.salvaged = True
+            record(AgentStep(index=len(run.steps) + 1, thought="（改用输出上限截断时抢救出的 `final`）"))
+            return finish("finished", pending)
+        return finish(reason)
+
     if max_steps <= 0:
         # A budget of zero is a configuration choice, not a failure: it means "answer from what
         # you were given". Recording it as `budget` keeps the report honest about it.
@@ -391,6 +424,12 @@ def run_agent(
 
     parse_errors = 0
     note = ""
+    #: A `final` recovered from an answer the output limit cut in half. Held rather than used: the
+    #: retry below usually produces a complete answer, and a complete answer beats a truncated one.
+    #: It is spent only when the run would otherwise end with *nothing* -- a budget stop or an
+    #: exhausted parse-retry budget -- which is where the real loss was: 7 budget and 7 error runs
+    #: in the measured audit, each of them a stage that produced no output at all.
+    pending: dict[str, Any] | None = None
     for index in range(1, max_steps + 1):
         user = render_user_message(
             task,
@@ -452,11 +491,18 @@ def run_agent(
                 parse_errors += 1
                 record(AgentStep(index=index, thought=thought))
                 if parse_errors >= max_parse_attempts:
-                    return finish("error")
+                    return finish_or_spend_salvage("error")
                 note = (
                     "`final` must be a JSON object, not "
                     f"{type(final).__name__}. Answer again with one JSON object."
                 )
+                continue
+            if payload.get("_truncated"):
+                # A final the output limit cut in half. Held, not used: ask for a shorter answer
+                # first, and only spend it if the run never gets a complete one.
+                if pending is None:
+                    pending = final
+                record(AgentStep(index=index, thought=thought))
                 continue
             record(AgentStep(index=index, thought=thought))
             return finish("finished", final)
@@ -466,14 +512,14 @@ def run_agent(
             parse_errors += 1
             record(AgentStep(index=index, thought=thought or answer.strip()[:2000]))
             if parse_errors >= max_parse_attempts:
-                return finish("error")
+                return finish_or_spend_salvage("error")
             note = f"Your last answer could not be used: {batch_error}\nAnswer again with one JSON object."
             continue
         if not batch:
             parse_errors += 1
             record(AgentStep(index=index, thought=thought or answer.strip()[:2000]))
             if parse_errors >= max_parse_attempts:
-                return finish("error")
+                return finish_or_spend_salvage("error")
             note = "One turn needs a `tool`, a `calls` array, or a `final` key. Answer again."
             continue
 
@@ -500,7 +546,7 @@ def run_agent(
     # The loop ran out of turns with work still possible. Whatever was produced is kept, and the
     # report is told the difference between "done" and "ran out".
     log.info("react: %s/%s hit the step budget (%d)", agent, scope_id, max_steps)
-    return finish("budget")
+    return finish_or_spend_salvage("budget")
 
 
 def _complete_with_retries(
@@ -626,6 +672,9 @@ def _parse_turn(
             f"你上一条回答被截断了：只抢救出前 {len(salvaged)} 个完整的调用，后面的丢了。"
             "一次少写几个调用，`text` 也写短一点。",
         )
+    repaired = _salvage_final(answer, output_schema)
+    if repaired is not None:
+        return repaired, None, SALVAGE_NOTE
     if syntax_error:
         return None, syntax_error, ""
     return None, "回答中找不到 JSON 对象（需要 thought + tool/calls/final）", ""
@@ -712,6 +761,131 @@ def _salvage_calls(answer: str) -> list[dict]:
         elif character == "]" and depth == 0:
             break
     return calls
+
+
+#: What the model is told when its answer was cut off at the output limit. Measured on the real
+#: audit of `upp-module-infra`: of 151 retry turns, **87 were this case** -- the model had written a
+#: `final` object, the answer hit the provider's output ceiling, and the strict parse threw the whole
+#: thing away. The retry then re-emitted the same long answer.
+SALVAGE_NOTE = (
+    "你上一条回答被输出上限截断了，整段作废。已经把你写出的 `final` 收下作为备用；"
+    "如果字段不全会在下游被拒。**请用更短的答案重发一次**：每个字段一句话，"
+    "`notes`/`reasons` 各留一条，长列表只留前三条。"
+)
+
+
+def _salvage_final(answer: str, output_schema: dict | None) -> dict | None:
+    """A `final` object recovered from an answer that was cut off mid-object.
+
+    Returns the payload the loop expects (with `_truncated` set, so the loop can hold it as a
+    fallback instead of ending the run on a half-written answer), or None when nothing usable is
+    there. The `final` inside is the repaired object and carries no marker of its own: whatever
+    consumes it downstream sees only the fields the stage asked for.
+
+    The gate is the schema's own `required` list. A repair missing a field the stage needs would turn
+    a retry that usually succeeds (291 of 305 runs finished normally) into a stage output that is
+    silently incomplete -- the opposite of the point.
+
+    Two shapes are repaired, and the second one is what the quick run over the file subtree exposed:
+    an answer with a `"final"` envelope, and a **bare** payload -- the schema's object written
+    directly, which the prompt's "output the JSON object described by the schema" invites. Four-claim
+    batch answers were truncated at the output ceiling there and every retry died the same way: the
+    model had written `{"thought": …, "verdicts": [ … ]}` with no envelope, so a repair that only
+    looked for `"final"` found nothing, and the run ended `error` with no verdicts at all.
+    """
+    starts: list[tuple[int, bool]] = []
+    marker = answer.find('"final"')
+    if marker >= 0:
+        after = answer.find("{", marker)
+        if after >= 0:
+            starts.append((after, True))
+    required = [key for key in ((output_schema or {}).get("required") or []) if isinstance(key, str)]
+    first = answer.find("{")
+    # The bare shape is only *recognisable* by the schema: without a `required` list there is no way
+    # to tell the stage's answer from the envelope around it (`{"thought": …}` would be accepted as
+    # the answer), so the fallback is only offered when there is a schema to check it against.
+    if required and first >= 0 and all(first != start for start, _ in starts):
+        starts.append((first, False))
+    for start, _from_marker in starts:
+        repaired = _repair_truncated_json(answer, start)
+        if repaired is None:
+            continue
+        if required and any(key not in repaired for key in required):
+            continue
+        return {
+            "thought": "（回答被输出上限截断：已从截断的内容中取出写完整的部分作为备用）",
+            "final": repaired,
+            "_truncated": True,
+        }
+    return None
+
+
+def _repair_truncated_json(text: str, start: int) -> dict | None:
+    """Parse the object beginning at `text[start]`, closing brackets the truncation left open.
+
+    Two passes, and the first one is what makes it safe to try at all:
+
+    * if the object is **balanced**, it is parsed exactly as written -- a complete `final` sitting
+      inside an answer whose *envelope* was malformed is recovered, and nothing is invented;
+    * otherwise every position where a value finished is remembered together with the brackets still
+      open at that moment (a string closing counts, which is what lets `{"a": 1, "b": [` be cut back
+      to `{"a": 1}`), and the newest such position that yields valid JSON once the open brackets are
+      closed wins.
+
+    A value cut off mid-string cannot be recovered at all -- there is no way to know what it said --
+    and that case returns None rather than a guess.
+    """
+    stack: list[str] = []
+    checkpoints: list[tuple[int, list[str]]] = []
+    in_string = False
+    escaped = False
+    pairs = {"{": "}", "[": "]"}
+    for index in range(start, len(text)):
+        character = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+                checkpoints.append((index + 1, list(stack)))
+            continue
+        if character == '"':
+            in_string = True
+        elif character in pairs:
+            stack.append(character)
+        elif character == ",":
+            # A separator is where the value before it ended -- numbers and literals have no other
+            # marker, so without this a cut just after `"confidence": 0.7` would drop the number.
+            checkpoints.append((index, list(stack)))
+        elif character in ("}", "]"):
+            if not stack or pairs[stack.pop()] != character:
+                return None
+            if not stack:
+                try:
+                    value = json.loads(text[start : index + 1])
+                except json.JSONDecodeError:
+                    return None
+                return value if isinstance(value, dict) else None
+            checkpoints.append((index + 1, list(stack)))
+    # Truncated: try the most recent value boundary first, walking back at most a few dozen times.
+    # The cut itself is a candidate too, and only when it did not land inside a string: an answer
+    # ending `…"confidence": 0.7` is complete except for its closing brace, and the digit run that
+    # ends at the cut has no separator after it to be recorded as a checkpoint.
+    candidates: list[tuple[int, list[str]]] = []
+    if not in_string:
+        candidates.append((len(text), list(stack)))
+    candidates.extend(reversed(checkpoints[-40:]))
+    for position, pending in candidates:
+        closers = "".join(pairs[opener] for opener in reversed(pending))
+        try:
+            value = json.loads(text[start:position] + closers)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def _turn_calls(payload: dict) -> tuple[list[dict], str | None]:

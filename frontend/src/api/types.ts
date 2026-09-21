@@ -165,12 +165,26 @@ export interface Job {
  * `events` 里每一项的 `kind` 决定其它字段，这里按最宽的形状声明：轨迹的用途就是把后端记下的
  * 事实原样展示，前端**不做推断**——推断出来的一律是猜测，而这一屏的价值恰好在于它不是猜测。
  */
+export interface AuditLead {
+  lead_id: string;
+  question: string;
+  status: string;
+  source_work_id: string;
+  linked_work_id: string;
+  processing_reason: string;
+  file: string;
+  line: number | null;
+}
+
 export interface AuditEvent {
+  lead?: AuditLead;
+  work_id?: string;
+  work?: AuditWorkItem;
   seq: number;
   at: string;
   kind: AuditEventKind;
   run_id?: string;
-  /** 阶段事件：prep / recon / threat_model / plan / discovery / validation / attack_path / findings / close。 */
+  /** 阶段事件：prep / security_inventory / recon / threat_model / plan / discovery / validation / attack_path / findings / close。 */
   stage?: string;
   state?: string;
   round?: number;
@@ -214,14 +228,19 @@ export interface AuditEvent {
   counters?: Record<string, number>;
   dry_run?: boolean;
   fatal?: string | null;
+  closure_note?: string;
   /** record：某个 agent 往黑板上记了一条事实（note/component/entry_point/…/lead）。 */
   record_kind?: string;
+  candidate_ids?: string[];
+  evidence_version?: number;
+  execution_budget?: Record<string, unknown>;
   revision?: number;
   text?: string;
   note?: string;
 }
 
 export type AuditEventKind =
+  | "work_item"
   | "stage"
   | "agent_start"
   | "agent_step"
@@ -235,6 +254,39 @@ export type AuditEventKind =
   | "summary"
   | "error"
   | "unknown";
+
+export interface AuditWorkItem {
+  work_id: string;
+  scope_id: string;
+  title: string;
+  rationale: string;
+  kind: "file_review" | "investigation" | "validation" | "attack_path";
+  state: "planned" | "running" | "done" | "blocked" | "canceled" | "abandoned";
+  files: string[];
+  completion_criteria: string;
+  question?: string;
+  priority?: number;
+  merged_into?: string;
+  gaps?: { gap_id: string; kind: string; question: string; file: string; line: number;
+    state: "pending" | "resolved" | "blocked"; reason: string; evidence_refs: string[]; lead_id: string }[];
+  status_reason: string;
+  candidate_ids: string[];
+  pending_updates?: string[];
+  read_files: number;
+  unread_ranges?: Record<string, [number, number | null][]>;
+  steps_used: number;
+  opened_at: string;
+  closed_at: string | null;
+  attempts: {
+    run_id: string;
+    agent: string;
+    started_at: string;
+    finished_at: string | null;
+    stop_reason: string;
+    steps: number;
+    error: string;
+  }[];
+}
 
 export interface AuditTrail {
   job_id: string;

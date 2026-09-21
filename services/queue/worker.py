@@ -21,6 +21,7 @@ makes "it is scanning" visible instead of "nothing is happening".
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -65,7 +66,8 @@ _STAGES = {stage.value: stage for stage in JobStage}
 #: happening: "正在验证候选 12/56" is the difference between a job that is working and one that is
 #: stuck. Unknown names fall back to the raw id, so a new phase shows up rather than showing blank.
 _AUDIT_STAGE_LABEL = {
-    "prep": "确定性预扫描",
+    "prep": "结构勘察",
+    "security_inventory": "AI 安全清单",
     "recon": "勘察仓库",
     "threat_model": "建立威胁模型",
     "plan": "规划调查范围",
@@ -428,6 +430,10 @@ class Worker:
         if result.fatal:
             warnings.append(result.fatal)
         counts = trail.counters(result.blackboard)
+        incomplete = sum(
+            item.state.value not in {"done", "canceled"}
+            for item in result.blackboard.work
+        )
         # The terminal stage write is inside `_audit_event`/`_finish` already, but the *summary* is
         # the one place that knows the run is over and what it produced, so it is written here
         # rather than inferred from the last stage event.
@@ -438,6 +444,7 @@ class Worker:
             note=(
                 f"AI 审计结束：{counts.get('scopes', 0)} 个 scope、"
                 f"{counts.get('candidates', 0)} 个候选、{counts.get('findings', 0)} 条发现"
+                + (f"；{incomplete} 项任务未完成" if incomplete else "；覆盖任务已完成")
             ),
             units_done=counts.get("scopes", 0),
             units_total=counts.get("scopes", 0),
@@ -453,7 +460,12 @@ class Worker:
         )
         if result.fatal:
             raise _JobRefused(FailureMode.AI_FAILED, result.fatal)
-        if not result.blackboard.closed:
+        if incomplete:
+            warnings.append(
+                f"审计结果不完整：仍有 {incomplete} 项任务未完成；"
+                "不能把当前 0 条发现解释为项目没有漏洞，详情见任务清单和覆盖表"
+            )
+        elif not result.blackboard.closed:
             warnings.append("审计没有正常收敛关闭；见报告里的关闭说明与覆盖表")
 
         return JobResult(
@@ -482,10 +494,31 @@ class Worker:
         Only the model concurrency is taken from settings; the rest keep the harness defaults,
         because they are the bounds the Java benchmark was measured with and a job that quietly
         used different ones would produce a different answer from the CLI run of the same command.
+
+        One exception, and it is named rather than hidden: `AEGIS_HARNESS_CLAIM_BATCH_SIZE` lets a
+        deployment judge several *different* claims in one run, in validation and in the attack-path
+        stage. `1` (the default) is the historical behaviour. Measured on `upp-module-infra`: 139
+        validation runs decided 98 claims at 196 s each -- 110 of the run's 274 minutes -- with
+        `FileController.java` alone read 261 times, plus 72 attack-path runs for 161 confirmed
+        candidates; file-overlap packing alone takes those 98 claims to ~44 runs, and every claim still
+        gets its own verdict. It is off by default because it changes what a judging run is.
         """
+        from services.harness.budget import environment_limits
         from services.harness.coordinator import HarnessConfig
 
-        return HarnessConfig(concurrency=max(1, self.settings.ai.concurrency))
+        raw = os.environ.get("AEGIS_HARNESS_CLAIM_BATCH_SIZE", "").strip()
+        try:
+            batch_size = int(raw) if raw else 1
+        except ValueError:
+            log.warning(
+                "worker: AEGIS_HARNESS_CLAIM_BATCH_SIZE=%r is not an integer; using 1", raw
+            )
+            batch_size = 1
+        return HarnessConfig(
+            concurrency=max(1, self.settings.ai.concurrency),
+            claim_batch_size=max(1, batch_size),
+            **environment_limits(),
+        )
 
     def _audit_event(self, job_id: str, event: dict) -> None:
         """Mirror one trail event into the job's record -- coarsely, on purpose.
@@ -520,11 +553,16 @@ class Worker:
             return
         if kind == "summary":
             counters = event.get("counters") or {}
+            phase = event.get("phase")
             self.store.record_stage(
                 job_id,
                 JobStage.AI,
                 state="running",
-                note="AI 审计：正在写报告",
+                note=(
+                    str(event.get("note") or "AI 安全清单完成")
+                    if phase == "security_inventory"
+                    else "AI 审计：正在写报告"
+                ),
                 # No total here on purpose: the plan's scope count is not in the run's counters, and
                 # `units_done == units_total` would draw a progress bar that is always full -- a
                 # fabricated 100%. `formatUnits` says "总数未知" instead, which is true.

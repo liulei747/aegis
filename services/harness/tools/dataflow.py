@@ -29,7 +29,6 @@ identical, and the whole point of this stage is that they must not.
 
 from __future__ import annotations
 
-import ast
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +37,6 @@ from typing import Any, Protocol
 from aegis_contracts.dataflow import FlowBundle
 from aegis_contracts.harness import DataflowEvidence, ToolName, ToolResult
 from aegis_core.config import DataflowConfig
-from aegis_core.workspace import iter_source_files
 from services.harness.tools.base import ToolContext
 from services.harness.tools.paths import ToolArgumentError, relative_in_workspace
 from services.harness.tools.support import clip, int_argument, str_argument
@@ -256,7 +254,6 @@ class WorkerDataflowVerifier:
         self.config = config
         self._client_factory = client_factory or _default_client_factory
         self._clients: dict[str, FlowClient] = {}
-        self._method_names: dict[str, bool] = {}
 
     # -- the protocol ---------------------------------------------------
     def verify(self, *, file: str, line: int, source_hint: str | None) -> DataflowEvidence:
@@ -287,125 +284,54 @@ class WorkerDataflowVerifier:
 
     # -- source anchor --------------------------------------------------
     def source_anchor(self, *, file: str, line: int, hint: str | None) -> SourceAnchor:
-        """Where the value enters, derived from the code when the model did not say.
+        """Where the value enters. **Always `auto`**: the engine decides, against the graph.
 
-        Three cases, and the reason each is not the others:
+        This used to be decided here, in Python -- a dotted hint was a call anchor, a bare hint
+        that named a function in *this workspace* was a parameter anchor, and no hint fell back to
+        an `ast` walk for the hit's enclosing function. Every step was Python-only, which is what
+        `ast.parse` on a `.java` file turned into an impossibility: the walk raised `SyntaxError`,
+        the fallback used the configured `request.args.get`, and every question returned 0 source
+        candidates. The engine holds the graph, and the graph is the only thing that can answer
+        "which method contains this line, and what does it take" for a language we do not parse
+        ourselves -- so the whole decision moves there and the language stops mattering here.
 
-        * a dotted/qualified hint (``request.args.get``) is a **call** anchor -- measured, only
-          the ``code.contains`` clause of the worker's matcher finds a dotted source;
-        * a bare hint that names a function defined in this workspace is a **parameter** anchor,
-          because handing that name to the call matcher resolves to its call site and finds
-          nothing;
-        * no hint (or a bare name that is not a function here) falls back to the **enclosing
-          function of the hit**, parameter-anchored, and finally to the configured call anchor.
+        `hint` survives as a *hint*, evaluated against the CPG rather than against Python syntax:
+        a dotted expression is a call, a bare name that names a method in the graph is that
+        method's parameters, anything else is a call.
         """
         text = (hint or "").strip()
-        if text:
-            if _looks_qualified(text):
-                return SourceAnchor(kind="call", needle=text, origin="模型提示（调用锚点）")
-            if self._defines_function(text):
-                return SourceAnchor(
-                    kind="parameter", method=text, parameter="",
-                    origin="模型提示（函数参数锚点）",
-                )
-            return SourceAnchor(kind="call", needle=text, origin="模型提示（调用锚点）")
-
-        enclosing = self._enclosing_parameter(file, line)
-        if enclosing is not None:
-            method, parameter = enclosing
-            return SourceAnchor(
-                kind="parameter", method=method, parameter=parameter,
-                origin="命中位置所在函数推导",
-            )
-        return SourceAnchor(kind="call", needle=self.config.source, origin="配置默认调用锚点")
+        return SourceAnchor(
+            kind="auto",
+            needle=text,
+            origin="模型提示（交由引擎按图判定）" if text else "由引擎从命中位置推导",
+        )
 
     def _client(self, anchor: SourceAnchor) -> FlowClient:
-        """One client per source needle, because the needle travels in the client's config.
+        """One client per source *hint*, because the hint travels in the client's config.
 
-        ``WorkerDataflowClient.extract`` takes the source end from ``DataflowConfig.source`` --
-        there is no per-call argument for it -- so a call anchor is applied by handing the client
-        a config copy with that needle. Reusing the client's own payload builder (instead of
-        posting to the worker here) is what keeps "no sink is ever sent" a property of one
-        module rather than a promise repeated in two.
+        `WorkerDataflowClient.extract` takes the source end from ``DataflowConfig.source`` -- there
+        is no per-call argument for it -- so a hint is applied by handing the client a config copy.
+        That is also why `auto` **with no hint passes an empty `source`**: the configured default is
+        a string a call matcher will look for, and sending it would turn "let the graph decide" back
+        into "match this literal", which is exactly the Python-shaped behaviour this anchor kind
+        exists to remove.
+
+        Reusing the client's own payload builder (instead of posting to the worker here) is what
+        keeps "no sink is ever sent" a property of one module rather than a promise repeated in two.
         """
-        key = anchor.needle if anchor.kind == "call" else ""
+        carries_hint = anchor.kind in ("call", "auto")
+        key = anchor.needle if carries_hint else "parameter"
         client = self._clients.get(key)
         if client is None:
-            config = self.config if not key else self.config.model_copy(update={"source": key})
+            config = (
+                self.config.model_copy(update={"source": anchor.needle})
+                if carries_hint
+                else self.config
+            )
             client = self._client_factory(config, self.workspace)
             self._clients[key] = client
         return client
 
-    def _defines_function(self, name: str) -> bool:
-        """Is there a ``def name`` in this workspace? Cached; parsing stops at the first hit.
-
-        A bare source hint is ambiguous -- ``handle_request`` is a method here, ``getenv`` is a
-        call -- and the two need opposite anchor kinds. The workspace itself settles it, and the
-        answer is cached because the model asks about the same few names repeatedly.
-        """
-        known = self._method_names.get(name)
-        if known is not None:
-            return known
-        found = False
-        try:
-            for path in iter_source_files(self.workspace):
-                try:
-                    tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-                except (OSError, SyntaxError):
-                    continue
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-                        found = True
-                        break
-                if found:
-                    break
-        except OSError:
-            found = False
-        self._method_names[name] = found
-        return found
-
-    def _enclosing_parameter(self, file: str, line: int) -> tuple[str, str] | None:
-        """``(method, first usable parameter)`` of the innermost function containing ``line``.
-
-        This is the cheap static stand-in for the LSP caller walk the assembly pipeline does:
-        without a language server we cannot find the *entry point* up the call chain, but the
-        hit's own function is already a better source than a global call name, and its first
-        parameter is the value the function received. Walking outward is deliberate -- a method
-        with no parameters (a bound handler, a no-argument ``main``) is not an anchor at all, and
-        the outer function that called it usually is.
-        """
-        path = self.workspace / file
-        try:
-            source = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            return None
-
-        best: ast.FunctionDef | ast.AsyncFunctionDef | None = None
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            end = getattr(node, "end_lineno", None) or node.lineno
-            if node.lineno <= line <= end and (best is None or node.lineno > best.lineno):
-                best = node
-        while best is not None:
-            parameter = _first_parameter(best)
-            if parameter is not None:
-                return best.name, parameter
-            # The innermost function has nothing to anchor on; try the one that contains it.
-            enclosing = None
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                end = getattr(node, "end_lineno", None) or node.lineno
-                if node.lineno < best.lineno <= end:
-                    if enclosing is None or node.lineno > enclosing.lineno:
-                        enclosing = node
-            best = enclosing
-        return None
 
 
 def _default_client_factory(config: DataflowConfig, workspace: Path) -> FlowClient:
@@ -512,21 +438,3 @@ def _element_text(element: Any) -> str:
     code = (element.code or "").strip()
     text = f"{where} {code}".strip()
     return text or (element.label or "?")
-
-
-def _looks_qualified(text: str) -> bool:
-    """Does this hint name a *call*, rather than a function of this repository?"""
-    return "." in text or "(" in text or ")" in text
-
-
-def _first_parameter(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
-    """The first parameter worth using as a source, or None.
-
-    ``self``/``cls`` are skipped: they are the receiver, taint does not enter through them, and
-    the worker would happily anchor on them and return a path that proves nothing.
-    """
-    args = list(node.args.posonlyargs) + list(node.args.args)
-    for arg in args:
-        if arg.arg not in ("self", "cls"):
-            return arg.arg
-    return None

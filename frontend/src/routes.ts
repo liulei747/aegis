@@ -16,7 +16,7 @@ export type Route =
   | { screen: "compare"; bundleId: string | null }
   | { screen: "verdicts"; bundleId: string | null }
   | { screen: "projects"; workspace: string | null }
-  | { screen: "audit"; jobId: string | null }
+  | { screen: "audit"; jobId: string | null; workspace: string | null }
   | { screen: "traffic" }
   | { screen: "settings" };
 
@@ -64,8 +64,14 @@ export function parseRoute(hash: string): Route {
       return { screen: "projects", workspace: parts[1] ?? null };
     // `#/audit` without an id is the submit screen: the list of audits and the form are the same
     // screen, because a reader who has no run open is a reader about to start one.
+    //
+    // `#/audit/w/<workspace>` 是**预选项目**的提交页（从「项目管理」每行的按钮跳进来）。
+    // 用 `w` 作前缀段而不是把 workspace 放进第二段：第二段历史上就是 job id，而一个 job id 与
+    // 一个 workspace 路径在形状上无法区分 —— 靠 `J-` 前缀去猜，就是把两个概念绑在一个位置上，
+    // 下次改 job id 的格式就会静默地把路径读成 id。
     case "audit":
-      return { screen: "audit", jobId: parts[1] ?? null };
+      if (parts[1] === "w") return { screen: "audit", jobId: null, workspace: parts[2] ?? null };
+      return { screen: "audit", jobId: parts[1] ?? null, workspace: null };
     case "traffic":
       return { screen: "traffic" };
     case "settings":

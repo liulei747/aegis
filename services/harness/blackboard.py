@@ -88,17 +88,29 @@ def save(blackboard: Blackboard, run_dir: Path | str) -> Path:
 
     `save` does not bump `revision`: revisions count *updates*, and a write that changed nothing
     must not look like one. Mutators bump it.
+
+    **What goes to disk is not what is held in memory.** On the `upp-module-infra` audit the file was
+    40 MB, and the parts a reader cannot use were almost all of it: every agent's `read` step carried
+    the file body twice (once as the tool's `summary`, once as `data.lines`), 2902 times, for 203
+    distinct files. The ledger needs four numbers per read (`path`, `offset`, `returned_lines`,
+    `total_lines`); the material reuse needs the lines of a file the run has read *completely*, and one
+    copy of those is enough. So the artifact keeps the newest complete read per file and drops the
+    rest, and says so rather than looking complete -- see `_slim_for_disk`.
     """
     directory = Path(run_dir)
     directory.mkdir(parents=True, exist_ok=True)
     target = blackboard_path(directory)
     payload = blackboard.model_dump(mode="json")
+    payload["runs"] = _slim_for_disk(payload.get("runs") or [])
     fd, tmp_name = tempfile.mkstemp(
         dir=str(directory), prefix=BLACKBOARD_FILE + ".", suffix=_TMP_SUFFIX, text=True
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            # Compact, not `indent=2`: on the module audit the indentation alone was ~3 MB of a 21 MB
+            # file, and nobody reads a 21 MB JSON by eye -- the report is the human view of this, and
+            # `jq` reads the compact form perfectly well.
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -108,6 +120,81 @@ def save(blackboard: Blackboard, run_dir: Path | str) -> Path:
         Path(tmp_name).unlink(missing_ok=True)
         raise
     return target
+
+
+#: How much of a non-`read` tool result is kept in the artifact. The ledger and the report both read
+#: the structured half (`data`); the summary is prose for a human, and past this much of it the
+#: human is reading a file listing rather than an audit record. The tail is *dropped* rather than
+#: kept aside: keeping it made the artifact 1.5 MB larger to hold text the tool can produce again.
+KEPT_SUMMARY_CHARS = 1200
+
+#: How many entries of a list-valued `data` field the artifact keeps (`list_files` returns up to 200
+#: paths per call and the module audit made 345 of them; `grep` returns up to 200 matches). The count
+#: that was dropped is recorded, so a reader knows the list is a prefix rather than the whole answer.
+KEPT_DATA_ITEMS = 50
+
+
+def _slim_for_disk(runs: list[dict]) -> list[dict]:
+    """The run transcripts, with the redundant file bodies removed and every removal stated.
+
+    Three rules, all of them about not lying:
+
+    * a `read` step keeps its `data` (the coverage ledger is computed from exactly those fields) and
+      loses its `summary`; the body is either in `data.lines` for the newest complete read of that
+      file or reachable in the workspace;
+    * older copies of the same file's lines are dropped, and each one records why;
+    * a list in `data` is kept as a prefix with its full count beside it.
+
+    Nothing here changes what the run *did*: the ledger fields, the tool names, the thoughts and the
+    order are all untouched. What it removes is duplicated bytes.
+    """
+    newest_complete: dict[str, int] = {}
+    for index, run in enumerate(runs):
+        for step in run.get("steps") or []:
+            call, result = step.get("call") or {}, step.get("result") or {}
+            if (call.get("tool") or "") != "read" or not result.get("ok"):
+                continue
+            data = result.get("data") or {}
+            path = str(data.get("path") or "")
+            total = int(data.get("total_lines") or 0)
+            returned = int(data.get("returned_lines") or 0)
+            if path and total > 0 and returned >= total:
+                newest_complete[path] = index
+
+    for index, run in enumerate(runs):
+        for step in run.get("steps") or []:
+            call, result = step.get("call") or {}, step.get("result") or {}
+            tool = call.get("tool") or ""
+            data = result.get("data") or {}
+            if tool == "read":
+                path = str(data.get("path") or "")
+                if isinstance(data.get("lines"), list):
+                    if newest_complete.get(path) != index:
+                        data["lines"] = []
+                        data["lines_omitted"] = (
+                            "同一文件另有更完整的读取记录，此处只保留台账字段（path/offset/"
+                            "returned_lines/total_lines）"
+                        )
+                if result.get("summary"):
+                    result["summary_chars"] = len(result["summary"])
+                    result["summary"] = (
+                        f"{path or '（未记录路径）'}：正文已从产物中省略（内容与工作区文件一致；"
+                        "读取窗口见 data）"
+                    )
+            else:
+                summary = result.get("summary")
+                if isinstance(summary, str) and len(summary) > KEPT_SUMMARY_CHARS:
+                    result["summary_chars"] = len(summary)
+                    result["summary"] = (
+                        summary[:KEPT_SUMMARY_CHARS]
+                        + f"\n（产物中省略后 {len(summary) - KEPT_SUMMARY_CHARS} 字符；"
+                        "完整输出在工作区与工具层，本文件只保留台账字段）"
+                    )
+            for key, value in list(data.items()):
+                if isinstance(value, list) and len(value) > KEPT_DATA_ITEMS:
+                    data[f"{key}_omitted"] = len(value) - KEPT_DATA_ITEMS
+                    data[key] = value[:KEPT_DATA_ITEMS]
+    return runs
 
 
 def load(run_dir: Path | str) -> Blackboard | None:
@@ -520,6 +607,14 @@ def set_context(
     return _touch(blackboard, bump=changed)
 
 
+def set_security_inventory(blackboard: Blackboard, inventory: Any) -> Blackboard:
+    """Persist deterministic leads without mixing them into model-established facts."""
+    if blackboard.security_inventory == inventory:
+        return blackboard
+    blackboard.security_inventory = inventory
+    return _touch(blackboard)
+
+
 # ─────────────────────────────────────────────────────────── appends
 
 
@@ -582,7 +677,8 @@ def add_work(blackboard: Blackboard, items: list[WorkItem]) -> int:
     for item in items:
         if _append_unique(blackboard.work, item, key="work_id"):
             added += 1
-        ensure_coverage(blackboard, item.scope_id, title=item.title)
+        if item.kind.value in ("file_review", "investigation"):
+            ensure_coverage(blackboard, item.scope_id, title=item.title)
     if added:
         _touch(blackboard)
     return added
@@ -647,7 +743,7 @@ def close_work(
         if steps_used > item.steps_used:
             item.steps_used = steps_used
             changed = True
-        if item.state in (WorkItemState.PLANNED, WorkItemState.RUNNING):
+        if item.state in (WorkItemState.PLANNED, WorkItemState.RUNNING, WorkItemState.BLOCKED):
             item.state = state
             item.closed_at = _now()
             changed = True

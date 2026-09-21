@@ -18,7 +18,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type ApiError } from "../api/client.ts";
+import { api, previousAttempt, type ApiError } from "../api/client.ts";
 import type {
   AuditEvent,
   AuditReport,
@@ -26,6 +26,7 @@ import type {
   BundleSummary,
   Job,
   JobSummary,
+  ProjectRecord,
 } from "../api/types.ts";
 import {
   agentRows,
@@ -43,6 +44,7 @@ import { Banner, Empty, Field, StateBadge, Stat, usePolled } from "../components
 import { formatCount, formatDurationMs, formatTimestamp } from "../format.ts";
 import { JOB_KIND, label } from "../labels.ts";
 import { ProjectFacts, ProjectSelect, useProjectChoice } from "./ProjectPicker.tsx";
+import { AuditBlackboard, AuditTasks } from "./AuditTasks.tsx";
 
 /** 对话流最多渲染多少条。过滤器仍然作用于全部，截断的是 DOM，不是事实。 */
 const DIALOGUE_LIMIT = 300;
@@ -104,38 +106,64 @@ function useAuditTrail(jobId: string | null) {
 function SubmitPanel({
   jobs,
   bundles,
+  projects,
+  initialWorkspace,
   onSubmitted,
 }: {
   jobs: JobSummary[];
   bundles: BundleSummary[];
+  /** 项目注册表：新项目还没有任务与分析包，只靠那两份派生的话它在选择器里是隐形的。 */
+  projects: ProjectRecord[];
+  /** 从项目页带着路径跳进来时预选它。 */
+  initialWorkspace: string | null;
   onSubmitted: (jobId: string) => void;
 }) {
-  const { choices, choice, select } = useProjectChoice(bundles, jobs);
+  const { choices, choice, select } = useProjectChoice(bundles, jobs, projects, initialWorkspace);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<ApiError | null>(null);
   const [accepted, setAccepted] = useState<string | null>(null);
+  // 上一次尝试是 failed / canceled 时，网关会拒绝同指纹的再次提交（409），除非带 `?force=true`。
+  // 那不是死胡同，所以单独记下来给一个按钮 —— 只显示一句错误的话，这个项目在界面上就永远跑不了。
+  //
+  // `workspace` 必须在收到 409 的那一刻记下来：这个按钮重新提交的是**被拒绝的那个项目**，
+  // 不是此刻下拉框里选中的项目。`choice` 是从三份轮询数据里每次渲染重算的（recent activity 排序、
+  // 选中项消失还会退回默认值），用户改一下下拉框、或某次轮询恰好把列表换了个序，
+  // 「重新运行这个项目」就会带着 `?force=true` 打到**另一个**项目上 —— 而_FORCE_对一个已成功的
+  // 项目意味着归档它上一次的结果再整个重跑。
+  const [previous, setPrevious] = useState<{ jobId: string; state: string; workspace: string } | null>(
+    null,
+  );
 
   const recent = jobs.filter((job) => job.kind === "audit").slice(0, 10);
   const running = recent.filter((job) => job.state === "running" || job.state === "queued");
 
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault();
+  /** 提交一次审计。409 时把**这次请求用的 workspace** 和拒绝信息一起记下，供恢复按钮原样重发。 */
+  const runAudit = async (workspace: string, options: { force?: boolean } = {}) => {
     setFailure(null);
     setAccepted(null);
+    setPrevious(null);
+    setBusy(true);
+    try {
+      const result = await api.submitAudit({ workspace }, options);
+      setAccepted(result.job_id);
+      onSubmitted(result.job_id);
+    } catch (caught) {
+      const error = caught as ApiError;
+      setFailure(error);
+      const attempt = previousAttempt(error);
+      if (attempt !== null) setPrevious({ ...attempt, workspace });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submit = (event: React.SyntheticEvent) => {
+    event.preventDefault();
     if (choice === null) {
       setFailure({ status: 0, detail: "先选一个项目。还没有项目就去「项目管理」新建一个。" });
       return;
     }
-    setBusy(true);
-    try {
-      const result = await api.submitAudit({ workspace: choice.workspace });
-      setAccepted(result.job_id);
-      onSubmitted(result.job_id);
-    } catch (caught) {
-      setFailure(caught as ApiError);
-    } finally {
-      setBusy(false);
-    }
+    void runAudit(choice.workspace);
   };
 
   return (
@@ -149,6 +177,33 @@ function SubmitPanel({
       </p>
 
       {failure ? <Banner>{failure.detail}</Banner> : null}
+      {previous ? (
+        <Banner kind="warn">
+          上一次尝试 <code>{previous.jobId}</code> 是
+          <strong>
+            {previous.state === "failed"
+              ? "失败的"
+              : previous.state === "canceled"
+                ? "被取消的"
+                : previous.state}
+          </strong>
+          ，同一份请求不会自动重跑（"没有结果"与"结果是干净"不是一回事）。
+          {" "}
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void runAudit(previous.workspace, { force: true })}
+          >
+            重新运行这个项目
+          </button>
+          {" "}
+          <span className="muted">
+            （<code>{previous.workspace}</code>，带 <code>?force=true</code>）
+          </span>
+          {" "}
+          <a href={`#/audit/${encodeURIComponent(previous.jobId)}`}>看上一次的轨迹</a>
+        </Banner>
+      ) : null}
       {accepted ? (
         <Banner kind="info">
           已提交，任务号 <code>{accepted}</code>。运行状态与对话见下。
@@ -169,8 +224,9 @@ function SubmitPanel({
         </div>
         <ProjectFacts choice={choice} />
         <p className="muted">
-          同一个项目的重复提交会挂到已经在跑的那个任务上，不会跑第二遍；要重新跑，请到任务页用
-          「重新运行」。
+          同一个项目的重复提交会挂到已经在跑的那个任务上，不会跑第二遍。上一次是失败或被取消时，
+          提交会被<strong>先拒一次</strong>并给出「重新运行」—— 那种情况下不会自动重试，
+          因为"跑过但没有结果"和"跑出来是干净的"必须让人分得开。
         </p>
       </form>
 
@@ -204,23 +260,43 @@ function SubmitPanel({
               <th>提交时间</th>
               <th className="num">耗时</th>
               <th className="num">发现</th>
+              <th className="num">重跑</th>
             </tr>
           </thead>
           <tbody>
-            {recent.map((job) => (
-              <tr key={job.job_id} className="clickable" onClick={() => onSubmitted(job.job_id)}>
-                <td>
-                  <code>{job.job_id}</code>
-                </td>
-                <td>
-                  <StateBadge state={job.state} cancelRequested={job.cancel_requested} />
-                </td>
-                <td className="note">{job.workspace ?? "—"}</td>
-                <td>{formatTimestamp(job.submitted_at)}</td>
-                <td className="num">{formatDurationMs(job.duration_ms)}</td>
-                <td className="num">{formatCount(job.counters.findings ?? 0)}</td>
-              </tr>
-            ))}
+            {recent.map((job) => {
+              const terminal =
+                job.state === "succeeded" || job.state === "failed" || job.state === "canceled";
+              return (
+                <tr key={job.job_id} className="clickable" onClick={() => onSubmitted(job.job_id)}>
+                  <td>
+                    <code>{job.job_id}</code>
+                  </td>
+                  <td>
+                    <StateBadge state={job.state} cancelRequested={job.cancel_requested} />
+                  </td>
+                  <td className="note">{job.workspace ?? "—"}</td>
+                  <td>{formatTimestamp(job.submitted_at)}</td>
+                  <td className="num">{formatDurationMs(job.duration_ms)}</td>
+                  <td className="num">{formatCount(job.counters.findings ?? 0)}</td>
+                  <td className="num">
+                    {terminal && job.workspace ? (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={(event) => {
+                          // 行本身点击是"进详情"；这里的重跑要拦住冒泡，别两个都发生。
+                          event.stopPropagation();
+                          void runAudit(job.workspace as string, { force: true });
+                        }}
+                      >
+                        重新审计
+                      </button>
+                    ) : null}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
@@ -317,7 +393,7 @@ function DialogueFeed({ events }: { events: AuditEvent[] }) {
   );
 }
 
-function RunView({ jobId, onBack }: { jobId: string; onBack: () => void }) {
+function RunView({ jobId, onBack, onRestart }: { jobId: string; onBack: () => void; onRestart: (jobId: string) => void }) {
   const job = usePolled<Job>(() => api.job(jobId), [jobId], { pollMs: 2000 });
   const trail = useAuditTrail(jobId);
   const [failure, setFailure] = useState<ApiError | null>(null);
@@ -367,12 +443,38 @@ function RunView({ jobId, onBack }: { jobId: string; onBack: () => void }) {
     }
   };
 
+  const restart = async () => {
+    // 重跑的是**这个任务自己的** workspace（redrive 复用任务号，它是指纹），不是下拉框里的选择。
+    // 全程可选链：旧记录的 `submission` 缺字段时，按钮退化为禁用，而不是在渲染/点击时抛错。
+    const workspace = job.data?.submission?.request?.workspace;
+    if (!workspace || busy) return;
+    setBusy(true);
+    setFailure(null);
+    try {
+      const result = await api.submitAudit({ workspace }, { force: true });
+      // Redrive keeps the job id but resets the trail sequence. Remount all polling state.
+      onRestart(result.job_id);
+    } catch (caught) {
+      setFailure(caught as ApiError);
+      setBusy(false);
+    }
+  };
+
   const stages = stageRows(events);
   const agents = agentRows(events);
   const coverage = coverageRows(events);
   const candidates = candidateRows(events);
   const findings = findingRows(events);
   const runningCount = agents.filter((row) => row.state === "running").length;
+  const resultWarnings = job.data?.result?.warnings ?? [];
+  const closureNote = [...events]
+    .reverse()
+    .find((event) => event.kind === "summary")?.closure_note;
+  const legacyIncomplete =
+    !resultWarnings.some((warning) => warning.includes("审计结果不完整")) &&
+    closureNote?.includes("仍有")
+      ? closureNote
+      : null;
 
   return (
     <section>
@@ -385,6 +487,16 @@ function RunView({ jobId, onBack }: { jobId: string; onBack: () => void }) {
           <StateBadge state={job.data.state} cancelRequested={job.data.cancel_requested} />
         ) : null}
         {runningCount > 0 ? <span className="badge">{runningCount} 个 agent 在跑</span> : null}
+        {terminal ? (
+          <button
+            type="button"
+            className="right"
+            onClick={() => void restart()}
+            disabled={busy || !job.data?.submission?.request?.workspace}
+          >
+            {busy ? "正在重新提交…" : "重新审计"}
+          </button>
+        ) : null}
         {!closed && !terminal ? (
           <button type="button" className="right" onClick={cancel} disabled={busy}>
             {busy ? "取消中…" : "取消"}
@@ -399,6 +511,14 @@ function RunView({ jobId, onBack }: { jobId: string; onBack: () => void }) {
         <Banner>
           <strong>{job.data.failure.mode}</strong>：{job.data.failure.message}
         </Banner>
+      ) : null}
+      {resultWarnings.map((warning) => (
+        <Banner key={warning} kind="warn">
+          {warning}
+        </Banner>
+      ))}
+      {legacyIncomplete ? (
+        <Banner kind="warn">审计结果不完整：{legacyIncomplete}</Banner>
       ) : null}
       {trail.exists === false ? (
         <Banner kind="info">
@@ -447,6 +567,9 @@ function RunView({ jobId, onBack }: { jobId: string; onBack: () => void }) {
           {formatTimestamp(job.data?.progress.worker_heartbeat_at ?? null)}
         </Field>
       </div>
+
+      <AuditTasks key={jobId} events={events} terminal={terminal || closed} />
+      <AuditBlackboard events={events} />
 
       <h2>阶段</h2>
       {stages.length === 0 ? (
@@ -652,15 +775,30 @@ export function AuditScreen({
   jobId,
   jobs,
   bundles,
+  projects,
+  workspace,
   onOpen,
 }: {
   jobId: string | null;
   jobs: JobSummary[];
   bundles: BundleSummary[];
+  projects: ProjectRecord[];
+  /** `#/audit/w/<路径>` 带来的预选项目；`#/audit` 时为 null。 */
+  workspace: string | null;
   onOpen: (jobId: string) => void;
 }) {
+  const [attemptView, setAttemptView] = useState(0);
   if (jobId === null) {
-    return <SubmitPanel jobs={jobs} bundles={bundles} onSubmitted={onOpen} />;
+    return (
+      <SubmitPanel
+        jobs={jobs}
+        bundles={bundles}
+        projects={projects}
+        initialWorkspace={workspace}
+        onSubmitted={onOpen}
+      />
+    );
   }
-  return <RunView jobId={jobId} onBack={() => onOpen("")} />;
+  return <RunView key={`${jobId}:${attemptView}`} jobId={jobId} onBack={() => onOpen("")}
+    onRestart={(id) => { setAttemptView((value) => value + 1); onOpen(id); }} />;
 }

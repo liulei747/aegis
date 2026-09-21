@@ -145,7 +145,26 @@ services:
       # configured), so it needs the AI settings for the same reason the gateway does.
       AEGIS_AI__ENABLED: "true"
       AEGIS_AI__BASE_URL: ${API_URL:-}
-      AEGIS_AI__MODEL: ${MODEL:-}
+      # `AEGIS_AI_MODEL`, deliberately NOT `MODEL`. Compose interpolation gives the *shell*
+      # environment precedence over `--env-file`, so a `MODEL` left over in the operator's
+      # session silently overrode this file: `.env` said `glm-5.3-flash`, the deployment ran
+      # `deepseek-v4-flash`, and editing `.env` changed nothing. A name of its own cannot be
+      # shadowed by an unrelated variable, and the default here is what `.env.example` documents.
+      AEGIS_AI__MODEL: ${AEGIS_AI_MODEL:-glm-5.3-flash}
+      # Calls in flight at once, passed through because the app's default is 1 and this file
+      # previously did not carry this variable at all -- which made "1" the only reachable value
+      # and left a deployed audit unable to be sped up without editing code.
+      #
+      # READ `docs/AI_STAGE.md` BEFORE RAISING IT: behind a gateway with a ~60s ceiling, six
+      # concurrent calls returned 3 usable answers where six sequential returned 6. Concurrency
+      # multiplies the very failure it is meant to work around.
+      AEGIS_AI__CONCURRENCY: "${AEGIS_AI_CONCURRENCY:-8}"
+      # Output-token ceiling. Measured reason it is set at all: with the provider's own default, 87
+      # of 151 retry turns in a real audit were answers the output limit had cut in half, each one a
+      # full re-emission of a long `final`. 16384 rather than 8192 because a *batched* judging run
+      # needs N times one answer -- every `batch(4)` call in a quick run came back at exactly 8192 and
+      # looped on truncation. Pair it with `AEGIS_HARNESS_CLAIM_BATCH_SIZE`. `0` lets the provider decide.
+      AEGIS_AI__MAX_TOKENS: "${AEGIS_AI_MAX_TOKENS:-16384}"
       AEGIS_AI__API_KEY_ENV: API_KEY
       API_KEY: ${API_KEY:-}
     entrypoint:
@@ -201,6 +220,15 @@ services:
       AEGIS_LSP_CONFIG_FILE: /opt/aegis/lsp.yaml
       AEGIS_QUEUE__REDIS_URL: redis://redis:6379/0
       # Scanning stays delegated (small image, CPU bound).
+      AEGIS_HARNESS_MAX_RUN_SECONDS: ${AEGIS_HARNESS_MAX_RUN_SECONDS:-7200}
+      AEGIS_HARNESS_MAX_MODEL_CALLS: ${AEGIS_HARNESS_MAX_MODEL_CALLS:-512}
+      AEGIS_HARNESS_MAX_MODEL_TOKENS: ${AEGIS_HARNESS_MAX_MODEL_TOKENS:-0}
+      AEGIS_HARNESS_MAX_COST_USD: ${AEGIS_HARNESS_MAX_COST_USD:-0}
+      AEGIS_HARNESS_INPUT_USD_PER_MILLION: ${AEGIS_HARNESS_INPUT_USD_PER_MILLION:-0}
+      AEGIS_HARNESS_OUTPUT_USD_PER_MILLION: ${AEGIS_HARNESS_OUTPUT_USD_PER_MILLION:-0}
+      AEGIS_HARNESS_MAX_CLAIM_ATTEMPTS: ${AEGIS_HARNESS_MAX_CLAIM_ATTEMPTS:-3}
+      AEGIS_HARNESS_MAX_GAP_CONTINUATIONS: ${AEGIS_HARNESS_MAX_GAP_CONTINUATIONS:-2}
+      AEGIS_HARNESS_MAX_NO_PROGRESS_CONTINUATIONS: ${AEGIS_HARNESS_MAX_NO_PROGRESS_CONTINUATIONS:-1}
       AEGIS_SCAN_SERVICE_URL: http://scan:8101
       # Taint flows run here too -- this service is the other caller of the extraction code,
       # so it needs the same fleet size as `extract` or a project would route differently
@@ -215,7 +243,26 @@ services:
       # gateway. See the gateway's block for why `--env-file .env` is required.
       AEGIS_AI__ENABLED: "true"
       AEGIS_AI__BASE_URL: ${API_URL:-}
-      AEGIS_AI__MODEL: ${MODEL:-}
+      # `AEGIS_AI_MODEL`, deliberately NOT `MODEL`. Compose interpolation gives the *shell*
+      # environment precedence over `--env-file`, so a `MODEL` left over in the operator's
+      # session silently overrode this file: `.env` said `glm-5.3-flash`, the deployment ran
+      # `deepseek-v4-flash`, and editing `.env` changed nothing. A name of its own cannot be
+      # shadowed by an unrelated variable, and the default here is what `.env.example` documents.
+      AEGIS_AI__MODEL: ${AEGIS_AI_MODEL:-glm-5.3-flash}
+      # Calls in flight at once, passed through because the app's default is 1 and this file
+      # previously did not carry this variable at all -- which made "1" the only reachable value
+      # and left a deployed audit unable to be sped up without editing code.
+      #
+      # READ `docs/AI_STAGE.md` BEFORE RAISING IT: behind a gateway with a ~60s ceiling, six
+      # concurrent calls returned 3 usable answers where six sequential returned 6. Concurrency
+      # multiplies the very failure it is meant to work around.
+      AEGIS_AI__CONCURRENCY: "${AEGIS_AI_CONCURRENCY:-8}"
+      # Output-token ceiling. Measured reason it is set at all: with the provider's own default, 87
+      # of 151 retry turns in a real audit were answers the output limit had cut in half, each one a
+      # full re-emission of a long `final`. 16384 rather than 8192 because a *batched* judging run
+      # needs N times one answer -- every `batch(4)` call in a quick run came back at exactly 8192 and
+      # looped on truncation. Pair it with `AEGIS_HARNESS_CLAIM_BATCH_SIZE`. `0` lets the provider decide.
+      AEGIS_AI__MAX_TOKENS: "${AEGIS_AI_MAX_TOKENS:-16384}"
       AEGIS_AI__API_KEY_ENV: API_KEY
       API_KEY: ${API_KEY:-}
     entrypoint: ["aegis-worker"]
@@ -287,7 +334,26 @@ services:
       # in `/health` (`capabilities.ai.api_key_present`) and in the job's warnings.
       AEGIS_AI__ENABLED: "true"
       AEGIS_AI__BASE_URL: ${API_URL:-}
-      AEGIS_AI__MODEL: ${MODEL:-}
+      # `AEGIS_AI_MODEL`, deliberately NOT `MODEL`. Compose interpolation gives the *shell*
+      # environment precedence over `--env-file`, so a `MODEL` left over in the operator's
+      # session silently overrode this file: `.env` said `glm-5.3-flash`, the deployment ran
+      # `deepseek-v4-flash`, and editing `.env` changed nothing. A name of its own cannot be
+      # shadowed by an unrelated variable, and the default here is what `.env.example` documents.
+      AEGIS_AI__MODEL: ${AEGIS_AI_MODEL:-glm-5.3-flash}
+      # Calls in flight at once, passed through because the app's default is 1 and this file
+      # previously did not carry this variable at all -- which made "1" the only reachable value
+      # and left a deployed audit unable to be sped up without editing code.
+      #
+      # READ `docs/AI_STAGE.md` BEFORE RAISING IT: behind a gateway with a ~60s ceiling, six
+      # concurrent calls returned 3 usable answers where six sequential returned 6. Concurrency
+      # multiplies the very failure it is meant to work around.
+      AEGIS_AI__CONCURRENCY: "${AEGIS_AI_CONCURRENCY:-8}"
+      # Output-token ceiling. Measured reason it is set at all: with the provider's own default, 87
+      # of 151 retry turns in a real audit were answers the output limit had cut in half, each one a
+      # full re-emission of a long `final`. 16384 rather than 8192 because a *batched* judging run
+      # needs N times one answer -- every `batch(4)` call in a quick run came back at exactly 8192 and
+      # looped on truncation. Pair it with `AEGIS_HARNESS_CLAIM_BATCH_SIZE`. `0` lets the provider decide.
+      AEGIS_AI__MAX_TOKENS: "${AEGIS_AI_MAX_TOKENS:-16384}"
       AEGIS_AI__API_KEY_ENV: API_KEY
       API_KEY: ${API_KEY:-}
       # --- dataflow fleet -------------------------------------------------------
@@ -484,7 +550,26 @@ services:
       AEGIS_DATAFLOW__WORKER_COUNT: "2"
       AEGIS_AI__ENABLED: "true"
       AEGIS_AI__BASE_URL: ${API_URL:-}
-      AEGIS_AI__MODEL: ${MODEL:-}
+      # `AEGIS_AI_MODEL`, deliberately NOT `MODEL`. Compose interpolation gives the *shell*
+      # environment precedence over `--env-file`, so a `MODEL` left over in the operator's
+      # session silently overrode this file: `.env` said `glm-5.3-flash`, the deployment ran
+      # `deepseek-v4-flash`, and editing `.env` changed nothing. A name of its own cannot be
+      # shadowed by an unrelated variable, and the default here is what `.env.example` documents.
+      AEGIS_AI__MODEL: ${AEGIS_AI_MODEL:-glm-5.3-flash}
+      # Calls in flight at once, passed through because the app's default is 1 and this file
+      # previously did not carry this variable at all -- which made "1" the only reachable value
+      # and left a deployed audit unable to be sped up without editing code.
+      #
+      # READ `docs/AI_STAGE.md` BEFORE RAISING IT: behind a gateway with a ~60s ceiling, six
+      # concurrent calls returned 3 usable answers where six sequential returned 6. Concurrency
+      # multiplies the very failure it is meant to work around.
+      AEGIS_AI__CONCURRENCY: "${AEGIS_AI_CONCURRENCY:-8}"
+      # Output-token ceiling. Measured reason it is set at all: with the provider's own default, 87
+      # of 151 retry turns in a real audit were answers the output limit had cut in half, each one a
+      # full re-emission of a long `final`. 16384 rather than 8192 because a *batched* judging run
+      # needs N times one answer -- every `batch(4)` call in a quick run came back at exactly 8192 and
+      # looped on truncation. Pair it with `AEGIS_HARNESS_CLAIM_BATCH_SIZE`. `0` lets the provider decide.
+      AEGIS_AI__MAX_TOKENS: "${AEGIS_AI_MAX_TOKENS:-16384}"
       AEGIS_AI__API_KEY_ENV: API_KEY
       API_KEY: ${API_KEY:-}
     volumes:

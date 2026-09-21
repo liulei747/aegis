@@ -12,6 +12,7 @@
  */
 
 import { apiUrl } from "./config.ts";
+import { messageFor, type ApiError } from "./errors.ts";
 import type {
   AIReport,
   AITrafficReport,
@@ -31,18 +32,10 @@ import type {
   TrafficReport,
 } from "./types.ts";
 
-export interface ApiError {
-  status: number;
-  detail: string;
-}
-
-function messageFor(status: number, statusText: string, body: unknown): string {
-  if (typeof body === "object" && body !== null && "detail" in body) {
-    const detail = (body as { detail: unknown }).detail;
-    if (typeof detail === "string") return detail;
-  }
-  return `${status} ${statusText}`;
-}
+// The error shape and the two readers for it live in `api/errors.ts`: `client.ts` pulls in
+// `config.ts`, which touches `window`, and the error rules have to be testable without a browser.
+export type { ApiError } from "./errors.ts";
+export { previousAttempt } from "./errors.ts";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
@@ -67,7 +60,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // A non-JSON error body is still an error; the status line is the message.
     }
-    throw { status: response.status, detail: messageFor(response.status, response.statusText, body) } satisfies ApiError;
+    // `body` rides along: a 409 on a submit carries the previous attempt's job id and state, and
+    // the audit screen needs them to offer a re-run rather than a dead end.
+    throw {
+      status: response.status,
+      detail: messageFor(response.status, response.statusText, body),
+      body,
+    } satisfies ApiError;
   }
   return (await response.json()) as T;
 }
@@ -163,10 +162,36 @@ export const api = {
    *
    * 只接受 workspace：审计的边界（轮数、每 agent 步数、并发）是"这次评审产出了什么"的一部分，
    * 让调用方随手改会让两个请求看起来一样、结果却不同——而任务指纹正是按请求字段算的。
+   *
+   * `force` 是**这个入口必须有**的：任务指纹只由 workspace 决定，所以一个项目跑过第一次之后，
+   * 之后的每一次提交都命中同一个指纹。上一次是 succeeded 时网关会重跑，但上一次是 **failed /
+   * canceled** 时它回 409 并要求 `?force=true` —— 没有这个开关，界面上那个项目就永远提交不了，
+   * 而页面上那句"要重新跑请到任务页用「重新运行」"指向的是一个不存在的按钮。
    */
-  submitAudit: (body: { workspace: string }) =>
+  submitAudit: (body: { workspace: string }, options: { force?: boolean } = {}) =>
     request<JobAccepted | Job>(
-      "/v1/audit",
+      "/v1/audit" + (options.force ? "?force=true" : ""),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+
+  /**
+   * 重新扫描：对同一个 workspace 再跑一遍 静态扫描 → 调用图组装 → 分析包。
+   *
+   * 走 `/v1/assemble`（compose 部署带队列，所以是 202 + 任务号，工作在 worker 里跑，能看进度、
+   * 能取消）；不带队列的裸部署会同步返回整个分析包 —— 那是给 CLI 和测试用的契约，界面只认任务号。
+   *
+   * `force` 同样是**这个入口必须有**的：assemble 任务的指纹也由 workspace 决定。项目第一次扫描
+   * 之后，重扫永远命中同一个指纹 —— 不带 force，上一次 succeeded 的任务会原样返回（界面上就是
+   * "点了没反应"），上一次 failed / canceled 回 409。重新扫描是用户点按钮说出口的意图，
+   * 所以调用点都直接带 force。
+   */
+  assemble: (body: { workspace: string }, options: { force?: boolean } = {}) =>
+    request<JobAccepted | Job>(
+      "/v1/assemble" + (options.force ? "?force=true" : ""),
       {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },

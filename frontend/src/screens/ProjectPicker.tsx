@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState } from "react";
-import type { BundleSummary, JobSummary } from "../api/types.ts";
+import type { BundleSummary, JobSummary, ProjectRecord } from "../api/types.ts";
 import { choicesFrom, defaultChoice, type ProjectChoice } from "../projects.ts";
 import { Empty } from "../components.tsx";
 import { formatCount, formatRelative } from "../format.ts";
@@ -16,17 +16,22 @@ import { formatCount, formatRelative } from "../format.ts";
  *
  * 列表由页面外壳（`App.tsx`）传进来而不是各自再轮询一次：外壳本来就在轮询任务与分析包，
  * 每个屏再拉一遍就是同一份数据的三份副本，而它们会因为刷新时刻不同而互相矛盾。
+ *
+ * `records` 是项目注册表。它必须在这里，因为**新建的项目在任务与分析包里还不存在**：
+ * 只按那两份派生的话，刚建好、上传完文件的项目在选择器里是隐形的。
  */
 export function useProjectChoice(
   bundles: BundleSummary[],
   jobs: JobSummary[],
+  records: ProjectRecord[] = [],
+  initialWorkspace: string | null = null,
 ): {
   choices: ProjectChoice[];
   choice: ProjectChoice | null;
   select: (workspace: string) => void;
 } {
-  const choices = choicesFrom(bundles, jobs);
-  const [workspace, setWorkspace] = useState<string | null>(null);
+  const choices = choicesFrom(bundles, jobs, records);
+  const [workspace, setWorkspace] = useState<string | null>(initialWorkspace);
 
   // 默认选中第一个可用的项目；选中的项目消失了（清理掉的分析包）就退回默认。
   const current = choices.find((item) => item.workspace === workspace) ?? null;
@@ -36,6 +41,12 @@ export function useProjectChoice(
   useEffect(() => {
     if (workspace !== null && current === null) setWorkspace(null);
   }, [workspace, current]);
+
+  // 从别处带着路径跳进来时跟随它。用户自己在选择器里改选不会改 URL，所以这个 effect 不会把
+  // 他的选择拽回去 —— 它只在 `initialWorkspace` 真的变了的时候动手。
+  useEffect(() => {
+    if (initialWorkspace !== null) setWorkspace(initialWorkspace);
+  }, [initialWorkspace]);
 
   return {
     choices,

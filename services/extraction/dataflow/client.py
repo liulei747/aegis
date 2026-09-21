@@ -147,6 +147,7 @@ class WorkerDataflowClient:
             sink_derivation_method=str(body.get("sink_derivation_method") or ""),
             sink_derivation_alternatives=list(body.get("sink_derivation_alternatives") or []),
             engine=f"joern-worker/{body.get('index')}",
+            frontend=str(body.get("frontend") or ""),
             source_candidates=int(body.get("source_candidates") or 0),
             sink_candidates=int(body.get("sink_candidates") or 0),
             from_cache=bool(body.get("cpg_cached")),

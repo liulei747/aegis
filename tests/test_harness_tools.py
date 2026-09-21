@@ -176,6 +176,7 @@ def test_schemas_describe_every_registered_tool() -> None:
         "read",
         "list_files",
         "shell_command",
+        "grep",
         "dataflow_verify",
         "record",
         "board",
@@ -185,6 +186,63 @@ def test_schemas_describe_every_registered_tool() -> None:
         assert schema["parameters"]["type"] == "object"
         assert schema["parameters"]["additionalProperties"] is False
         assert schema["description"]
+
+
+def test_grep_finds_matches_across_the_workspace_in_one_call(context: ToolContext) -> None:
+    """The search the audit paid 1344 `shell_command` steps for, as one tool call.
+
+    Measured on `upp-module-infra`: of 5198 agent steps, 1344 were shell commands and most were
+    searches -- two round trips each, and an unbounded textual answer. This asserts the shape that
+    replaces them: paths relative to the workspace, line numbers, a cap that says how much it did not
+    show, and no shell involved at all (`shell_policy` here allows nothing).
+    """
+    result = run_tool(context, ToolName.GREP, pattern=r"def handle_request")
+
+    assert result.ok is True
+    assert result.data["total_matched"] == 1
+    assert result.data["matches"][0]["path"] == "handler.py"
+    assert result.data["matches"][0]["line"] == 1
+    assert "handler.py:1:" in result.summary
+
+    # `include` narrows by filename, and a directory narrows by location.
+    only_py = run_tool(context, ToolName.GREP, pattern=r"request", include="*.py")
+    assert only_py.ok is True and only_py.data["total_matched"] >= 3
+    inside = run_tool(context, ToolName.GREP, pattern=r"request", path="pkg")
+    assert [m["path"] for m in inside.data["matches"]] == ["pkg/mod.py", "pkg/mod.py"]
+    assert [m["line"] for m in inside.data["matches"]] == [1, 2]
+
+    # Vendored directories are never searched, and the binary file is skipped *and said so* -- a
+    # silent skip is how "no match" gets read as "this repository does not contain it".
+    assert all("node_modules" not in m["path"] for m in only_py.data["matches"])
+    assert "二进制" in result.summary
+    assert "data.bin" not in result.summary
+
+
+def test_grep_refuses_what_it_cannot_answer_honestly(context: ToolContext) -> None:
+    """A malformed pattern must not look like "this repository does not contain it"."""
+    bad_pattern = run_tool(context, ToolName.GREP, pattern="getParameter(")
+    assert bad_pattern.ok is False
+    assert "不是合法正则" in bad_pattern.error
+
+    escaping = run_tool(context, ToolName.GREP, pattern="x", path="../..")
+    assert escaping.ok is False and "工作区" in escaping.error
+    absolute = run_tool(context, ToolName.GREP, pattern="x", include="/etc/*")
+    assert absolute.ok is False and "绝对路径" in absolute.error
+
+    missing = run_tool(context, ToolName.GREP, pattern="x", path="nope")
+    assert missing.ok is False and "不存在" in missing.error
+
+
+def test_grep_says_how_much_it_did_not_show(context: ToolContext) -> None:
+    """A truncated search is the shape that reads as "nothing here", so the count is always stated."""
+    context.limits.max_grep_matches = 2
+    result = run_tool(context, ToolName.GREP, pattern=r"line")
+
+    assert result.ok is True
+    assert result.data["count"] == 2
+    assert result.data["total_matched"] > 2
+    assert result.data["truncated"] is True
+    assert "已截断" in result.summary
 
 
 def test_invoke_swallows_a_tool_that_raises(monkeypatch, context: ToolContext) -> None:
@@ -1119,6 +1177,9 @@ def test_the_record_schema_is_closed_and_lists_every_kind_it_accepts() -> None:
 
     assert kind["enum"] == sorted(KINDS)
     assert set(kind["enum"]) == {
+        "gap",
+        "evidence",
+        "candidate",
         "actor",
         "asset",
         "component",

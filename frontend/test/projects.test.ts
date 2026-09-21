@@ -127,6 +127,51 @@ test("a project with no bundle is still offered -- it has a path and can be audi
   assert.equal(defaultChoice(choices)?.workspace, "/fresh");
 });
 
+test("choicesFrom offers a project that exists only in the registry", () => {
+  // 用户反馈的那一条：建好项目、上传完文件，到深度审计页**选不到它**。因为选择器只从"任务与
+  // 分析包上记录的 workspace"反推项目，而一个还没跑过任何东西的新项目在那份派生数据里不存在。
+  const choices = choicesFrom([], [], [record("/fresh", "fresh", "2026-06-01T00:00:00Z")]);
+
+  assert.equal(choices.length, 1);
+  assert.equal(choices[0]?.workspace, "/fresh");
+  assert.equal(choices[0]?.usable, true, "有真实路径，就能提交");
+  assert.equal(choices[0]?.bundleCount, 0);
+  assert.equal(defaultChoice(choices)?.workspace, "/fresh", "刚建的项目要能被自动选中");
+});
+
+test("a registry project that already has jobs is not listed twice", () => {
+  // 注册表与派生数据是**同一行的两个来源**，按 workspace 做并集，不是追加。
+  const choices = choicesFrom(
+    [bundle("B-1", "/p", "2026-01-01T00:00:00Z")],
+    [job("J-1", "/p", "audit", "succeeded", "2026-02-01T00:00:00Z")],
+    [record("/p", "registry-name", "2026-03-01T00:00:00Z")],
+  );
+
+  assert.equal(choices.length, 1, "一个项目一行");
+  assert.equal(choices[0]?.name, "registry-name", "注册表的名字比路径末段准");
+  assert.equal(choices[0]?.bundleCount, 1, "合并不能把派生计数吃掉");
+  assert.equal(choices[0]?.lastAuditJob?.job_id, "J-1");
+});
+
+test("the newest project comes first, so a just-created one is the default", () => {
+  const choices = choicesFrom(
+    [bundle("B-old", "/old", "2026-01-01T00:00:00Z")],
+    [],
+    [record("/new", "new", "2026-06-01T00:00:00Z")],
+  );
+
+  assert.deepEqual(
+    choices.map((choice) => choice.workspace),
+    ["/new", "/old"],
+  );
+  assert.equal(defaultChoice(choices)?.workspace, "/new");
+});
+
+test("a registry row with an empty workspace is not offered", () => {
+  // 注册表不该出现空路径，但空路径一旦进了选项就是一个"可以审计的目录"，点了才 400。
+  assert.equal(choicesFrom([], [], [record("", "broken", "2026-06-01T00:00:00Z")]).length, 0);
+});
+
 test("an in-flight audit is visible on the choice that owns it", () => {
   const choices = choicesFrom(
     [bundle("B-1", "/busy", "2026-01-01T00:00:00Z")],

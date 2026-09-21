@@ -55,12 +55,14 @@ class QueryBody(BaseModel):
             "is a method's parameter instead -- see `anchor_method`."
         ),
     )
-    anchor_kind: Literal["call", "parameter"] = Field(
+    anchor_kind: Literal["call", "parameter", "auto"] = Field(
         default="call",
         description=(
             "`call`: `source` is matched against call nodes. `parameter`: the source is a "
             "parameter of `anchor_method`, which is the node a caller-walk hands over -- and the "
-            "one a call matcher cannot reach, because a parameter is not a call."
+            "one a call matcher cannot reach, because a parameter is not a call. `auto`: the "
+            "engine decides against the graph, which is what a *finding* needs -- it says where the "
+            "danger is and nothing about where the value entered."
         ),
     )
     anchor_method: str = Field(
@@ -94,6 +96,10 @@ def health() -> dict:
         "status": "ok" if _worker.is_up else "cold",
         "loaded": _worker.loaded_project,
         "index": _INDEX,
+        # Which languages this deployment can build a graph for, published the same way
+        # `app/api/routes.py` publishes `deep_analysis.taint`: a client deciding whether to expect
+        # a taint trace should not have to read this service's config to find out.
+        "frontends": dict(sorted(_config.cpg_frontends.items())),
     }
 
 
@@ -106,6 +112,14 @@ def query(body: QueryBody) -> dict:
         )
     if body.anchor_kind == "call" and not body.source.strip():
         raise HTTPException(status_code=400, detail="source anchor must be non-empty")
+    if body.anchor_kind == "auto" and not (body.finding_path and body.finding_line):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "anchor_kind='auto' needs the finding position: that is what the enclosing method "
+                "and its parameter are derived from. Without a hit there is nothing to derive from."
+            ),
+        )
     if not body.sink.strip() and not (body.finding_path and body.finding_line):
         raise HTTPException(
             status_code=400,
@@ -165,6 +179,10 @@ def query(body: QueryBody) -> dict:
         "sink_derivation_alternatives": sink.alternatives,
         "source_candidates": answer.source_candidates,
         "sink_candidates": answer.sink_candidates,
+        # Which frontend built the graph. An empty flow plus a frontend that does not match the
+        # workspace is a different fact from an empty flow plus a matching one, and the caller
+        # cannot compute this for itself -- only the worker did the census.
+        "frontend": answer.frontend,
         "flows": answer.flows,
     }
 

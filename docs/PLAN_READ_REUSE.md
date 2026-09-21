@@ -528,12 +528,7 @@ python -m services.harness.cli plan --workspace var\projects\demo-taint
 
 ### 6.3 真实运行的验收指标（只能从一次真跑读出）
 
-对下一次 audit 的产物跑：
-
-```powershell
-python var\audit_breakdown.py <job_id>
-python var\prefetch_worth.py <job_id>
-```
+对下一次 audit 的 `trail.jsonl` 与 `ai-traffic.jsonl` 按下表验收：
 
 | 指标 | 基线（`J-712e9f…`） | 门槛 |
 | --- | --- | --- |

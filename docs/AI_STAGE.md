@@ -125,6 +125,18 @@ Both are reasoning models, and the reasoning is most of the output: `completion=
 binding constraint on model choice, not our client timeout -- raising `timeout_s` cannot help,
 because the 504 comes from the gateway.
 
+> **Re-measured 2026-09-16, and the 504 was the gateway's, not the model's.**
+> Against `https://tokens.store/v1/`, with a ~5k-token prompt (the shape the audit sends),
+> `glm-5.3-flash` answered in **2-4 s** -- one call alone and **five at once, 6/6 usable**, burst
+> wall 4.2 s. So the table above records a property of the *old* endpoint. It is kept because the
+> failure it names is real and returns the moment an operator points `API_URL` at a gateway with a
+> 60 s ceiling; `var/probe/probe_ai_concurrency.py` is the one-call-plus-one-burst check that
+> settles it for a given endpoint before an audit is started.
+>
+> This is also the reason `docker/docker-compose.yml` passes concurrency through at all
+> (`AEGIS_AI_CONCURRENCY`, default 5): the app's own default is 1, and a deployment could not be
+> sped up without editing code.
+
 The verdict itself, on the demo's SQL injection:
 
 ```
@@ -152,3 +164,24 @@ MySQL's backslash escaping -- a distinction no static rule in this stack makes.
   is an error, while an omitted non-decisive key is recorded in `missing_fields`. Whether an
   incomplete verdict should ever be treated as decisive is a policy question, not yet answered.
 - Nothing consumes the verdicts yet: threat modelling across contexts, and any UI, are separate.
+
+## Call shape: the output ceiling, and what the provider's default cost (2026-09-17)
+
+This stage sends `max_tokens` from `AIConfig.max_tokens` (default **8192**); `0` omits the key and
+restores "let the provider decide". The reason it is set at all is measured on the
+`upp-module-infra` harness audit -- a different stage, the same transport: of 151 retry turns, **87
+were answers the output limit had cut in half**. The model had written its `final` object, the strict
+parse threw the whole turn away, and the retry re-emitted the same long answer. Each retry is a full
+call, and these are the *longest* answers in a run, so the cost is not proportional to their count.
+
+The harness stage also recovers such an answer instead of losing it (`react._salvage_final`): the
+truncated object is closed bracket by bracket, gated on the schema's `required` keys, and **held** as
+a fallback while the model is asked for a shorter answer -- spent only if the run would otherwise end
+with nothing (measured: all 14 output-less runs in that audit ended on a truncated `final`).
+
+Concurrency is the other half of the same measurement and lives in `.env`:
+`AEGIS_AI_CONCURRENCY`. The old default of 1 was right for the old gateway (six concurrent calls
+behind a ~60 s ceiling returned 3 usable answers where six sequential returned 6); re-measured against
+`https://tokens.store/v1/` on 2026-09-16, `glm-5.3-flash` answered in **2-4 s**, alone and five at
+once, **6/6 usable**. `.env` runs 8 now, against a measured effective concurrency of 4.07 on a
+whole-module audit.

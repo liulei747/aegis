@@ -131,6 +131,27 @@ def from_runs(runs: list[AgentRun]) -> dict[str, FileCoverage]:
     return found
 
 
+def unread_ranges(files: list[str], covered: dict[str, FileCoverage]) -> dict[str, list[tuple[int, int | None]]]:
+    """Missing inclusive line intervals; None is an unknown EOF for an unopened file."""
+    result = {}
+    for name in files:
+        entry = covered.get(name)
+        if entry is None:
+            result[name] = [(1, None)]
+            continue
+        cursor, missing = 1, []
+        for start, end in _merge(entry.windows):
+            start, end = max(1, start), min(entry.total_lines + 1, end)
+            if start > cursor:
+                missing.append((cursor, min(start - 1, entry.total_lines)))
+            cursor = max(cursor, end)
+        if cursor <= entry.total_lines:
+            missing.append((cursor, entry.total_lines))
+        if missing:
+            result[name] = missing
+    return result
+
+
 def unreviewed(workspace: Path, covered: dict[str, FileCoverage]) -> list[tuple[str, int]]:
     """Source files nobody read end to end, as `(relative_path, line_count)`.
 

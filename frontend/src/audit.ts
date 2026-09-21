@@ -11,11 +11,59 @@
  * 那是事实，而猜成失败会让一个正常运行的审计看起来正在崩。
  */
 
-import type { AuditEvent, AuditEventKind } from "./api/types.ts";
+import type { AuditEvent, AuditEventKind, AuditWorkItem } from "./api/types.ts";
 
-/** 编排层的阶段，按真实顺序。`prep` 是确定性预扫描（不调用模型），`close` 收尾，`findings` 汇总。 */
+/** Work items are emitted from the execution ledger, never inferred from agent runs. */
+export function taskRows(events: AuditEvent[]): AuditWorkItem[] {
+  const rows = new Map<string, { seq: number; work: AuditWorkItem }>();
+  for (const event of events) {
+    if (event.kind !== "work_item" || !event.work) continue;
+    const previous = rows.get(event.work.work_id);
+    if (!previous || event.seq > previous.seq) {
+      rows.set(event.work.work_id, { seq: event.seq, work: event.work });
+    }
+  }
+  return [...rows.values()].map(({ work }) => work);
+}
+
+export function taskEvidence(events: AuditEvent[], task: AuditWorkItem): AuditEvent[] {
+  const runs = new Set(task.attempts.map((attempt) => attempt.run_id));
+  const candidates = new Set(task.candidate_ids);
+  return events.filter((event) => {
+    if (["candidate", "verdict", "attack_path", "finding"].includes(event.kind)) {
+      return !!event.candidate_id && (candidates.has(event.candidate_id)
+        || (event.scope === task.scope_id && ["file_review", "investigation"].includes(task.kind)));
+    }
+    if (event.kind === "record") return event.candidate_ids?.some(id => candidates.has(id))
+      || (event.work_id ? event.work_id === task.work_id : event.scope === task.scope_id);
+    return event.kind === "agent_step" && !!event.run_id && runs.has(event.run_id);
+  });
+}
+
+/** Explain a blocked task from its own attempt and, for legacy runs, its last model-failure turn. */
+export function taskStatusReason(task: AuditWorkItem, evidence: AuditEvent[]): string {
+  if (task.state !== "blocked" && task.state !== "abandoned") return task.status_reason || "—";
+  const attemptError = [...task.attempts].reverse().find(attempt => attempt.error)?.error ?? "";
+  const modelFailure = [...evidence].reverse().find(event =>
+    event.kind === "agent_step" && (event.thought ?? "").startsWith("model call failed:"),
+  )?.thought ?? "";
+  // Legacy runs stored a generic attempt error while the concrete provider failure
+  // lived in the final turn.  Prefer that concrete turn over the placeholder.
+  const detail = modelFailure || attemptError;
+  const lowered = detail.toLowerCase();
+  if (lowered.includes("aiunavailable") || lowered.includes("model call failed")) {
+    const transport = lowered.includes("unexpected_eof_while_reading") ||
+      (lowered.includes("ssl") && lowered.includes("eof"));
+    return `${transport ? "模型服务的 HTTPS/TLS 连接被提前关闭" : "模型服务不可用"}，Agent 无法继续分析；本任务可重试。具体错误：${detail}`;
+  }
+  if (detail) return `Agent 执行失败，任务未完成。具体错误：${detail}`;
+  return task.status_reason || "受阻，但运行记录没有提供具体失败原因";
+}
+
+/** 编排层的阶段，按真实顺序。两个预处理阶段都不调用模型。 */
 export const HARNESS_STAGES = [
   "prep",
+  "security_inventory",
   "recon",
   "threat_model",
   "plan",
@@ -27,7 +75,8 @@ export const HARNESS_STAGES = [
 ] as const;
 
 export const STAGE_LABEL: Readonly<Record<string, string>> = {
-  prep: "预扫描",
+  prep: "结构勘察",
+  security_inventory: "AI 安全清单",
   recon: "仓库勘察",
   threat_model: "威胁建模",
   plan: "范围规划",
@@ -40,6 +89,7 @@ export const STAGE_LABEL: Readonly<Record<string, string>> = {
 
 /** 事件种类的中文名。屏幕上的过滤器用它，没有它就只能显示英文 id。 */
 export const EVENT_LABEL: Readonly<Record<string, string>> = {
+  work_item: "任务更新",
   stage: "阶段",
   agent_start: "开始",
   agent_step: "对话",
@@ -269,7 +319,14 @@ export interface CandidateRow {
 export function candidateRows(events: AuditEvent[]): CandidateRow[] {
   const rows = new Map<string, CandidateRow>();
   const order: string[] = [];
-  for (const event of events) {
+  for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
+    if (event.kind === "record" && event.record_kind === "evidence_changed") {
+      for (const id of event.candidate_ids ?? []) {
+        const row = rows.get(id);
+        if (row) Object.assign(row, { verdict: null, confidence: null, evidenceKind: null, reachable: null });
+      }
+      continue;
+    }
     const id = event.candidate_id;
     if (!id) continue;
     if (event.kind === "candidate") {
@@ -352,4 +409,16 @@ export function agentsSeen(events: AuditEvent[]): string[] {
   const seen = new Set<string>();
   for (const event of events) if (event.agent) seen.add(event.agent);
   return [...seen].sort();
+}
+
+
+/** Latest persisted lead projection; legacy record events remain readable. */
+export function leadRows(events: AuditEvent[]) {
+  const latest = new Map<string, AuditEvent>();
+  for (const event of events) {
+    if (!event.lead?.lead_id) continue;
+    const previous = latest.get(event.lead.lead_id);
+    if (!previous || event.seq > previous.seq) latest.set(event.lead.lead_id, event);
+  }
+  return [...latest.values()].map(event => event.lead!);
 }

@@ -40,6 +40,7 @@ class ToolLimits:
 
     max_read_lines: int = 200          # per `read` call
     max_list_files: int = 200          # per `list_files` call
+    max_grep_matches: int = 200        # per `grep` call
     max_output_chars: int = 8_000      # what one ToolResult.summary may carry
 
 

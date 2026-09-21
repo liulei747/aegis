@@ -33,6 +33,9 @@ from services.harness import coverage
 log = get_logger(__name__)
 
 REPORT_FILE = "report.md"
+#: The runs that did not finish, in full. Written beside the report rather than inside it: see
+#: `write_report` for the measurement that moved it.
+ABNORMAL_RUNS_FILE = "abnormal-runs.md"
 
 #: The Chinese labels for coverage states. Kept explicit rather than using `.value` so the report
 #: and the JSON blackboard can be worded for their different readers.
@@ -50,10 +53,23 @@ EVIDENCE_LABEL = {
 
 
 def write_report(blackboard: Blackboard, run_dir: Path, *, notes: list[str] | None = None) -> Path:
-    """Render and write `report.md`. Returns its path."""
-    path = Path(run_dir) / REPORT_FILE
+    """Render and write `report.md` -- and `abnormal-runs.md` beside it.
+
+    Two files rather than one because they have different readers and very different sizes: measured
+    on the `upp-module-infra` audit the inlined transcripts of the 14 abnormal runs were 665 KB of a
+    1080 KB report, and the report is the thing a human opens. Returns the report's path.
+    """
+    directory = Path(run_dir)
+    path = directory / REPORT_FILE
     path.write_text(render(blackboard, notes=notes), encoding="utf-8")
+    (directory / ABNORMAL_RUNS_FILE).write_text(
+        abnormal_runs_markdown(blackboard), encoding="utf-8"
+    )
     return path
+
+
+def _cell(value: str) -> str:
+    return " ".join(value.split()).replace("|", "\\|")
 
 
 def render(blackboard: Blackboard, *, notes: list[str] | None = None) -> str:
@@ -62,8 +78,19 @@ def render(blackboard: Blackboard, *, notes: list[str] | None = None) -> str:
     out.append("")
     out.append(f"- 工作区：`{blackboard.workspace}`")
     out.append(f"- 轮次：**{_rounds(blackboard)}**；blackboard revision：{blackboard.revision}")
-    out.append(f"- 运行状态：{'已收敛关闭' if blackboard.closed else '未关闭（提前结束）'}")
+    out.append(f"- 运行状态：{'已结束（完成情况见任务与覆盖台账）' if blackboard.closed else '未关闭（提前结束）'}")
     out.append(f"- 关闭说明：{blackboard.closure_note or '（无）'}")
+    if blackboard.execution_budget:
+        budget = blackboard.execution_budget
+        cost = f"按配置单价估算 ${budget.get('cost_usd', 0):.4f}" if budget.get("cost_configured") else "未配置费用单价"
+        out.append(f"- 运行预算：模型调用 {budget.get('model_calls', 0)} 次；"
+                   f"已报告 token {budget.get('tokens', 0)}；{cost}；"
+                   f"缺少用量的调用 {budget.get('unknown_usage', 0)} 次。{budget.get('stop_reason', '')}")
+    gaps = [(work, gap) for work in blackboard.work for gap in work.gaps if gap.state != "resolved"]
+    if gaps:
+        out.append("- 未完成具体检查：")
+        for work, gap in gaps:
+            out.append(f"  - {_cell(work.title)}：{_cell(gap.question)}（{gap.file}:{gap.line}，{_cell(gap.reason)}）")
     if notes:
         out.append("")
         out.append("运行备注：")
@@ -91,13 +118,17 @@ def render(blackboard: Blackboard, *, notes: list[str] | None = None) -> str:
     out.append(f"| 提前结束的 agent run | {len(early)} |")
     opening = getattr(blackboard, "opening", None)
     if opening is not None:
-        # In the overview as well as in section 4: whether the opening pair actually read each other
-        # decides how much the threat model below is worth, and a reader who stops after the counts
-        # should still see it.
-        unread = sum(opening.unread.values())
+        # Single-round design (2026-09-18): the opening pair runs once each and does not cross-read;
+        # reconciling their outputs is the AI security-inventory stage's job, which runs next.
+        out.append(f"| 开场（recon → 威胁建模） | 单轮独立（{opening.passes} 轮，不互读收敛） |")
+    security_inventory = getattr(blackboard, "security_inventory", None)
+    if security_inventory is not None:
+        counts = security_inventory_counts(security_inventory)
         out.append(
-            f"| 开场轮次（recon × 威胁建模） | {opening.passes}"
-            f"{'（已收敛）' if opening.converged else f'（未收敛，{unread} 条未读）'} |"
+            "| AI 安全清单 | 入口 "
+            f"{counts['entry_points']} · 鉴权 {counts['authorization_controls']} · 危险能力 "
+            f"{counts['dangerous_capabilities']} · 配置 {counts['configurations']} · 依赖 "
+            f"{counts['dependencies']} · 未决 {len(security_inventory.coverage_gaps)} |"
         )
     out.append("")
 
@@ -353,11 +384,19 @@ def _trail_section(blackboard: Blackboard) -> list[str]:
 
     early = _stopped_early(blackboard)
     early_ids = {run.run_id for run in early}
+    salvaged = [run for run in blackboard.runs if run.salvaged]
     out.append(
         f"共 {len(blackboard.runs)} 个 agent run，其中 {len(early)} 个没有正常结束"
-        "（下表标注），它们的完整步骤附在本节末尾。"
+        "（下表标注 ⚠️），它们的完整步骤附在本节末尾。"
         f"其余 run 的逐步记录见运行目录下的 `trail.jsonl`。"
     )
+    if salvaged:
+        out.append("")
+        out.append(
+            f"其中 {len(salvaged)} 个 run 的最终答案来自**被输出上限截断的回答**"
+            "（下表标注 ✂️）：字段是模型的，但被截断的列表可能不完整，"
+            "它们本会以“没有产出”结束。"
+        )
     out.append("")
     out.append("| agent | scope | 步数 | 工具调用 | 结束原因 | 最终输出 |")
     out.append("| --- | --- | --- | --- | --- | --- |")
@@ -369,6 +408,11 @@ def _trail_section(blackboard: Blackboard) -> list[str]:
                 tools[name] = tools.get(name, 0) + 1
         listed = "、".join(f"{name}×{count}" for name, count in sorted(tools.items())) or "（无工具调用）"
         marker = " ⚠️" if run.run_id in early_ids else ""
+        if run.salvaged:
+            # A salvaged answer is the model's, minus whatever the output cut took. Saying so in the
+            # table is the difference between a reader trusting a short list and knowing why it is
+            # short -- see `react._salvage_final`.
+            marker += " ✂️"
         output = _clip(_json(run.output), 80) if run.output else "—"
         out.append(
             f"| `{run.agent}`{marker} | `{run.scope_id}` | {len(run.steps)} | {listed} | "
@@ -377,21 +421,50 @@ def _trail_section(blackboard: Blackboard) -> list[str]:
     out.append("")
 
     if early:
-        out.append("### 6.1 未正常结束的 run（全文）")
+        # The full transcripts go to their own file. Measured on the `upp-module-infra` audit: this
+        # section was 665 KB of a 1080 KB report -- 62% of what a human opens, spent on runs that did
+        # not finish, which is a minority of the work. The events are the same ones `trail.jsonl`
+        # carries, so nothing becomes unavailable; the report stops being the place to read them.
+        out.append("### 6.1 未正常结束的 run（全文另存）")
         out.append("")
+        out.append(
+            f"这 {len(early)} 个 run 的逐步记录写在同目录的 `abnormal-runs.md` 里（"
+            "它们是同一批 trail 事件，只是从报告里挪出去，好让报告读得完）。"
+        )
+        out.append("")
+        out.append("| run | 阶段 | 结束原因 | 步数 |")
+        out.append("| --- | --- | --- | --- |")
         for run in early:
-            out.append(f"#### {run.run_id}")
-            out.append("")
             out.append(
-                f"- 阶段：`{run.agent}`；scope：`{run.scope_id}`；"
-                f"模型：`{run.model or '（未记录）'}`"
+                f"| `{run.run_id}` | `{run.agent}` | `{run.stop_reason}` | {len(run.steps)} |"
             )
-            out.append(f"- 结束原因：`{run.stop_reason}`；步数：{len(run.steps)}")
-            if run.output:
-                out.append(f"- 最终输出：`{_clip(_json(run.output), 600)}`")
-            out.append("")
-            out.extend(_steps_block(run))
     return out
+
+
+def abnormal_runs_markdown(blackboard: Blackboard) -> str:
+    """The full step-by-step record of the runs that did not finish, as its own file.
+
+    Same content the report used to inline. A run that stopped early is the one a reviewer wants the
+    transcript of, so it is not summarised away -- it is just no longer the reason the report is
+    1 MB.
+    """
+    early = _stopped_early(blackboard)
+    lines = ["# 未正常结束的 run（全文）", ""]
+    if not early:
+        lines.append("本次运行没有未正常结束的 run。")
+        return "\n".join(lines) + "\n"
+    for run in early:
+        lines.append(f"## {run.run_id}")
+        lines.append("")
+        lines.append(
+            f"- 阶段：`{run.agent}`；scope：`{run.scope_id}`；模型：`{run.model or '（未记录）'}`"
+        )
+        lines.append(f"- 结束原因：`{run.stop_reason}`；步数：{len(run.steps)}")
+        if run.output:
+            lines.append(f"- 最终输出：`{_clip(_json(run.output), 600)}`")
+        lines.append("")
+        lines.extend(_steps_block(run))
+    return "\n".join(lines) + "\n"
 
 
 def _steps_block(run) -> list[str]:
@@ -454,31 +527,71 @@ def _file_coverage_block(blackboard: Blackboard) -> list[str]:
 
 
 def _opening_block(blackboard: Blackboard) -> list[str]:
-    """Whether the two opening agents ended up having read each other's work.
+    """How the opening ran, and what the inventory stage made of it.
 
-    Reported as its own claim because it is one: recon and threat modelling run concurrently and their
-    task texts are fixed when they start, so "the threat model was written against a directory-name map"
-    and "the threat model was written against what recon had read" produce the same `threats` list and
-    are not the same review. Measured on the first real audit, the threat model read the board twice at
-    its very first steps and never again while recon published eleven facts after that -- a reader of
-    that report had no way to tell.
+    Single-round design (2026-09-18): recon and threat modelling each run once and do not cross-read,
+    so there is no convergence claim to audit — what a reader needs instead is the inventory stage's
+    own account of the security surface and of what it could not establish.
     """
     opening = getattr(blackboard, "opening", None)
-    if opening is None:
+    inventory = getattr(blackboard, "security_inventory", None)
+    if opening is None and inventory is None:
         return []
-    out = ["### 开场配对（recon × 威胁建模）", ""]
-    state = "已收敛" if opening.converged else "**未收敛**"
-    out.append(f"- 结论：{state}；共 {opening.passes} 轮。")
-    if opening.watermarks:
-        seen = "、".join(
-            f"`{agent}` 读到 revision {revision}" for agent, revision in sorted(opening.watermarks.items())
+    out: list[str] = []
+    if opening is not None:
+        out.extend(_opening_summary(opening))
+    if inventory is not None:
+        out.append("### 安全清单（AI，基于开场两方的结论）")
+        out.append("")
+        for name, label in (
+            ("entry_points", "入口"),
+            ("authorization_controls", "鉴权控制"),
+            ("dangerous_capabilities", "危险能力"),
+            ("configurations", "配置"),
+            ("dependencies", "依赖"),
+            ("state_controls", "状态控制"),
+        ):
+            items = list(getattr(inventory, name) or [])
+            out.append(f"- {label}：{len(items)} 项")
+            for item in items[:5]:
+                # The inventory items are free-shaped dicts; show the identifying fields first and
+                # clip, so a 30-entry section renders as a skimable list rather than JSON dumps.
+                ordered = sorted(
+                    (str(key), str(value)) for key, value in item.items()
+                )
+                text = "；".join(f"{key}={value}" for key, value in ordered)
+                out.append(f"  - {text[:160]}")
+        if inventory.coverage_gaps:
+            out.append(f"- 未决（coverage_gaps）：{len(inventory.coverage_gaps)} 条")
+            for gap in inventory.coverage_gaps[:5]:
+                out.append(f"  - {gap}")
+        out.append("")
+    return out
+
+
+def security_inventory_counts(inventory) -> dict[str, int]:
+    """Per-section sizes of the AI inventory, in a stable order for the overview row."""
+    return {
+        name: len(list(getattr(inventory, name) or []))
+        for name in (
+            "entry_points",
+            "authorization_controls",
+            "dangerous_capabilities",
+            "configurations",
+            "dependencies",
+            "state_controls",
         )
-        out.append(f"- 各自读到的黑板版本（按真实 `board` 调用计）：{seen}。")
+    }
+
+
+def _opening_summary(opening) -> list[str]:
+    out = ["### 开场（recon → 威胁建模）", ""]
+    out.append(f"- 结论：单轮独立完成（{opening.passes} 轮；设计上不互读收敛）。")
     if opening.unread:
         backlog = "、".join(
             f"`{agent}` 还有 {count} 条未读" for agent, count in sorted(opening.unread.items())
         )
-        out.append(f"- 未读：{backlog}——下面第 2、4 节的内容是在这种情况下得出的。")
+        out.append(f"- 未读：{backlog}")
     out.append(f"- 说明：{opening.note}")
     out.append("")
     return out
@@ -504,13 +617,13 @@ def _coverage_section(blackboard: Blackboard) -> list[str]:
     if blackboard.work:
         out.append("### 工作计划台账")
         out.append("")
-        out.append("| work_id | scope | 状态 | 步数 | 打开理由 |")
-        out.append("| --- | --- | --- | --- | --- |")
+        out.append("| 任务 | 类型 | 状态 | 执行次数 | 打开理由 | 完成或受阻原因 |")
+        out.append("| --- | --- | --- | --- | --- | --- |")
         for item in blackboard.work:
             rationale = item.rationale.replace("|", "\\|") or "（未给出理由）"
             out.append(
-                f"| `{item.work_id}` | `{item.scope_id}` | {item.state.value} | "
-                f"{item.steps_used} | {rationale} |"
+                f"| {_cell(item.title)} | {item.kind.value} | {item.state.value} | "
+                f"{len(item.attempts)} | {rationale} | {_cell(item.status_reason)} |"
             )
         out.append("")
     return out

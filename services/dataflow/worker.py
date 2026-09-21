@@ -44,7 +44,7 @@ from pathlib import Path
 
 from aegis_core.config import DataflowConfig
 from aegis_core.logging import get_logger
-from aegis_core.workspace import workspace_digest
+from aegis_core.workspace import dominant_suffix, suffix_census, workspace_digest
 
 log = get_logger(__name__)
 
@@ -96,6 +96,28 @@ def anchoredParameter(method: String, param: String): List[CfgNode] =
     ps.map(p => p: CfgNode)
   }
 
+// The source end when the caller did not commit to a kind -- which is the normal case for a
+// finding: it says where the danger is and nothing about where the value entered.
+//
+// Decided **against the graph**, not against the file's text, so one rule serves every language a
+// frontend can parse: a dotted expression is a call; a bare name that names a method *here* is
+// that method's parameters; anything else is a call; and a finding inside a method falls back to
+// that method's own parameters. This replaced a Python `ast` walk that could only ever answer for
+// Python -- on a Java project it raised SyntaxError, the caller fell back to a configured string
+// such as `request.args.get`, and every question returned "0 source candidates", which read as
+// "the value cannot reach the sink" about a graph the engine had never been able to search.
+def anchoredAuto(needle: String, method: String, param: String, fallback: String): List[CfgNode] =
+  if (needle.nonEmpty) {
+    if (needle.contains(".") || needle.contains("(") || needle.contains(")")) anchored(needle)
+    else {
+      val byParameter = anchoredParameter(needle, "")
+      if (byParameter.nonEmpty) byParameter else anchored(needle)
+    }
+  }
+  else if (method.nonEmpty) anchoredParameter(method, param)
+  else if (fallback.nonEmpty) anchored(fallback)
+  else Nil
+
 val srcs = %SOURCE_ANCHOR%
 val sinks = anchored("%SINK%")
 val flows = sinks.reachableByFlows(srcs).l
@@ -129,9 +151,19 @@ java.nio.file.Files.write(
 #: Where the query writes its answer, relative to the project's cache directory.
 REPORT_NAME = "report.txt"
 
-#: The two ways a caller can name the source end of a taint question.
+#: The ways a caller can name the source end of a taint question.
 ANCHOR_CALL = "call"
 ANCHOR_PARAMETER = "parameter"
+#: "You work out where the value enters" -- the caller names the sink and, optionally, a hint,
+#: and the engine decides against the graph. This is the kind the harness uses, because a finding
+#: says where the danger is and nothing about where the value came from, and *that* question is
+#: answerable only by the graph.
+ANCHOR_AUTO = "auto"
+
+#: Parameters that are the receiver rather than data: taint does not enter through them, and an
+#: anchor on one returns a path that proves nothing. A name list because it is the only thing the
+#: CPG agrees on across frontends -- Java names it `this`, Python `self`/`cls`.
+RECEIVER_PARAMETERS = frozenset({"self", "cls", "this"})
 
 
 def _scala_literal(value: str) -> str:
@@ -168,26 +200,40 @@ class SourceAnchor:
     parameter: str = ""
 
     def __post_init__(self) -> None:
-        if self.kind not in (ANCHOR_CALL, ANCHOR_PARAMETER):
+        if self.kind not in (ANCHOR_CALL, ANCHOR_PARAMETER, ANCHOR_AUTO):
             raise ValueError(f"unknown source anchor kind: {self.kind!r}")
         if self.kind == ANCHOR_CALL and not self.needle.strip():
             raise ValueError("a call anchor needs a non-empty name")
         if self.kind == ANCHOR_PARAMETER and not self.method.strip():
             raise ValueError("a parameter anchor needs the method it belongs to")
+        # `auto` needs nothing: `needle` is an optional hint and the method/parameter come from
+        # the graph. Requiring one here would push the caller back into guessing.
 
     @property
     def expr(self) -> str:
         """How the anchor reads in a report: `handle_request(request)`, or the call text."""
         if self.kind == ANCHOR_PARAMETER:
             return f"{self.method}({self.parameter or '*'})"
+        if self.kind == ANCHOR_AUTO:
+            return self.needle or "auto（由引擎从命中位置推导）"
         return self.needle
 
-    def scala(self) -> str:
-        """The Scala expression that resolves this anchor to nodes."""
+    def scala(self, *, auto_method: str = "", auto_param: str = "", fallback: str = "") -> str:
+        """The Scala expression that resolves this anchor to nodes.
+
+        `auto` needs the enclosing method and its chosen parameter, which only exist after the
+        sink has been derived -- so they arrive as arguments rather than living on the anchor.
+        """
         if self.kind == ANCHOR_PARAMETER:
             return (
                 f'anchoredParameter("{_scala_literal(self.method)}", '
                 f'"{_scala_literal(self.parameter)}")'
+            )
+        if self.kind == ANCHOR_AUTO:
+            return (
+                f'anchoredAuto("{_scala_literal(self.needle)}", '
+                f'"{_scala_literal(auto_method)}", "{_scala_literal(auto_param)}", '
+                f'"{_scala_literal(fallback)}")'
             )
         return f'anchored("{_scala_literal(self.needle)}")'
 
@@ -237,6 +283,7 @@ val candidates: List[Call] = method.toList.flatMap { m =>
 }
 
 val report = Seq("METHOD\\t" + method.map(_.name).getOrElse("")) ++
+  method.toList.flatMap(_.parameter.map(p => "PARAM\\t" + p.name)) ++
   candidates.map(c => "CANDIDATE\\t" + c.name + "\\t" + c.lineNumber.getOrElse(-1)) ++
   Seq("CHOSEN\\t" + candidates.headOption.map(_.name).getOrElse(""))
 
@@ -274,6 +321,10 @@ class SinkResolution:
     anchor: str = ""
     derived_from: str | None = None
     method: str = ""
+    #: The enclosing method's parameters, in CPG order and including the receiver. Carried because
+    #: an `auto` anchor needs one of them as the source end, and the same query already found the
+    #: method -- asking again would be a second round trip for a fact we are holding.
+    parameters: list[str] = field(default_factory=list)
     alternatives: list[str] = field(default_factory=list)
 
 
@@ -294,6 +345,10 @@ class FlowAnswer:
     #: mis-typed anchor must not be read as "the engine proved the value cannot reach the sink".
     source_kind: str = ""
     source_expr: str = ""
+    #: Which CPG frontend built the graph this answer came from. Reported because "the anchor
+    #: matched no node" has two very different causes -- a wrong anchor, and a graph built in the
+    #: wrong language -- and only this field tells them apart after the fact.
+    frontend: str = ""
     elapsed_s: float = 0.0
     load_s: float = 0.0
     sink_s: float = 0.0
@@ -360,10 +415,14 @@ def _parse_sink_report(text: str, *, finding_path: str, finding_line: int) -> Si
     method = ""
     chosen = ""
     others: list[str] = []
+    parameters: list[str] = []
     for line in text.splitlines():
         parts = line.rstrip("\r").split("\t")
         if parts[0] == "METHOD" and len(parts) >= 2:
             method = parts[1]
+        elif parts[0] == "PARAM" and len(parts) >= 2:
+            if parts[1] and parts[1] not in parameters:
+                parameters.append(parts[1])
         elif parts[0] == "CANDIDATE" and len(parts) >= 2:
             if parts[1] and parts[1] not in others:
                 others.append(parts[1])
@@ -373,8 +432,57 @@ def _parse_sink_report(text: str, *, finding_path: str, finding_line: int) -> Si
         anchor=chosen,
         derived_from=f"{finding_path}:{finding_line}" if chosen else None,
         method=method,
+        parameters=parameters,
         alternatives=others,
     )
+
+
+def _auto_source(anchor: SourceAnchor, resolution: SinkResolution) -> tuple[str, str]:
+    """`(method, parameter)` for an `auto` anchor with no hint, or `("", "")` for anything else.
+
+    The receiver is skipped: taint does not enter through `this`/`self`, and an anchor on one
+    returns a path that proves nothing. When the method has no other parameter there is nothing to
+    anchor on and the caller's configured default call anchor takes over -- the same last resort as
+    before, minus the assumption that the default is a Python expression.
+    """
+    if anchor.kind != ANCHOR_AUTO or anchor.needle:
+        return "", ""
+    chosen = next(
+        (name for name in resolution.parameters if name not in RECEIVER_PARAMETERS), ""
+    )
+    return (resolution.method, chosen) if chosen else ("", "")
+
+
+@dataclass(frozen=True)
+class Frontend:
+    """The CPG frontend chosen for one workspace, and the evidence it was chosen on.
+
+    A value object rather than a loose binary path because the choice travels: it decides the
+    build argv, it keys the CPG cache, and it is what a reader needs in order to tell "the engine
+    found nothing" from "we asked in a language this graph was never built in".
+    """
+
+    name: str
+    suffix: str
+    binary: Path
+    #: Verbatim extra argv -- a Java classpath goes here. Kept on the value so the argv that built
+    #: a graph is reconstructible from the thing that names the graph.
+    extra_args: tuple[str, ...] = ()
+
+    @property
+    def key(self) -> str:
+        """What the CPG cache directory and the session guard carry."""
+        return self.name
+
+
+class NoFrontend(JoernError):
+    """No configured frontend covers this workspace's language.
+
+    A named refusal rather than an empty graph, because the two are indistinguishable from every
+    layer above this one: an empty graph makes every question come back "the anchor matches no
+    node", which the validation stage reads as evidence about the code. The message carries the
+    census and the configured suffixes, because the fix is an operator decision.
+    """
 
 
 class JoernWorker:
@@ -391,28 +499,89 @@ class JoernWorker:
         *,
         workspace_root: Path,
         joern_bin: str = "joern",
-        cpg_bin: str = "/opt/joern/joern-cli/frontends/pysrc2cpg/bin/pysrc2cpg",
+        cpg_bin: str | None = None,
     ) -> None:
         self.config = config
         self.workspace_root = workspace_root
         self.joern_bin = joern_bin
+        #: A forced frontend binary, or None. The deployment leaves it None and lets `frontend_for`
+        #: decide per workspace from the suffix census -- a worker is routed a project by path, and
+        #: its language is a fact about the tree rather than about the worker. Tests and one-off
+        #: probes pin it.
         self.cpg_bin = cpg_bin
         self.index = worker_index()
         # Absolute inside the container; the mount point is the supervisor's own filesystem,
         # so no host/container translation is involved.
         self.cache_dir = Path(config.cache_dir).expanduser().resolve()
-        # Two areas, on purpose. The CPG is a pure function of the workspace content, so it is
-        # shareable across workers -- one worker can reuse what another built, and resizing the
-        # fleet does not force a rebuild. Reports and Joern's own project scratch are per-worker
-        # state, so they are keyed by index: two workers handling the same project (which
-        # happens when the fleet is resized) would otherwise write the same file.
+        # Two areas, on purpose. The CPG is a pure function of the workspace content **and the
+        # frontend that built it**, so it is shareable across workers -- one worker can reuse what
+        # another built, and resizing the fleet does not force a rebuild. Reports and Joern's own
+        # project scratch are per-worker state, so they are keyed by index: two workers handling the
+        # same project (which happens when the fleet is resized) would otherwise write the same file.
         self.shared_dir = self.cache_dir / "cpg"
         self.scratch_dir = self.cache_dir / f"worker-{self.index}"
         for path in (self.shared_dir, self.scratch_dir):
             path.mkdir(parents=True, exist_ok=True)
         self._server: subprocess.Popen | None = None
-        self._loaded_digest: str | None = None
+        #: `(workspace digest, frontend)` of the graph the live session holds. Both halves are
+        #: needed: the same workspace has a different graph per frontend, and this guard decides
+        #: whether the resident server has to be respawned.
+        self._loaded: tuple[str, str] | None = None
         self._lock = threading.Lock()
+
+    def frontend_for(self, workspace: Path) -> Frontend:
+        """Which frontend builds this workspace's graph.
+
+        Decided per workspace, not per worker: a worker is handed a project by path, and its
+        language is a property of the tree. The choice is a **suffix census** rather than a
+        configured answer, so adding a language is a config entry and not a code path.
+
+        Two refusals, both deliberate. `NoFrontend` when nothing in the tree matches a configured
+        suffix; `JoernUnavailable` when the frontend for the winning suffix is not installed.
+        Neither may degrade to "build an empty graph": that is a wrong answer wearing the shape of
+        a clean codebase. A missing *Java* frontend therefore does not take Python analysis down
+        with it -- the check happens here, per workspace, not at startup.
+        """
+        if self.cpg_bin:
+            binary = Path(self.cpg_bin)
+            return Frontend(name=binary.name or "unknown", suffix="", binary=binary)
+
+        census = suffix_census(workspace, set(self.config.cpg_frontends))
+        suffix = dominant_suffix(census)
+        if suffix is None:
+            configured = ", ".join(sorted(self.config.cpg_frontends)) or "none configured"
+            raise NoFrontend(
+                f"nothing under {workspace} carries a suffix this deployment has a frontend for "
+                f"({configured}); census={census or '{}'}. Refusing rather than building an empty "
+                "graph, because an empty graph makes every question read as 'the value cannot "
+                "reach the sink'"
+            )
+        name = self.config.cpg_frontends[suffix]
+        binary = self.config.frontends_dir / name / "bin" / name
+        if not binary.is_file():
+            raise JoernUnavailable(
+                f"frontend {name!r} for {suffix} is not installed at {binary} (census={census}). "
+                "The worker image must ship it -- see services/dataflow/Dockerfile."
+            )
+        return Frontend(
+            name=name,
+            suffix=suffix,
+            binary=binary,
+            extra_args=tuple(self.config.cpg_frontend_args.get(suffix) or ()),
+        )
+
+    def graph_key(self, digest: str, frontend: Frontend) -> str:
+        """Cache directory name for one workspace **under one frontend**.
+
+        The frontend is part of the key, not decoration. `shared_dir` is shared by the whole fleet,
+        and the key used to be a function of the workspace content alone -- so serving a second
+        frontend, or merely reconfiguring one, would have answered from the graph the *previous*
+        one built. A stale graph is a wrong answer while a needless rebuild is only slow, so the
+        tie goes to the rebuild. `workspace_digest`'s own docstring records the same class of bug
+        from when the digest hashed only `.py` files: two unrelated Java projects collided on
+        `sha1("")` and the second was answered from the first one's graph.
+        """
+        return f"{digest}-{frontend.key}"
 
     # -- environment ---------------------------------------------------
     def check(self) -> None:
@@ -424,8 +593,21 @@ class JoernWorker:
                 f"{self.joern_bin!r} is not executable in this container. The worker image "
                 "must provide Joern; see services/dataflow/Dockerfile."
             )
-        if not Path(self.cpg_bin).is_file() and shutil.which(self.cpg_bin) is None:
-            raise JoernUnavailable(f"{self.cpg_bin!r} is missing (pysrc2cpg frontend)")
+        if self.cpg_bin is not None:
+            if not Path(self.cpg_bin).is_file() and shutil.which(self.cpg_bin) is None:
+                raise JoernUnavailable(
+                    f"the forced frontend {self.cpg_bin!r} is missing. Unset it to let the worker "
+                    "pick a frontend per workspace from the suffix census."
+                )
+            return
+        # Per-frontend binaries are checked in `frontend_for`, not here: a deployment that has
+        # configured a language whose frontend this image lacks must still be able to analyse the
+        # languages it does have.
+        if not self.config.frontends_dir.is_dir():
+            raise JoernUnavailable(
+                f"frontends directory {self.config.frontends_dir} does not exist. The worker image "
+                "must ship Joern's frontends; see services/dataflow/Dockerfile."
+            )
 
     # -- lifecycle -----------------------------------------------------
     @property
@@ -434,7 +616,8 @@ class JoernWorker:
 
     @property
     def loaded_project(self) -> str | None:
-        return self._loaded_digest
+        """The digest of the workspace the live session holds, or None. Reported by `/health`."""
+        return self._loaded[0] if self._loaded else None
 
     def start(self) -> float:
         """Confirm Joern is runnable. The server itself is started per project by `_load`.
@@ -495,7 +678,7 @@ class JoernWorker:
         yes. `start_new_session` at spawn is what makes the group addressable here.
         """
         server, self._server = self._server, None
-        self._loaded_digest = None
+        self._loaded = None
         if server is None:
             return
         self._signal_server(server, signal.SIGTERM)
@@ -537,10 +720,10 @@ class JoernWorker:
             time.sleep(0.5)
         log.warning("dataflow: port %s still answers after stop()", self._port())
 
-    def _cpg_path(self, digest: str) -> Path:
-        return self.shared_dir / digest / "cpg.bin"
+    def _cpg_path(self, digest: str, frontend: Frontend) -> Path:
+        return self.shared_dir / self.graph_key(digest, frontend) / "cpg.bin"
 
-    def _run_cpg_builder(self, workspace: Path, out: Path) -> None:
+    def _run_cpg_builder(self, workspace: Path, out: Path, frontend: Frontend) -> None:
         """Build a CPG, then publish it by rename.
 
         The rename matters for a shared cache: two workers can be asked for the same project
@@ -548,18 +731,37 @@ class JoernWorker:
         half-written graph. Building into a temporary name and renaming makes the published
         file all-or-nothing, and both builders produce identical bytes anyway, so whichever
         wins is correct.
+
+        `frontend.extra_args` is appended verbatim. For Java that is the type-information classpath
+        (`--inference-jar-paths`), which is a refinement rather than a prerequisite: measured on a
+        three-file fixture that references `HttpServletRequest` with no servlet jar available, the
+        graph builds and a cross-file flow still comes out, because call nodes come from the source
+        text whether or not their types resolve.
         """
         out.parent.mkdir(parents=True, exist_ok=True)
         staging = out.with_name(f"{out.name}.staging-{os.getpid()}")
         staging.unlink(missing_ok=True)
-        proc = subprocess.run(
-            [self.cpg_bin, "-o", str(staging), str(workspace)],
-            capture_output=True, timeout=self.config.timeout_s,
-        )
+        argv = [str(frontend.binary), "-o", str(staging), str(workspace), *frontend.extra_args]
+        log.info("dataflow: building CPG with %s (%s)", frontend.name, frontend.suffix or "forced")
+        try:
+            proc = subprocess.run(argv, capture_output=True, timeout=self.config.timeout_s)
+        except subprocess.TimeoutExpired as exc:
+            # A timeout is a *named* failure, not a 500. Measured reference so the message can say
+            # whether the budget or the repository is the problem: 2341 Java files took 418 s and
+            # produced a 15 MB graph, which fills 70% of the 600 s default -- so a bigger Java
+            # project needs `AEGIS_DATAFLOW__TIMEOUT_S` raised before its first query, and the
+            # message has to say that rather than dying as an unhandled exception.
+            staging.unlink(missing_ok=True)
+            raise JoernError(
+                f"{frontend.name} did not finish building the graph within "
+                f"{self.config.timeout_s:.0f}s (AEGIS_DATAFLOW__TIMEOUT_S). Reference measurement: "
+                "2341 Java files -> 418s / 15 MB, so a repository this size is already at 70% of "
+                "the default budget."
+            ) from exc
         if proc.returncode != 0 or not staging.is_file():
             staging.unlink(missing_ok=True)
             tail = proc.stderr.decode("utf-8", "replace")[-400:]
-            raise JoernError(f"pysrc2cpg failed (rc={proc.returncode}): {tail}")
+            raise JoernError(f"{frontend.name} failed (rc={proc.returncode}): {tail}")
         os.replace(staging, out)
 
     # -- HTTP on localhost ---------------------------------------------
@@ -658,9 +860,13 @@ class JoernWorker:
         anchor, which is what every existing caller does.
         """
         resolved_anchor = anchor or SourceAnchor(needle=source.strip())
+        # Chosen outside the lock: the census only reads the filesystem, and holding the session
+        # lock across a tree walk would block every other request for no reason. It can also
+        # refuse -- `NoFrontend` / `JoernUnavailable` -- which is better raised before the lock.
+        frontend = self.frontend_for(workspace)
         with self._lock:
             started = time.monotonic()
-            digest, cold, cpg_cached = self._load(workspace)
+            digest, cold, cpg_cached = self._load(workspace, frontend)
             load_s = time.monotonic() - started
             scratch = self.scratch_dir / digest
             scratch.mkdir(parents=True, exist_ok=True)
@@ -676,21 +882,30 @@ class JoernWorker:
                     sink_s = time.monotonic() - derive_started
                 else:
                     # No sink and no position to derive one from. Report it; do not guess.
-                    return FlowAnswer(cold=cold, cpg_cached=cpg_cached, load_s=load_s), resolution
+                    return FlowAnswer(
+                        cold=cold, cpg_cached=cpg_cached, load_s=load_s, frontend=frontend.name
+                    ), resolution
 
             if not resolution.anchor:
-                return FlowAnswer(cold=cold, cpg_cached=cpg_cached, load_s=load_s), resolution
+                return FlowAnswer(
+                    cold=cold, cpg_cached=cpg_cached, load_s=load_s, frontend=frontend.name
+                ), resolution
 
+            auto_method, auto_param = _auto_source(resolved_anchor, resolution)
             answer = self._run_flow(
                 scratch,
                 anchor=resolved_anchor,
                 sink=resolution.anchor,
                 timeout_s=timeout_s,
+                auto_method=auto_method,
+                auto_param=auto_param,
+                fallback=self.config.source.strip(),
             )
             answer.cold = cold
             answer.cpg_cached = cpg_cached
             answer.load_s = load_s
             answer.sink_s = sink_s
+            answer.frontend = frontend.name
             return answer, resolution
 
     def flow(self, *, source: str = "", sink: str, workspace: Path,
@@ -703,36 +918,58 @@ class JoernWorker:
         return answer
 
     # -- internals (caller holds the lock) ------------------------------
-    def _load(self, workspace: Path) -> tuple[str, bool, bool]:
-        """Make `workspace` the session's loaded project.
+    def _load(self, workspace: Path, frontend: Frontend) -> tuple[str, bool, bool]:
+        """Make `workspace` the session's loaded project, built by `frontend`.
 
         Returns `(digest, was_cold, cpg_cached)`. `was_cold` is about **this session** -- it had
         to import the graph -- while `cpg_cached` is about the **CPG on disk**: a cold session
         over a cached CPG skips the build and only pays the import.
+
+        The session guard is `(digest, frontend)`, not the digest alone: the same workspace has a
+        different graph per frontend, so a digest-only guard would keep serving the old graph from
+        a process that had been reconfigured -- or, worse, from one that had just been asked about
+        a Java project after a Python one.
         """
         digest = workspace_digest(workspace)
-        if self._loaded_digest == digest and self.is_up:
+        key = (digest, frontend.key)
+        if self._loaded == key and self.is_up:
             return digest, False, True
-        cpg = self._cpg_path(digest)
+        cpg = self._cpg_path(digest, frontend)
         cpg_cached = cpg.is_file()
         if not cpg_cached:
-            self._run_cpg_builder(workspace, cpg)
+            self._run_cpg_builder(workspace, cpg, frontend)
         # Restart rather than import: see `_spawn_server` for why this build cannot swap the graph
-        # in a live session. `stop()` clears the loaded digest, so it is set only after the spawn.
+        # in a live session. `stop()` clears the loaded key, so it is set only after the spawn.
         self.stop()
         self._spawn_server(cpg)
-        self._loaded_digest = digest
+        self._loaded = key
         return digest, True, cpg_cached
 
     def _run_flow(self, workdir: Path, *, anchor: SourceAnchor, sink: str,
-                  timeout_s: float) -> FlowAnswer:
+                  timeout_s: float, auto_method: str = "", auto_param: str = "",
+                  fallback: str = "") -> FlowAnswer:
+        """Run the flow query. `auto_method` / `auto_param` / `fallback` only matter for `auto`.
+
+        They arrive as arguments because they are facts about the derived sink, not properties of
+        the anchor the caller sent: the enclosing method of the hit and one of its parameters.
+        """
         report_path = workdir / REPORT_NAME
         report_path.unlink(missing_ok=True)
+        # Report what was *asked*, which for `auto` is the method and parameter the engine picked.
+        # An empty flow has to be readable as "we asked this, and it matched nothing".
+        source_expr = (
+            f"{auto_method}({auto_param})"
+            if anchor.kind == ANCHOR_AUTO and auto_method
+            else anchor.expr
+        )
         query = (
             FLOW_QUERY
-            .replace("%SOURCE_ANCHOR%", anchor.scala())
+            .replace(
+                "%SOURCE_ANCHOR%",
+                anchor.scala(auto_method=auto_method, auto_param=auto_param, fallback=fallback),
+            )
             .replace("%SOURCE_KIND%", _report_field(anchor.kind))
-            .replace("%SOURCE_EXPR%", _report_field(anchor.expr))
+            .replace("%SOURCE_EXPR%", _report_field(source_expr))
             .replace("%SINK%", _scala_literal(sink))
             .replace("%OUTPUT%", str(report_path))
         )

@@ -126,6 +126,7 @@ class ChatClient:
         model: str,
         temperature: float = 0.0,
         timeout_s: float = 180.0,
+        max_tokens: int = 0,
         transport: Transport = urllib_transport,
     ) -> None:
         if not base_url.strip():
@@ -139,6 +140,9 @@ class ChatClient:
         self.model = model
         self.temperature = temperature
         self.timeout_s = timeout_s
+        #: Sent as `max_tokens` when positive, omitted when zero. Omitting is the historical
+        #: behaviour: the provider's default applies, and the harness cannot say what it is.
+        self.max_tokens = max_tokens
         self._transport = transport
 
     @property
@@ -154,6 +158,8 @@ class ChatClient:
                 {"role": "user", "content": user},
             ],
         }
+        if self.max_tokens > 0:
+            payload["max_tokens"] = self.max_tokens
         body = self._transport(self.url, payload, self.api_key, self.timeout_s)
         choices = body.get("choices") or []
         if not choices:

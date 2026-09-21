@@ -41,6 +41,7 @@ from services.harness.tools.base import (
 )
 from services.harness.tools.board import SECTIONS, BoardTool
 from services.harness.tools.dataflow import DataflowVerifyTool, WorkerDataflowVerifier
+from services.harness.tools.grep import GrepTool
 from services.harness.tools.list_files import ListFilesTool
 from services.harness.tools.read import ReadTool
 from services.harness.tools.record import KINDS, RecordTool
@@ -53,6 +54,7 @@ TOOLS: dict[ToolName, Tool] = {
     ToolName.READ: ReadTool(),
     ToolName.LIST_FILES: ListFilesTool(),
     ToolName.SHELL: ShellCommandTool(),
+    ToolName.GREP: GrepTool(),
     ToolName.DATAFLOW_VERIFY: DataflowVerifyTool(),
     ToolName.RECORD: RecordTool(),
     ToolName.BOARD: BoardTool(),
@@ -119,6 +121,7 @@ __all__ = [
     "DataflowEvidence",
     "DataflowVerifier",
     "DataflowVerifyTool",
+    "GrepTool",
     "ListFilesTool",
     "ReadTool",
     "RecordTool",

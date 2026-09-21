@@ -99,6 +99,42 @@ def _is_synthetic(name: str) -> bool:
     return name.startswith(_SYNTHETIC_MARK) or _SYNTHETIC_MARK in name
 
 
+def _unlanded_detail(
+    bundle: FlowBundle, *, missing_sink: bool, unmatched_sink: bool
+) -> str:
+    """Why an empty flow is a statement about the question and not about the code.
+
+    Three sentences for three cases, because a reader deciding whether to trust the bundle has to
+    be able to tell them apart: "no sink could be derived at all", "the sink we derived matches no
+    call node", and "the source anchor matches no node". Each ends by saying what happened next --
+    the slice fell back to the crawl -- because an empty flow that silently becomes an empty slice
+    is the failure this wording exists to prevent.
+
+    The frontend is appended when the bundle names one: "the anchor matched nothing" and "the graph
+    was built in the wrong language" produce the same empty flow, and only this distinguishes them.
+    """
+    note = f"（图由 {bundle.frontend} 构建）" if bundle.frontend else ""
+    if missing_sink:
+        return (
+            "无法解析出任何汇聚点锚点：没有告诉数据流引擎要找什么，"
+            "而命中的位置也没有产出可调用的调用。这不是“不存在数据流”，"
+            f"因此这个切片回退到调用方/被调用方爬取{note}"
+        )
+    if unmatched_sink:
+        return (
+            f"汇聚点锚点 `{bundle.sink_anchor}` 没有匹配到任何节点"
+            f"（匹配到 {bundle.source_candidates} 个源）。空路径在这里只是"
+            "“这个问题没有落在图上”，不能证明不存在数据流；"
+            f"因此这个切片回退到调用方/被调用方爬取{note}"
+        )
+    return (
+        f"来源锚点 `{bundle.source_anchor}` 没有匹配到任何节点"
+        f"（其余候选：汇聚点 {bundle.sink_candidates} 个）。空路径在这里只是"
+        "“这个问题没有落在图上”，不能证明不存在数据流；"
+        f"因此这个切片回退到调用方/被调用方爬取{note}"
+    )
+
+
 class CallGraphBuilder:
     def __init__(
         self,
@@ -241,9 +277,12 @@ class CallGraphBuilder:
         prune records the omission. In the demo repo that silently hid `safe_escape`, which is
         the single function that decides whether the finding is real.
 
-        Returns None when there is nothing to build from, so the caller can fall back to the
-        crawl. An empty flow is NOT nothing: it is the engine proving the value never reaches
-        the sink, and it is reported as a prune rather than silently falling back.
+        Returns None in two situations, both of which fall back to the crawl: the engine failed
+        (recorded as `dataflow_unavailable`), and the question never landed on the graph (recorded
+        as `dataflow_sink_unresolved`, `dataflow_sink_unmatched` or `dataflow_source_unmatched`).
+        An empty flow where both anchors *did* land is the third case and is not a fallback: the
+        engine proved the value never reaches the sink, so the focus stands alone and
+        `dataflow_no_path` says why.
         """
         assert self.dataflow is not None
         try:
@@ -295,24 +334,57 @@ class CallGraphBuilder:
             return None
 
         if not bundle.reachable:
-            # Two different situations, and conflating them would be a lie:
-            #   - a sink was resolved and the engine found no path to it (the code is fixed);
-            #   - no sink could be resolved at all (we did not know what to look for).
+            # An empty flow has two meanings, and telling them the same way is a lie:
+            #
+            #   * **the question never landed on the graph** -- the source anchor matched no node,
+            #     or the sink was never derived, or the derived sink matches no call node. The
+            #     empty flow is then a statement about the *question*, not about the code;
+            #   * **the engine proved there is no path** -- a source and a sink that both resolved,
+            #     with no flow between them. That is a finding about the code.
+            #
+            # This is not academic. Measured on a Java project whose CPG was built by the Python
+            # frontend (the harness records the same measurement in
+            # `services/harness/tools/dataflow.py`): every question matched 0 nodes. Reporting that
+            # as `dataflow_no_path` claimed "the value cannot reach the sink" -- a claim about code
+            # the engine never read -- *and* returned `slice_`, which took away the LSP call graph
+            # that was already working and left a single-method slice. So the unlanded cases name
+            # themselves and fall through to the crawl.
             missing_sink = not bundle.sink_anchor
+            unmatched_sink = not missing_sink and bundle.sink_candidates == 0
+            unmatched_source = bundle.source_candidates == 0
+            if missing_sink or unmatched_sink or unmatched_source:
+                slice_.prunes.append(
+                    PruneDecision(
+                        rule=(
+                            "dataflow_sink_unresolved"
+                            if missing_sink
+                            else "dataflow_sink_unmatched"
+                            if unmatched_sink
+                            else "dataflow_source_unmatched"
+                        ),
+                        detail=_unlanded_detail(
+                            bundle, missing_sink=missing_sink, unmatched_sink=unmatched_sink
+                        ),
+                        method_id=focus.method_id,
+                        path=focus.path,
+                        line=focus.region.start_line,
+                        provider=Provider.JOERN_DATAFLOW,
+                    )
+                )
+                # None rather than `slice_`: the crawl below is material that already worked, and a
+                # question that never landed on the graph is not a reason to take it away. The
+                # prune stays on the slice, so the bundle still says the engine answered nothing.
+                return None
+
             slice_.prunes.append(
                 PruneDecision(
-                    rule="dataflow_sink_unresolved" if missing_sink else "dataflow_no_path",
+                    rule="dataflow_no_path",
                     detail=(
-                        "无法解析出任何汇聚点锚点：没有告诉数据流引擎要找什么，"
-                        "而命中的位置也没有产出可调用的调用"
-                        if missing_sink
-                        else (
-                            f"数据流引擎没有找到从 `{bundle.source_anchor}` 到 "
-                            f"`{bundle.sink_anchor}` 的路径"
-                            f"（匹配到 {bundle.source_candidates} 个源、"
-                            f"{bundle.sink_candidates} 个汇聚点）：该值到不了汇聚点，"
-                            "因此没有污点链可以交给模型"
-                        )
+                        f"数据流引擎没有找到从 `{bundle.source_anchor}` 到 "
+                        f"`{bundle.sink_anchor}` 的路径"
+                        f"（匹配到 {bundle.source_candidates} 个源、"
+                        f"{bundle.sink_candidates} 个汇聚点）：该值到不了汇聚点，"
+                        "因此没有污点链可以交给模型"
                     ),
                     method_id=focus.method_id,
                     path=focus.path,
