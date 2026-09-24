@@ -93,6 +93,26 @@ def test_cancel_event_and_abort_are_both_honoured(workspace: Path, fake_engine) 
     assert from_abort.canceled is True
 
 
+def test_killed_scan_recognizes_external_cancel_event(workspace: Path, monkeypatch) -> None:
+    """A process killed by the HTTP job's event remains a cancellation after it exits."""
+    from services.scan.opengrep import OpengrepRunner
+    from services.scan.opengrep import ScanOutcome as EngineOutcome
+
+    event = threading.Event()
+
+    def killed_scan(_self, _workspace, **_kwargs):
+        event.set()
+        return EngineOutcome(engine="opengrep", returncode=-15, sarif_path=workspace / "none")
+
+    monkeypatch.setattr(OpengrepRunner, "scan", killed_scan)
+    monkeypatch.setattr(OpengrepRunner, "version", lambda _self: "test")
+    outcome = run_scan(ScanRequest(workspace=workspace, cancel_event=event))
+
+    assert outcome.canceled is True
+    assert outcome.scan_record is not None
+    assert outcome.scan_record.failure_mode == "scan_aborted"
+
+
 # --- the registry ------------------------------------------------------
 
 

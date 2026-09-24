@@ -217,6 +217,7 @@ services:
       AEGIS_WORKSPACE_ROOT: /workspace
       AEGIS_OUTPUT_DIR: /data/packages
       AEGIS_WORK_DIR: /data/work
+      AEGIS_AI_RUNTIME_DIR: /data/ai-config
       AEGIS_LSP_CONFIG_FILE: /opt/aegis/lsp.yaml
       AEGIS_QUEUE__REDIS_URL: redis://redis:6379/0
       # Scanning stays delegated (small image, CPU bound).
@@ -271,6 +272,7 @@ services:
       - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects:ro
       - ../var/packages:/data/packages
       - ../var/work:/data/work
+      - ../var/ai-config:/data/ai-config
     healthcheck:
       # No HTTP surface: what a worker's health means is "Redis is reachable and my loop is
       # turning over", which is the same signal the reaper uses to tell slow from dead.
@@ -311,6 +313,7 @@ services:
     environment:
       AEGIS_LOG_LEVEL: INFO
       AEGIS_WORKSPACE_ROOT: /workspace
+      AEGIS_AI_RUNTIME_DIR: /data/ai-config
       AEGIS_OUTPUT_DIR: /data/packages
       AEGIS_WORK_DIR: /data/work
       # Both hops delegated: this container runs no scanner and no extraction.
@@ -371,6 +374,7 @@ services:
       - ${AEGIS_PROJECTS_ROOT:-../var/projects}:/data/projects
       - ../var/packages:/data/packages
       - ../var/work:/data/work
+      - ../var/ai-config:/data/ai-config
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
       interval: 30s

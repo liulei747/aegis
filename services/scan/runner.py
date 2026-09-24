@@ -239,10 +239,10 @@ def run_scan(request: ScanRequest) -> ScanOutcome:
         tail = outcome.stderr_tail.splitlines()[-1] if outcome.stderr_tail else ""
         # Two ways to get a bad exit code, and they must not read the same in the ledger:
         # we killed it (a cancel) versus it died on its own (OOM killer, an operator's
-        # `kill`). The caller's abort predicate is the only witness -- the return code
-        # itself cannot tell them apart, which is why `aborted()` is asked here and
-        # nowhere else.
-        was_aborted = request.abort is not None and request.abort()
+        # `kill`). The combined abort predicate is the witness: a remote scan can be
+        # canceled through `cancel_event` even when the caller supplied no abort callback.
+        # The return code alone cannot distinguish that from an external kill.
+        was_aborted = abort is not None and abort()
         if was_aborted:
             reason = "扫描已按请求终止"
             log.info("scan process killed while a cancel was pending")

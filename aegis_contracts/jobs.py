@@ -252,6 +252,17 @@ class JobProgress(BaseModel):
         return cls(stages=stages)
 
 
+class AuditOptions(BaseModel):
+    """Bounded, persisted controls for one audit attempt."""
+
+    concurrency: int | None = Field(default=None, ge=1, le=8)
+    max_tokens: int | None = Field(default=None, ge=0, le=32768)
+    steps_per_agent: int | None = Field(default=None, ge=4, le=16)
+    timeout_s: float | None = Field(default=None, ge=30, le=600)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_rounds: int | None = Field(default=None, ge=1, le=5)
+
+
 class JobRequest(BaseModel):
     """What to run. Mirrors the HTTP request but does not import it."""
 
@@ -270,6 +281,7 @@ class JobRequest(BaseModel):
     #: Which finished bundle to act on. Only the AI stage uses it: that job consumes a bundle
     #: instead of producing one, so `workspace` alone does not identify the work.
     bundle_id: str | None = None
+    audit_options: AuditOptions | None = None
 
 
 class JobSubmission(BaseModel):
@@ -491,6 +503,10 @@ def request_fingerprint(
         f"package_name:{request.package_name or ''}",
         f"lsp_config:{lsp_config_fingerprint}",
     ]
+    if kind is JobKind.AUDIT and request.audit_options is not None:
+        selected_options = request.audit_options.model_dump(exclude_none=True)
+        if selected_options:
+            extra.append(f"audit_options:{canonical_json(selected_options)}")
     return _sha1(
         workspace,
         artifact,

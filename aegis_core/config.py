@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +53,8 @@ class AIConfig(BaseModel):
     #: `https://api.openai.com/v1` shape and a bare host work, because the path is added once.
     base_url: str = ""
     api_key_env: str = "API_KEY"
+    # Set only by the runtime configuration store. SecretStr masks accidental repr/JSON output.
+    api_key: SecretStr | None = None
     model: str = ""
     timeout_s: float = Field(default=180.0, gt=0)
     #: Calls in flight at once. Defaults to 1 because that is the setting the measurements
@@ -280,6 +282,7 @@ class Settings(BaseSettings):
     workspace_root: Path = Path("./workspace")
     output_dir: Path = Path("./var/packages")
     work_dir: Path = Path("./var/work")
+    ai_runtime_dir: Path | None = None
     max_file_bytes: int = 2_000_000
 
     # --- lsp ---------------------------------------------------------
@@ -313,6 +316,8 @@ class Settings(BaseSettings):
         self.workspace_root = self.workspace_root.expanduser().resolve()
         self.output_dir = self.output_dir.expanduser().resolve()
         self.work_dir = self.work_dir.expanduser().resolve()
+        if self.ai_runtime_dir is not None:
+            self.ai_runtime_dir = self.ai_runtime_dir.expanduser().resolve()
         if self.lsp_config_file is not None:
             self.lsp_config_file = self.lsp_config_file.expanduser().resolve()
         self.dataflow.cache_dir = self.dataflow.cache_dir.expanduser().resolve()
@@ -322,4 +327,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings().resolve()
-

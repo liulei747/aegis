@@ -87,6 +87,7 @@ def _job_request(
         lsp=getattr(payload, "lsp", True),
         package_name=getattr(payload, "package_name", None),
         bundle_id=getattr(payload, "bundle_id", None),
+        audit_options=getattr(payload, "audit_options", None),
     )
 
 

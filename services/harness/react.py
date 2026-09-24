@@ -42,7 +42,7 @@ from aegis_contracts.harness import (
     ToolResult,
 )
 from aegis_core.logging import get_logger
-from services.ai.client import AIError, AIUnavailable, truncated
+from services.ai.client import AIError, AIUnavailable, finish_reason, truncated
 from services.ai.parse import extract_json_object
 
 log = get_logger(__name__)
@@ -413,7 +413,8 @@ def run_agent(
         """
         if pending:
             run.salvaged = True
-            record(AgentStep(index=len(run.steps) + 1, thought="（改用输出上限截断时抢救出的 `final`）"))
+            cause = "供应商输出上限" if pending_output_limited else "不完整 JSON"
+            record(AgentStep(index=len(run.steps) + 1, thought=f"（改用{cause}时抢救出的 `final`）"))
             return finish("finished", pending)
         return finish(reason)
 
@@ -423,13 +424,16 @@ def run_agent(
         return finish("budget")
 
     parse_errors = 0
+    format_repairs = 0
     note = ""
+    compact_mode = False
     #: A `final` recovered from an answer the output limit cut in half. Held rather than used: the
     #: retry below usually produces a complete answer, and a complete answer beats a truncated one.
     #: It is spent only when the run would otherwise end with *nothing* -- a budget stop or an
     #: exhausted parse-retry budget -- which is where the real loss was: 7 budget and 7 error runs
     #: in the measured audit, each of them a stage that produced no output at all.
     pending: dict[str, Any] | None = None
+    pending_output_limited = False
     for index in range(1, max_steps + 1):
         user = render_user_message(
             task,
@@ -437,7 +441,12 @@ def run_agent(
             # The wrap-up reminder rides with whatever the previous turn needed to be told; both are
             # things the model cannot work out from the transcript (a parse error it has not seen, and
             # how many turns the *harness* has left).
-            note="\n".join(part for part in (note, wrap_up_note(index, max_steps)) if part),
+            note="\n".join(part for part in (
+                note,
+                "FORMAT RECOVERY: Use one short tool call per answer, or a concise complete final JSON. "
+                "Do not repeat previous calls." if compact_mode else "",
+                wrap_up_note(index, max_steps),
+            ) if part),
         )
         note = ""
         try:
@@ -458,10 +467,51 @@ def run_agent(
             run.model = str(result.model)
         answer = result.text or ""
 
-        payload, parse_error, salvage_note = _parse_turn(answer, output_schema=output_schema)
+        stop = finish_reason(result)
+        payload, parse_error, salvage_note = _parse_turn(
+            answer, output_schema=output_schema, output_limited=truncated(result)
+        )
+        repair_failed = False
+        if (payload is None and format_repairs < 2
+                and parse_errors + 1 < max_parse_attempts):
+            # Repair the wire format without spending one of the agent's investigation turns.
+            # This is bounded separately: two repair calls per run, no recursive retries.
+            format_repairs += 1
+            record(AgentStep(
+                index=index,
+                thought=f"格式修复 {format_repairs}/2（finish_reason={stop or '未提供'}）："
+                        f"{parse_error}；原文片段：{answer.strip()[:1400]}",
+            ))
+            repair_user = render_user_message(
+                task, run.steps,
+                note=(
+                    "Your last answer was invalid JSON. Correct its format now without repeating "
+                    "investigation. Return exactly one short JSON object: one tool call or a "
+                    "complete final. Keep text fields concise."
+                ),
+            )
+            try:
+                repaired_result = _complete_with_retries(
+                    client, system, repair_user, caller=f"{agent}:{scope_id}"
+                )
+            except (AIUnavailable, AIError):
+                pass  # The normal loop still has the original error and its retry path.
+            else:
+                result = repaired_result
+                answer = result.text or ""
+                stop = finish_reason(result)
+                payload, parse_error, salvage_note = _parse_turn(
+                    answer, output_schema=output_schema, output_limited=truncated(result)
+                )
+                repair_failed = payload is None
         if payload is None:
-            parse_errors += 1
-            record(AgentStep(index=index, thought=answer.strip()[:2000]))
+            compact_mode = True
+            parse_errors += 1 + int(repair_failed)
+            record(AgentStep(
+                index=index,
+                thought=f"模型回答无法解析（finish_reason={stop or '未提供'}）：{parse_error}；"
+                        f"原文片段：{answer.strip()[:1600]}",
+            ))
             if parse_errors >= max_parse_attempts:
                 log.warning("react: %s gave %d unparseable answers; stopping", agent, parse_errors)
                 return finish("error")
@@ -476,9 +526,15 @@ def run_agent(
                     "\nYour answer hit the OUTPUT LIMIT and was cut off, so it was not valid JSON. "
                     "Send fewer tool calls and shorter `text` per call; split the work over turns."
                 )
+            elif stop:
+                note += (
+                    f"\nProvider finish_reason={stop}; the response was malformed. "
+                    "Return a smaller valid JSON object."
+                )
             continue
         parse_errors = 0
         if salvage_note:
+            compact_mode = True
             note = salvage_note
 
         thought = str(payload.get("thought") or "")
@@ -502,6 +558,7 @@ def run_agent(
                 # first, and only spend it if the run never gets a complete one.
                 if pending is None:
                     pending = final
+                    pending_output_limited = truncated(result)
                 record(AgentStep(index=index, thought=thought))
                 continue
             record(AgentStep(index=index, thought=thought))
@@ -593,13 +650,14 @@ def _complete_with_retries(
             client=client, caller=caller, attempt=attempt, ok=True,
             duration_ms=(time.monotonic() - started) * 1000,
             prompt_chars=len(system) + len(user), answer_chars=len(result.text or ""),
-            usage=getattr(result, "usage", None),
+            usage=getattr(result, "usage", None), finish_reason=finish_reason(result),
         )
         return result
 
 
 def _record_call(*, client, caller: str, attempt: int, ok: bool, duration_ms: float,
-                 prompt_chars: int, answer_chars: int = 0, usage=None, error: str | None = None):
+                 prompt_chars: int, answer_chars: int = 0, usage=None, error: str | None = None,
+                 finish_reason: str | None = None):
     """Write one row of model traffic. Never raises -- see `services.ai.traffic`."""
     from services.ai import traffic
 
@@ -614,12 +672,13 @@ def _record_call(*, client, caller: str, attempt: int, ok: bool, duration_ms: fl
         prompt_chars=prompt_chars,
         answer_chars=answer_chars,
         usage=usage,
+        finish_reason=finish_reason,
         error=error,
     )
 
 
 def _parse_turn(
-    answer: str, *, output_schema: dict | None = None
+    answer: str, *, output_schema: dict | None = None, output_limited: bool = False
 ) -> tuple[dict | None, str | None, str]:
     """`(payload, error, salvage_note)` for one model answer. `payload` is None when it cannot be used.
 
@@ -666,15 +725,22 @@ def _parse_turn(
 
     salvaged = _salvage_calls(answer)
     if salvaged:
+        cause = "达到供应商输出上限" if output_limited else "JSON 不完整（供应商未报告输出上限）"
         return (
-            {"thought": "（回答被截断，抢救出其中完整的调用）", "calls": salvaged},
+            {"thought": f"（回答{cause}，抢救出其中完整的调用）", "calls": salvaged},
             None,
-            f"你上一条回答被截断了：只抢救出前 {len(salvaged)} 个完整的调用，后面的丢了。"
+            f"你上一条回答{cause}：只抢救出前 {len(salvaged)} 个完整的调用，后面的丢了。"
             "一次少写几个调用，`text` 也写短一点。",
         )
     repaired = _salvage_final(answer, output_schema)
     if repaired is not None:
-        return repaired, None, SALVAGE_NOTE
+        if not output_limited:
+            repaired["thought"] = "（JSON 不完整，供应商未报告输出上限：已保留可解析的最终结果作为备用）"
+        return repaired, None, (
+            SALVAGE_NOTE if output_limited else
+            "上一条回答的 JSON 不完整，供应商没有报告输出上限；已保留能解析的字段作为备用。"
+            "请用更短的完整 JSON 重发一次。"
+        )
     if syntax_error:
         return None, syntax_error, ""
     return None, "回答中找不到 JSON 对象（需要 thought + tool/calls/final）", ""

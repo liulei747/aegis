@@ -313,7 +313,9 @@ class Worker:
                 f"未找到包含 AI 块的分析包：{bundle}",
             )
 
-        config = self.settings.ai
+        from aegis_core.ai_runtime import effective_ai
+
+        config = effective_ai(self.settings)
         report = analyse_bundle(bundle, config)
         warnings: list[str] = []
         # Close the stage out with an outcome, not just the "running" pin set before the call:
@@ -386,6 +388,7 @@ class Worker:
           cancel lands within one agent (measured at 1-3 minutes on the Java benchmark) instead of
           in the 30 the whole run takes.
         """
+        from aegis_core.ai_runtime import effective_ai
         from services.ai.runner import AINotConfigured, client_from
         from services.harness import trail as trail_mod
         from services.harness.coordinator import HarnessCoordinator
@@ -395,7 +398,13 @@ class Worker:
         if not workspace.is_dir():
             raise _JobRefused(FailureMode.WORKSPACE_MISSING, f"工作区不是目录：{workspace}")
         try:
-            client = client_from(self.settings.ai)
+            options = request.audit_options
+            ai_overrides = options.model_dump(
+                include={"max_tokens", "timeout_s", "temperature"}, exclude_none=True
+            ) if options else {}
+            default_ai = effective_ai(self.settings)
+            ai_config = default_ai.model_copy(update=ai_overrides)
+            client = client_from(ai_config)
         except AINotConfigured as exc:
             # A refusal, not a crash: the operator has one environment variable to set, and the
             # message has to name it rather than failing 40 minutes later with no findings.
@@ -404,7 +413,7 @@ class Worker:
         run_root = self.settings.work_dir / "audit"
         coordinator = HarnessCoordinator(
             workspace=workspace,
-            config=self._audit_config(),
+            config=self._audit_config(request.audit_options, default_concurrency=default_ai.concurrency),
             client=client,
             out_dir=run_root,
             run_id=job.job_id,
@@ -488,12 +497,11 @@ class Worker:
             },
         )
 
-    def _audit_config(self):
+    def _audit_config(self, options=None, *, default_concurrency: int | None = None):
         """The harness bounds for a queued audit.
 
-        Only the model concurrency is taken from settings; the rest keep the harness defaults,
-        because they are the bounds the Java benchmark was measured with and a job that quietly
-        used different ones would produce a different answer from the CLI run of the same command.
+        Model concurrency comes from settings unless this job overrides it. Other harness bounds
+        keep their defaults unless an explicit per-job option is supplied.
 
         One exception, and it is named rather than hidden: `AEGIS_HARNESS_CLAIM_BATCH_SIZE` lets a
         deployment judge several *different* claims in one run, in validation and in the attack-path
@@ -514,11 +522,17 @@ class Worker:
                 "worker: AEGIS_HARNESS_CLAIM_BATCH_SIZE=%r is not an integer; using 1", raw
             )
             batch_size = 1
-        return HarnessConfig(
-            concurrency=max(1, self.settings.ai.concurrency),
+        config = HarnessConfig(
+            concurrency=max(1, options.concurrency if options and options.concurrency is not None
+                            else default_concurrency or self.settings.ai.concurrency),
             claim_batch_size=max(1, batch_size),
             **environment_limits(),
         )
+        if options and options.steps_per_agent is not None:
+            config.steps_per_agent = options.steps_per_agent
+        if options and options.max_rounds is not None:
+            config.max_rounds = options.max_rounds
+        return config
 
     def _audit_event(self, job_id: str, event: dict) -> None:
         """Mirror one trail event into the job's record -- coarsely, on purpose.

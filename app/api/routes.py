@@ -14,7 +14,17 @@ import shutil
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from aegis_contracts import views
@@ -22,6 +32,7 @@ from aegis_contracts.ai import AIReport
 from aegis_contracts.domain import AnalysisBundleManifest
 from aegis_contracts.jobs import JobAcceptedResponse, JobKind
 from aegis_contracts.projects import ProjectRecord, ProjectSource
+from aegis_core.ai_runtime import AISettingsUpdate, ai_view, effective_ai, reset_ai, save_ai
 from aegis_core.config import Settings
 from aegis_core.logging import get_logger
 from app import __version__
@@ -99,6 +110,7 @@ def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
 
     remote = scan_service_url()
     engine = _probe_remote_scanner(remote) if remote else _local_scanner(settings)
+    ai = effective_ai(settings)
 
     return HealthResponse(
         status="ok" if not engine.startswith("扫描服务") else "degraded",
@@ -115,14 +127,12 @@ def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
             # at a container: it is enabled in config but has no credential, which fails safely
             # and invisibly. Booleans only -- the key's *value* never appears here.
             "ai": {
-                "enabled": settings.ai.enabled,
-                "model": settings.ai.model,
-                "endpoint_configured": bool(settings.ai.base_url),
-                "api_key_present": bool(
-                    os.environ.get(settings.ai.api_key_env, "").strip()
-                ),
-                "api_key_env": settings.ai.api_key_env,
-                "concurrency": settings.ai.concurrency,
+                "enabled": ai.enabled,
+                "model": ai.model,
+                "endpoint_configured": bool(ai.base_url),
+                "api_key_present": ai_view(settings)["api_key_present"],
+                "api_key_env": ai.api_key_env,
+                "concurrency": ai.concurrency,
             },
             # Whether projects can be created at all, so a front-end can hide the form rather
             # than offer one whose every submission fails. `writable` is the honest part: the
@@ -149,18 +159,8 @@ def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
 
 @router.get("/v1/settings")
 def settings_view(settings: Settings = Depends(get_settings)) -> dict:
-    """The effective configuration, read-only.
-
-    Every value here comes from an environment variable, so there is nothing to write back: the
-    honest answer to "can I change this?" is that it is a redeploy, and a PUT route would either
-    lie or mutate a process-local copy that the next request re-reads from the environment.
-
-    The AI credential is the one field with a rule of its own. The *name* of the variable is part
-    of the configuration a caller needs in order to diagnose "the stage is enabled but has no
-    key"; the key's *value* is not configuration and never appears -- not here, not in `/health`,
-    not in a bundle. `api_key_present` carries the only part a caller can act on.
-    """
-    ai = settings.ai
+    """Effective configuration, with the LLM secret redacted."""
+    ai = effective_ai(settings)
     return {
         "workspace_root": str(settings.workspace_root),
         "output_dir": str(settings.output_dir),
@@ -176,17 +176,51 @@ def settings_view(settings: Settings = Depends(get_settings)) -> dict:
             "model": ai.model,
             "base_url": ai.base_url,
             "api_key_env": ai.api_key_env,
-            "api_key_present": bool(os.environ.get(ai.api_key_env, "").strip()),
+            "api_key_present": ai_view(settings)["api_key_present"],
             "timeout_s": ai.timeout_s,
             "concurrency": ai.concurrency,
+            "max_tokens": ai.max_tokens,
             "temperature": ai.temperature,
             "max_contexts": ai.max_contexts,
         },
         "cors": settings.cors.model_dump(mode="json"),
         "note": (
-            "只读：这些值来自环境变量，因此修改其中一个需要重新部署，而不是发一个请求"
+            "部署值来自环境变量，修改它们需要重新部署；LLM 配置可在本地控制台保存，新任务立即读取"
         ),
     }
+
+
+@router.get("/v1/ai/config")
+def read_ai_config(settings: Settings = Depends(get_settings)) -> dict:
+    """Redacted effective LLM configuration. Never serialize the saved API key."""
+    return ai_view(settings)
+
+
+@router.put("/v1/ai/config")
+def write_ai_config(
+    update: AISettingsUpdate,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Local-console write. The shared work directory makes new worker jobs see it."""
+    origin = request.headers.get("origin")
+    if origin not in (None, "http://127.0.0.1:8102", "http://localhost:8102"):
+        raise HTTPException(status_code=403, detail="仅允许本机控制台修改 LLM 配置")
+    try:
+        return save_ai(settings, update)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except OSError:
+        # A malformed file or write error must not echo the secret-bearing request.
+        raise HTTPException(status_code=500, detail="无法保存 LLM 配置，请检查共享工作目录") from None
+
+
+@router.delete("/v1/ai/config")
+def reset_ai_config(request: Request, settings: Settings = Depends(get_settings)) -> dict:
+    origin = request.headers.get("origin")
+    if origin not in (None, "http://127.0.0.1:8102", "http://localhost:8102"):
+        raise HTTPException(status_code=403, detail="仅允许本机控制台修改 LLM 配置")
+    return reset_ai(settings)
 
 
 def _local_scanner(settings: Settings) -> str:
@@ -697,7 +731,7 @@ async def analyze_bundle_route(
             response=response,
         )
 
-    report = await asyncio.to_thread(analyse_bundle, package, settings.ai)
+    report = await asyncio.to_thread(analyse_bundle, package, effective_ai(settings))
     if report.skipped:
         # Not an error: the stage is off by default, and saying so is the useful answer.
         return {"bundle_id": bundle_id, "skipped": report.skipped, "calls": []}

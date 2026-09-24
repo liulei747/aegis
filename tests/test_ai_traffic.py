@@ -31,6 +31,7 @@ def test_a_recorded_call_says_who_asked_and_what_it_cost(tmp_path: Path) -> None
         prompt_chars=5000,
         answer_chars=120,
         usage=_usage(),
+        finish_reason="length",
         path=path,
     )
 
@@ -41,6 +42,7 @@ def test_a_recorded_call_says_who_asked_and_what_it_cost(tmp_path: Path) -> None
     assert stored["duration_ms"] == 1235
     assert stored["prompt_tokens"] == 100 and stored["cached_tokens"] == 40
     assert stored["ok"] is True and stored["error"] is None
+    assert stored["finish_reason"] == "length"
 
 
 def test_the_log_never_carries_the_prompt_or_the_answer(tmp_path: Path) -> None:

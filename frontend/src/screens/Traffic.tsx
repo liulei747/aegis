@@ -109,6 +109,7 @@ function ModelTrafficPanel({ needle, onlyProblems }: { needle: string; onlyProbl
               <th className="num">输入</th>
               <th className="num">输出</th>
               <th className="num">缓存</th>
+              <th>停止原因</th>
               <th>结果</th>
             </tr>
           </thead>
@@ -124,6 +125,7 @@ function ModelTrafficPanel({ needle, onlyProblems }: { needle: string; onlyProbl
                 <td className="num">{formatCount(entry.prompt_tokens ?? 0)}</td>
                 <td className="num">{formatCount(entry.completion_tokens ?? 0)}</td>
                 <td className="num">{formatCount(entry.cached_tokens ?? 0)}</td>
+                <td className="note">{entry.finish_reason || "—"}</td>
                 <td className={entry.ok ? "ok" : "error"}>{entry.ok ? "成功" : entry.error ?? "失败"}</td>
               </tr>
             ))}

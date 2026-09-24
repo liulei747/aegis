@@ -475,6 +475,24 @@ def test_the_kind_is_part_of_the_fingerprint() -> None:
     assert job_id_for(assemble) != job_id_for(ai)
 
 
+def test_audit_options_are_bounded_and_part_of_audit_identity() -> None:
+    from pydantic import ValidationError
+
+    from aegis_contracts.jobs import AuditOptions
+
+    base = _request()
+    tuned = _request(audit_options=AuditOptions(concurrency=2, max_tokens=8192))
+    assert request_fingerprint(base, kind=JobKind.AUDIT) != request_fingerprint(
+        tuned, kind=JobKind.AUDIT
+    )
+    assert request_fingerprint(tuned, kind=JobKind.AUDIT) == request_fingerprint(
+        _request(audit_options={"max_tokens": 8192, "concurrency": 2}), kind=JobKind.AUDIT
+    )
+    with pytest.raises(ValidationError):
+        AuditOptions(concurrency=100)
+
+
+
 def test_the_bundle_id_is_part_of_the_fingerprint() -> None:
     """Analysing bundle A and bundle B are different pieces of work sharing one workspace."""
     first = request_fingerprint(_request(bundle_id="B-one"), kind=JobKind.AI_FANOUT)

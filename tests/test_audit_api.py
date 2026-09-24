@@ -129,6 +129,27 @@ def test_resubmitting_the_same_audit_attaches_instead_of_running_twice(
     assert plain.fingerprint != audit.submission.fingerprint
 
 
+def test_audit_options_are_persisted_and_change_the_job_id(audit_client, workspace: Path) -> None:
+    default_id = _submit_audit(audit_client, workspace)
+    tuned = audit_client.post("/v1/audit", json={
+        "workspace": str(workspace),
+        "audit_options": {"concurrency": 2, "max_tokens": 0, "steps_per_agent": 12,
+                          "timeout_s": 240, "temperature": 0.2, "max_rounds": 2},
+    })
+    assert tuned.status_code == 202, tuned.text
+    tuned_id = tuned.json()["job_id"]
+    assert tuned_id != default_id
+    job = _store(audit_client).get(tuned_id)
+    assert job is not None
+    assert job.submission.request.audit_options.max_tokens == 0
+    assert job.submission.request.audit_options.timeout_s == 240
+    assert job.submission.request.audit_options.max_rounds == 2
+    invalid = audit_client.post("/v1/audit", json={
+        "workspace": str(workspace), "audit_options": {"concurrency": 99},
+    })
+    assert invalid.status_code == 422
+
+
 def test_the_trail_is_an_honest_empty_page_before_the_run_starts(
     audit_client, workspace: Path
 ) -> None:

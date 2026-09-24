@@ -393,8 +393,8 @@ def _trail_section(blackboard: Blackboard) -> list[str]:
     if salvaged:
         out.append("")
         out.append(
-            f"其中 {len(salvaged)} 个 run 的最终答案来自**被输出上限截断的回答**"
-            "（下表标注 ✂️）：字段是模型的，但被截断的列表可能不完整，"
+            f"其中 {len(salvaged)} 个 run 的最终答案来自**不完整 JSON 中抢救的内容**"
+            "（下表标注 ✂️）：字段是模型的，但列表可能不完整；具体停止原因见模型流量，"
             "它们本会以“没有产出”结束。"
         )
     out.append("")

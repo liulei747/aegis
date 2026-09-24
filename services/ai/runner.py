@@ -34,7 +34,7 @@ from services.ai.blocks import (
     user_text,
     volatile_blocks,
 )
-from services.ai.client import AIError, AIUnavailable, ChatClient
+from services.ai.client import AIError, AIUnavailable, ChatClient, finish_reason
 from services.ai.parse import parse_verdict
 
 log = get_logger(__name__)
@@ -53,7 +53,7 @@ def client_from(config: AIConfig, *, transport=None) -> ChatClient:
     A missing key is a refusal: calling anyway, or skipping silently, would both look like a
     successful run that produced no verdicts.
     """
-    api_key = os.environ.get(config.api_key_env, "").strip()
+    api_key = (config.api_key.get_secret_value().strip() if config.api_key else "") or os.environ.get(config.api_key_env, "").strip()
     if not api_key:
         raise AINotConfigured(
             f"{config.api_key_env} 未设置：拒绝在没有密钥的情况下调用模型"
@@ -122,6 +122,7 @@ def call_with_retries(client: ChatClient, context_id: str | None, system: str, u
         prompt_chars=len(system) + len(user),
         answer_chars=len(result.text or ""),
         usage=result.usage,
+        finish_reason=finish_reason(result),
     )
     verdict, error, missing = parse_verdict(result.text)
     return AICall(

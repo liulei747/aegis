@@ -178,6 +178,36 @@ def test_settings_publishes_the_effective_configuration(client: TestClient) -> N
     assert "重新部署" in body["note"]
 
 
+def test_llm_config_is_saved_for_new_jobs_without_returning_the_key(
+    client: TestClient, monkeypatch
+) -> None:
+    from aegis_core.ai_runtime import effective_ai
+    from services.ai.runner import client_from
+
+    monkeypatch.delenv("API_KEY", raising=False)
+    response = client.put("/v1/ai/config", json={
+        "enabled": True, "base_url": "https://provider.example/v1", "model": "model-new",
+        "api_key": "secret-from-browser", "max_tokens": 0, "timeout_s": 240,
+    }, headers={"Origin": "http://127.0.0.1:8102"})
+    assert response.status_code == 200, response.text
+    assert response.json()["api_key_present"] is True
+    assert "secret-from-browser" not in response.text
+    assert "secret-from-browser" not in client.get("/v1/ai/config").text
+    assert "secret-from-browser" not in client.get("/v1/settings").text
+    config = effective_ai(get_settings())
+    assert config.model == "model-new"
+    assert config.max_tokens == 0
+    assert client_from(config).api_key == "secret-from-browser"
+    rejected = client.put("/v1/ai/config", json={"model": "hostile"},
+                          headers={"Origin": "https://outside.example"})
+    assert rejected.status_code == 403
+    assert effective_ai(get_settings()).model == "model-new"
+    restored = client.delete("/v1/ai/config", headers={"Origin": "http://127.0.0.1:8102"})
+    assert restored.status_code == 200
+    assert restored.json()["source"] == "environment"
+    assert effective_ai(get_settings()).model != "model-new"
+
+
 def test_settings_carries_the_key_name_but_never_the_key(client: TestClient, monkeypatch) -> None:
     """The one field with a rule of its own.
 

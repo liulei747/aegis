@@ -331,6 +331,7 @@ export interface AITrafficEntry {
   answer_chars: number;
   prompt_tokens: number | null;
   completion_tokens: number | null;
+  finish_reason?: string | null;
   cached_tokens: number | null;
   error: string | null;
 }
@@ -659,9 +660,30 @@ export interface SettingsView {
     api_key_env?: string;
     api_key_present?: boolean;
     concurrency?: number;
+    max_tokens?: number;
     max_contexts?: number;
     timeout_s?: number;
   };
   cors: { allow_origins: string[] };
   note: string;
 }
+
+/** GET/PUT /v1/ai/config never returns the secret value. */
+export interface LLMConfig {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  timeout_s: number;
+  concurrency: number;
+  temperature: number;
+  max_tokens: number;
+  max_contexts: number;
+  api_key_present: boolean;
+  api_key_source: string;
+  source: string;
+}
+
+export type LLMConfigUpdate = Omit<LLMConfig, "api_key_present" | "api_key_source" | "source"> & {
+  api_key?: string;
+  clear_api_key?: boolean;
+};

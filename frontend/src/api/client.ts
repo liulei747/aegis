@@ -12,6 +12,7 @@
  */
 
 import { apiUrl } from "./config.ts";
+import type { AuditTuning } from "../auditTuning.ts";
 import { messageFor, type ApiError } from "./errors.ts";
 import type {
   AIReport,
@@ -25,6 +26,8 @@ import type {
   Job,
   JobAccepted,
   JobList,
+  LLMConfig,
+  LLMConfigUpdate,
   MethodIndexRow,
   Observability,
   ProjectRecord,
@@ -160,15 +163,14 @@ export const api = {
   /**
    * 提交一次全自主审计。
    *
-   * 只接受 workspace：审计的边界（轮数、每 agent 步数、并发）是"这次评审产出了什么"的一部分，
-   * 让调用方随手改会让两个请求看起来一样、结果却不同——而任务指纹正是按请求字段算的。
+   * 每次审计可覆盖少量有界模型参数；这些值随请求保存并纳入任务指纹。
    *
    * `force` 是**这个入口必须有**的：任务指纹只由 workspace 决定，所以一个项目跑过第一次之后，
    * 之后的每一次提交都命中同一个指纹。上一次是 succeeded 时网关会重跑，但上一次是 **failed /
    * canceled** 时它回 409 并要求 `?force=true` —— 没有这个开关，界面上那个项目就永远提交不了，
    * 而页面上那句"要重新跑请到任务页用「重新运行」"指向的是一个不存在的按钮。
    */
-  submitAudit: (body: { workspace: string }, options: { force?: boolean } = {}) =>
+  submitAudit: (body: { workspace: string; audit_options?: AuditTuning }, options: { force?: boolean } = {}) =>
     request<JobAccepted | Job>(
       "/v1/audit" + (options.force ? "?force=true" : ""),
       {
@@ -215,6 +217,16 @@ export const api = {
     request<AuditReport>(`/v1/audit/${encodeURIComponent(jobId)}/report`),
 
   settings: () => request<SettingsView>("/v1/settings"),
+
+  aiConfig: () => request<LLMConfig>("/v1/ai/config"),
+
+  updateAIConfig: (body: LLMConfigUpdate) => request<LLMConfig>("/v1/ai/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  }),
+
+  resetAIConfig: () => request<LLMConfig>("/v1/ai/config", { method: "DELETE" }),
 
   // ── 项目：从仓库拉取或上传压缩包 ────────────────────────────────────────
 

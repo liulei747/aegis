@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from aegis_contracts.domain import AnalysisBundleManifest
+from aegis_contracts.jobs import AuditOptions
 from aegis_core.config import BudgetConfig
 
 
@@ -69,15 +70,11 @@ class ScanRequest(BaseModel):
 class AuditRequest(BaseModel):
     """Ask the agent harness to review a whole repository.
 
-    Only `workspace` is required, and only `workspace` is accepted: the harness bounds
-    (`max_rounds`, `steps_per_agent`, concurrency) are deliberately *not* per-request fields.
-    They are part of what the review produces, so letting a caller vary them would make two
-    requests for the same repository look identical while producing different findings -- and the
-    job fingerprint, which is how a resubmission attaches instead of running twice, is built from
-    exactly the fields here.
+    Optional, bounded audit controls are stored in the job and included in its fingerprint.
     """
 
     workspace: str = Field(description="Repo path inside the container/workspace, e.g. /data/projects/x.")
+    audit_options: AuditOptions | None = None
 
 
 class LspProbeResponse(BaseModel):

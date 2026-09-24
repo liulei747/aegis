@@ -417,10 +417,10 @@ def test_an_unparseable_answer_is_fed_back_then_stops_with_error(fake_tools, tmp
 
     assert run.stop_reason == "error"
     assert len(run.steps) == 2
-    # The parse error is fed back verbatim, which is what gives the model a chance to fix *this*
-    # mistake rather than guess.
+    # The repair request includes the parse error and does not spend an investigation turn.
     second_user = client.counter.calls[1][2]
-    assert "could not be used" in second_user
+    assert "invalid JSON" in second_user
+    assert "原文片段：I am not going to answer in JSON." in second_user
 
 
 def test_a_tool_outside_the_allow_list_is_refused_without_raising(fake_tools, tmp_path: Path) -> None:
@@ -3942,7 +3942,9 @@ def test_a_truncated_batch_of_calls_is_salvaged_instead_of_lost() -> None:
     assert error is None
     assert parsed is not None and len(parsed["calls"]) == 2
     assert [call["arguments"]["text"] for call in parsed["calls"]] == ["first", "second"]
-    assert "截断" in salvage and "2" in salvage
+    assert "JSON 不完整" in salvage and "2" in salvage
+    _, _, limited_note = _parse_turn(answer, output_limited=True)
+    assert "供应商输出上限" in limited_note
     assert "text" in salvage, "the feedback has to say what to do differently"
 
     # Braces inside strings must not be mistaken for structure.
@@ -3986,7 +3988,7 @@ def test_a_truncated_final_is_recovered_and_not_thrown_away() -> None:
     assert parsed["final"]["verdict"] == "confirmed"
     assert parsed["final"]["confidence"] == 0.8
     assert parsed["final"]["reasons"] == ["the sink is reachable"]
-    assert "截断" in note and "短" in note, "the retry has to be told to answer shorter"
+    assert "JSON 不完整" in note and "短" in note, "the retry has to be told to answer shorter"
 
     # Nested structure is closed all the way out, and the newest value boundary wins.
     nested = (
@@ -4035,7 +4037,7 @@ def test_a_truncated_bare_batch_answer_still_yields_the_verdicts_that_were_writt
     )
     assert batch.verdicts[0].verdict is VerdictKind.CONFIRMED
     assert batch.verdicts[1].verdict is VerdictKind.REJECTED
-    assert "截断" in note
+    assert "JSON 不完整" in note
 
     # Without a schema there is no way to tell the answer from its envelope, so the bare fallback is
     # not offered -- otherwise `{"thought": "t"}` would be accepted as a stage's answer.
@@ -4099,3 +4101,30 @@ def test_the_provider_s_own_truncation_word_reaches_the_model() -> None:
     assert truncated(result({"choices": [{"stop_reason": "max_output_tokens"}]})) is True
     assert truncated(result({})) is False
     assert finish_reason(result({"choices": [{"finish_reason": "length"}]})) == "length"
+
+
+def test_malformed_json_is_repaired_without_spending_an_investigation_turn() -> None:
+    from services.ai.client import ChatResult
+    from services.harness.react import run_agent
+
+    class Scripted:
+        model = "scripted"
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def complete(self, system: str, user: str) -> ChatResult:
+            self.messages.append(user)
+            answer = ('{"thought":"t","final":{"answer":"ok"}}' if len(self.messages) == 2
+                      else '{"thought":"unfinished","final":')
+            return ChatResult(text=answer, model=self.model,
+                              raw={"choices": [{"finish_reason": "stop"}]})
+
+    client = Scripted()
+    run = run_agent(agent="test", scope_id="x", system_prompt="s", task="t", tools=[],
+                    context=None, client=client, max_steps=1,
+                    output_schema={"required": ["answer"]})
+    assert run.stop_reason == "finished" and run.output == {"answer": "ok"}
+    assert len(client.messages) == 2
+    assert "Correct its format now" in client.messages[1]
+    assert any("finish_reason=stop" in step.thought for step in run.steps)

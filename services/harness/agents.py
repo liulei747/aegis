@@ -510,6 +510,8 @@ Each row must be a JSON object with at least `name`, `file`, `line`, `evidence`,
 empty list only after checking that category. Read code/manifests to close gaps in Recon; do not copy
 generic threats as facts. `coverage_gaps` must state anything you could not enumerate. This inventory
 is planning context, not a vulnerability list: do not claim exploitability or emit candidates.
+If the task names recovery sections, enumerate only those sections and leave the other arrays empty;
+the harness will merge the focused results with the earlier partial answer.
 Output only the JSON object described by the schema.
 """
 

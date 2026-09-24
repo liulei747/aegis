@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from aegis_contracts.jobs import (
+    AuditOptions,
     FailureMode,
     JobKind,
     JobRequest,
@@ -399,8 +400,8 @@ def test_an_ai_job_reports_the_ai_stage_while_it_runs(
 # --- the audit job -----------------------------------------------------
 
 
-def _audit_job(job_store, workspace: Path):
-    request = JobRequest(workspace=str(workspace), lsp=False)
+def _audit_job(job_store, workspace: Path, *, audit_options: AuditOptions | None = None):
+    request = JobRequest(workspace=str(workspace), lsp=False, audit_options=audit_options)
     return job_store.create(job_store.new_submission(request, kind=JobKind.AUDIT))[0]
 
 
@@ -418,12 +419,20 @@ def test_an_audit_job_runs_the_harness_under_the_shared_work_dir(
     The coordinator is stubbed here on purpose: whether the *review* works is the orchestration
     suite's question. This test is about the job plumbing around it.
     """
+    from aegis_core.ai_runtime import AISettingsUpdate, save_ai
     from services.harness import blackboard as bb
     from services.harness import trail as trail_mod
     from services.harness.coordinator import HarnessResult
 
     settings = _settings(tmp_path, queue_settings)
-    job = _audit_job(job_store, workspace)
+    save_ai(settings, AISettingsUpdate(
+        enabled=True, base_url="https://provider.example/v1", model="saved-model",
+        api_key="saved-secret", concurrency=3,
+    ))
+    job = _audit_job(job_store, workspace, audit_options=AuditOptions(
+        concurrency=2, max_tokens=0, steps_per_agent=12, timeout_s=240,
+        temperature=0.2, max_rounds=2,
+    ))
     captured: dict = {}
 
     class StubCoordinator:
@@ -459,9 +468,11 @@ def test_an_audit_job_runs_the_harness_under_the_shared_work_dir(
     monkeypatch.setattr(
         "services.harness.coordinator.HarnessCoordinator", StubCoordinator
     )
-    monkeypatch.setattr(
-        "services.ai.runner.client_from", lambda config, **kw: object()
-    )
+    def fake_client_from(config, **_kwargs):
+        captured["ai_config"] = config
+        return object()
+
+    monkeypatch.setattr("services.ai.runner.client_from", fake_client_from)
 
     _worker(job_store, job_stream, settings).handle(_entry(job))
 
@@ -471,6 +482,14 @@ def test_an_audit_job_runs_the_harness_under_the_shared_work_dir(
     assert captured["out_dir"] == settings.work_dir / "audit"
     assert captured["run_id"] == job.job_id
     assert captured["workspace"] == workspace
+    assert captured["config"].concurrency == 2
+    assert captured["config"].steps_per_agent == 12
+    assert captured["config"].max_rounds == 2
+    assert captured["ai_config"].max_tokens == 0
+    assert captured["ai_config"].timeout_s == 240
+    assert captured["ai_config"].temperature == 0.2
+    assert captured["ai_config"].model == "saved-model"
+    assert captured["ai_config"].api_key.get_secret_value() == "saved-secret"
     # 2. the coordinator polls the worker's own abort predicate
     assert captured["abort"] is not None
     # 3. the trail reached the job record

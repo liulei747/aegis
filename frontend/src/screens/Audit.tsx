@@ -19,6 +19,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, previousAttempt, type ApiError } from "../api/client.ts";
+import { loadAuditTuning, saveAuditTuning, type AuditTuning } from "../auditTuning.ts";
 import type {
   AuditEvent,
   AuditReport,
@@ -45,6 +46,7 @@ import { formatCount, formatDurationMs, formatTimestamp } from "../format.ts";
 import { JOB_KIND, label } from "../labels.ts";
 import { ProjectFacts, ProjectSelect, useProjectChoice } from "./ProjectPicker.tsx";
 import { AuditBlackboard, AuditTasks } from "./AuditTasks.tsx";
+import { AuditTuningEditor } from "./AuditTuningEditor.tsx";
 
 /** 对话流最多渲染多少条。过滤器仍然作用于全部，截断的是 DOM，不是事实。 */
 const DIALOGUE_LIMIT = 300;
@@ -122,6 +124,7 @@ function SubmitPanel({
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<ApiError | null>(null);
   const [accepted, setAccepted] = useState<string | null>(null);
+  const [tuning, setTuning] = useState<AuditTuning>(loadAuditTuning);
   // 上一次尝试是 failed / canceled 时，网关会拒绝同指纹的再次提交（409），除非带 `?force=true`。
   // 那不是死胡同，所以单独记下来给一个按钮 —— 只显示一句错误的话，这个项目在界面上就永远跑不了。
   //
@@ -130,7 +133,9 @@ function SubmitPanel({
   // 选中项消失还会退回默认值），用户改一下下拉框、或某次轮询恰好把列表换了个序，
   // 「重新运行这个项目」就会带着 `?force=true` 打到**另一个**项目上 —— 而_FORCE_对一个已成功的
   // 项目意味着归档它上一次的结果再整个重跑。
-  const [previous, setPrevious] = useState<{ jobId: string; state: string; workspace: string } | null>(
+  const [previous, setPrevious] = useState<{
+    jobId: string; state: string; workspace: string; tuning: AuditTuning;
+  } | null>(
     null,
   );
 
@@ -138,20 +143,28 @@ function SubmitPanel({
   const running = recent.filter((job) => job.state === "running" || job.state === "queued");
 
   /** 提交一次审计。409 时把**这次请求用的 workspace** 和拒绝信息一起记下，供恢复按钮原样重发。 */
-  const runAudit = async (workspace: string, options: { force?: boolean } = {}) => {
+  const runAudit = async (
+    workspace: string,
+    options: { force?: boolean; tuning?: AuditTuning } = {},
+  ) => {
+    const selectedTuning = options.tuning ?? tuning;
     setFailure(null);
     setAccepted(null);
     setPrevious(null);
     setBusy(true);
     try {
-      const result = await api.submitAudit({ workspace }, options);
+      const result = await api.submitAudit(
+        { workspace, ...(Object.keys(selectedTuning).length ? { audit_options: selectedTuning } : {}) },
+        { force: options.force },
+      );
+      saveAuditTuning(selectedTuning);
       setAccepted(result.job_id);
       onSubmitted(result.job_id);
     } catch (caught) {
       const error = caught as ApiError;
       setFailure(error);
       const attempt = previousAttempt(error);
-      if (attempt !== null) setPrevious({ ...attempt, workspace });
+      if (attempt !== null) setPrevious({ ...attempt, workspace, tuning: selectedTuning });
     } finally {
       setBusy(false);
     }
@@ -192,7 +205,7 @@ function SubmitPanel({
           <button
             type="button"
             disabled={busy}
-            onClick={() => void runAudit(previous.workspace, { force: true })}
+            onClick={() => void runAudit(previous.workspace, { force: true, tuning: previous.tuning })}
           >
             重新运行这个项目
           </button>
@@ -223,6 +236,9 @@ function SubmitPanel({
           </button>
         </div>
         <ProjectFacts choice={choice} />
+        <h3>本次审计参数</h3>
+        <p className="muted">留空使用部署默认值；这里的选择会随任务保存，并作为下次审计的浏览器默认值。</p>
+        <AuditTuningEditor value={tuning} onChange={setTuning} />
         <p className="muted">
           同一个项目的重复提交会挂到已经在跑的那个任务上，不会跑第二遍。上一次是失败或被取消时，
           提交会被<strong>先拒一次</strong>并给出「重新运行」—— 那种情况下不会自动重试，

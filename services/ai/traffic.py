@@ -87,6 +87,7 @@ def record(
     prompt_chars: int = 0,
     answer_chars: int = 0,
     usage: Any = None,
+    finish_reason: str | None = None,
     error: str | None = None,
     path: Path | None = None,
 ) -> dict | None:
@@ -111,6 +112,7 @@ def record(
         "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage is not None else None,
         "completion_tokens": getattr(usage, "completion_tokens", None) if usage is not None else None,
         "cached_tokens": getattr(usage, "cached_tokens", None) if usage is not None else None,
+        "finish_reason": _clip(finish_reason, 80) if finish_reason else None,
         "error": _clip(error) if error else None,
     }
     target = path or traffic_path()

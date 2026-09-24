@@ -16,6 +16,7 @@ Skipped when Node is unavailable, so a Python-only checkout still runs everythin
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,8 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("npm") is None or not (FRONTEND / "node_modules").is_dir(),
-    reason="the front-end needs `npm install` in frontend/ first",
+    shutil.which("npm") is None or shutil.which("node") is None
+    or not (FRONTEND / "node_modules").is_dir(),
+    reason="the front-end needs Node and `npm install` in frontend/ first",
 )
 
 
@@ -61,6 +63,24 @@ def _run(*args: str, timeout: int = 900) -> subprocess.CompletedProcess:
     )
 
 
+def _node(script: Path, *args: str, timeout: int = 900) -> subprocess.CompletedProcess:
+    """Run an installed package's JS entry point without host-specific `.bin` shims.
+
+    A Windows checkout bind-mounted into a Linux test container carries `.bin/tsc`
+    wrappers that invoke `node.exe`; the package entry points work on both hosts.
+    """
+    return subprocess.run(
+        [shutil.which("node") or "node", str(script), *args],
+        cwd=FRONTEND,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+
+
 def test_the_frontend_tests_pass() -> None:
     """The HTTP contract test and the arithmetic checks.
 
@@ -80,8 +100,16 @@ def test_the_frontend_typechecks_and_builds() -> None:
     resolution problem, and building alone (`vite build`) skips type errors, because Vite
     strips types without checking them.
     """
-    result = _run("run", "build")
-    assert result.returncode == 0, result.stdout + result.stderr
+    typecheck = _node(FRONTEND / "node_modules/typescript/bin/tsc", "--noEmit")
+    assert typecheck.returncode == 0, typecheck.stdout + typecheck.stderr
+    # A bind-mounted Windows installation has only Rollup's Windows native package.
+    # The Linux image's own `npm ci && npm run build` is verified by Docker build.
+    if (os.name != "nt"
+            and (FRONTEND / "node_modules/@rollup/rollup-win32-x64-msvc").is_dir()
+            and not (FRONTEND / "node_modules/@rollup/rollup-linux-x64-gnu").is_dir()):
+        pytest.skip("Windows node_modules mounted into Linux; Docker image builds frontend")
+    build = _node(FRONTEND / "node_modules/vite/bin/vite.js", "build")
+    assert build.returncode == 0, build.stdout + build.stderr
 
     dist = FRONTEND / "dist"
     assert (dist / "index.html").is_file(), "the build produced no index.html"

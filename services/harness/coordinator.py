@@ -1148,8 +1148,40 @@ class HarnessCoordinator:
                 % (outcome.error or "no answer")
             )
             return
-        bb.set_security_inventory(self.blackboard, outcome.parsed)
         inventory: agents.SecurityInventory = outcome.parsed
+        if outcome.run.salvaged:
+            # A repaired final can contain the first rows of a list but lose its tail. Asking the
+            # same large question again tends to hit the same limit, so repair in three small parts.
+            sections = (
+                ("entry_points", "authorization_controls"),
+                ("dangerous_capabilities", "configurations"),
+                ("dependencies", "state_controls"),
+            )
+            merged = inventory.model_dump()
+            for group in sections:
+                focused = self._agent(
+                    agent=agents.SECURITY_INVENTORY,
+                    scope_id="workspace:repair:" + ":".join(group),
+                    task=agents.security_inventory_task(self.blackboard)
+                    + "\nRecovery sections: " + ", ".join(group)
+                    + ". Check these sections fully; return empty arrays for all other sections."
+                    + " Keep each row concise and put uncertainty in coverage_gaps.",
+                    context=self.context,
+                    client=self.client,
+                    max_steps=self.config.steps_per_agent,
+                    blackboard=self.blackboard,
+                )
+                if focused.parsed is None:
+                    merged["coverage_gaps"].append(
+                        "安全清单分段补全失败：" + ", ".join(group)
+                    )
+                    continue
+                for name in (*group, "coverage_gaps", "files_reviewed", "notes"):
+                    for item in getattr(focused.parsed, name):
+                        if item not in merged[name]:
+                            merged[name].append(item)
+            inventory = agents.SecurityInventory.model_validate(merged)
+        bb.set_security_inventory(self.blackboard, inventory)
         counts = {
             name: len(getattr(inventory, name) or [])
             for name in (

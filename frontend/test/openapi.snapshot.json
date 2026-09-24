@@ -9,7 +9,7 @@
     "/health": {
       "get": {
         "summary": "Health",
-        "description": "Report the scanner that will actually be used.\n\nWhen scanning is delegated, the local binary is irrelevant, so the remote\nservice is probed instead — otherwise this endpoint answers a question nobody\nasked and hides an unreachable scan service behind a stale local version.",
+        "description": "Report the scanner that will actually be used.\n\nWhen scanning is delegated, the local binary is irrelevant, so the remote\nservice is probed instead \u2014 otherwise this endpoint answers a question nobody\nasked and hides an unreachable scan service behind a stale local version.",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -28,7 +28,7 @@
     "/v1/settings": {
       "get": {
         "summary": "Settings View",
-        "description": "The effective configuration, read-only.\n\nEvery value here comes from an environment variable, so there is nothing to write back: the\nhonest answer to \"can I change this?\" is that it is a redeploy, and a PUT route would either\nlie or mutate a process-local copy that the next request re-reads from the environment.\n\nThe AI credential is the one field with a rule of its own. The *name* of the variable is part\nof the configuration a caller needs in order to diagnose \"the stage is enabled but has no\nkey\"; the key's *value* is not configuration and never appears -- not here, not in `/health`,\nnot in a bundle. `api_key_present` carries the only part a caller can act on.",
+        "description": "Effective configuration, with the LLM secret redacted.",
         "operationId": "settings_view_v1_settings_get",
         "responses": {
           "200": {
@@ -39,6 +39,84 @@
                   "additionalProperties": true,
                   "type": "object",
                   "title": "Response Settings View V1 Settings Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/ai/config": {
+      "get": {
+        "summary": "Read Ai Config",
+        "description": "Redacted effective LLM configuration. Never serialize the saved API key.",
+        "operationId": "read_ai_config_v1_ai_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Read Ai Config V1 Ai Config Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Write Ai Config",
+        "description": "Local-console write. The shared work directory makes new worker jobs see it.",
+        "operationId": "write_ai_config_v1_ai_config_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AISettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Write Ai Config V1 Ai Config Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Reset Ai Config",
+        "operationId": "reset_ai_config_v1_ai_config_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Reset Ai Config V1 Ai Config Delete"
                 }
               }
             }
@@ -1455,6 +1533,128 @@
   },
   "components": {
     "schemas": {
+      "AISettingsUpdate": {
+        "properties": {
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Base Url"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "timeout_s": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 600.0,
+                "minimum": 10.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout S"
+          },
+          "concurrency": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 16.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Concurrency"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 200000.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
+          },
+          "max_contexts": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 500.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Contexts"
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "password",
+                "writeOnly": true
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "clear_api_key": {
+            "type": "boolean",
+            "title": "Clear Api Key",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "AISettingsUpdate"
+      },
       "AnalysisBundleManifest": {
         "properties": {
           "schema_version": {
@@ -1755,12 +1955,107 @@
         ],
         "title": "AssembleResponse"
       },
+      "AuditOptions": {
+        "properties": {
+          "concurrency": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 8.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Concurrency"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 32768.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
+          },
+          "steps_per_agent": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 16.0,
+                "minimum": 4.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steps Per Agent"
+          },
+          "timeout_s": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 600.0,
+                "minimum": 30.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout S"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "max_rounds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 5.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Rounds"
+          }
+        },
+        "type": "object",
+        "title": "AuditOptions",
+        "description": "Bounded, persisted controls for one audit attempt."
+      },
       "AuditRequest": {
         "properties": {
           "workspace": {
             "type": "string",
             "title": "Workspace",
             "description": "Repo path inside the container/workspace, e.g. /data/projects/x."
+          },
+          "audit_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -1768,7 +2063,7 @@
           "workspace"
         ],
         "title": "AuditRequest",
-        "description": "Ask the agent harness to review a whole repository.\n\nOnly `workspace` is required, and only `workspace` is accepted: the harness bounds\n(`max_rounds`, `steps_per_agent`, concurrency) are deliberately *not* per-request fields.\nThey are part of what the review produces, so letting a caller vary them would make two\nrequests for the same repository look identical while producing different findings -- and the\njob fingerprint, which is how a resubmission attaches instead of running twice, is built from\nexactly the fields here."
+        "description": "Ask the agent harness to review a whole repository.\n\nOptional, bounded audit controls are stored in the job and included in its fingerprint."
       },
       "Body_assemble_upload_v1_assemble_upload_post": {
         "properties": {
@@ -1835,7 +2130,7 @@
             "type": "string",
             "contentMediaType": "application/octet-stream",
             "title": "File",
-            "description": "源码压缩包（.zip）"
+            "description": "\u6e90\u7801\u538b\u7f29\u5305\uff08.zip\uff09"
           },
           "name": {
             "anyOf": [
@@ -1864,7 +2159,7 @@
         "properties": {
           "max_depth": {
             "type": "integer",
-            "maximum": 6.0,
+            "maximum": 8.0,
             "minimum": 0.0,
             "title": "Max Depth",
             "description": "How many call-graph hops from the sink.",
@@ -2735,6 +3030,16 @@
               }
             ],
             "title": "Bundle Id"
+          },
+          "audit_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuditOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
