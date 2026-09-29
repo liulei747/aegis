@@ -188,6 +188,7 @@ def test_llm_config_is_saved_for_new_jobs_without_returning_the_key(
     response = client.put("/v1/ai/config", json={
         "enabled": True, "base_url": "https://provider.example/v1", "model": "model-new",
         "api_key": "secret-from-browser", "max_tokens": 0, "timeout_s": 240,
+        "streaming": True, "connect_timeout_s": 25, "stream_idle_timeout_s": 120, "stream_total_timeout_s": 800,
     }, headers={"Origin": "http://127.0.0.1:8102"})
     assert response.status_code == 200, response.text
     assert response.json()["api_key_present"] is True
@@ -197,6 +198,11 @@ def test_llm_config_is_saved_for_new_jobs_without_returning_the_key(
     config = effective_ai(get_settings())
     assert config.model == "model-new"
     assert config.max_tokens == 0
+    live_client = client_from(config)
+    assert live_client.streaming
+    assert live_client.connect_timeout_s == 25
+    assert live_client.stream_idle_timeout_s == 120
+    assert live_client.stream_total_timeout_s == 800
     assert client_from(config).api_key == "secret-from-browser"
     rejected = client.put("/v1/ai/config", json={"model": "hostile"},
                           headers={"Origin": "https://outside.example"})

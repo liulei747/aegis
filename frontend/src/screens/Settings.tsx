@@ -23,8 +23,8 @@ function Section({ title, values }: { title: string; values: Record<string, unkn
 }
 
 function editable(config: LLMConfig): LLMConfigUpdate {
-  const { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts } = config;
-  return { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts };
+  const { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts, streaming, connect_timeout_s, stream_idle_timeout_s, stream_total_timeout_s } = config;
+  return { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts, streaming: streaming ?? false, connect_timeout_s: connect_timeout_s ?? 30, stream_idle_timeout_s: stream_idle_timeout_s ?? 180, stream_total_timeout_s: stream_total_timeout_s ?? 900 };
 }
 
 export function SettingsScreen() {
@@ -103,8 +103,19 @@ export function SettingsScreen() {
             <label>API 密钥<input type="password" autoComplete="new-password" value={keyInput} disabled={clearKey}
               placeholder={llm.data.api_key_present ? "已配置；留空保持原值" : "输入 API 密钥"}
               onChange={e => setKeyInput(e.target.value)} /></label>
-            <label>请求超时（秒）<input type="number" min="10" max="600" required value={form.timeout_s}
+            <label>{form.streaming ? "首事件等待（秒）" : "请求超时（秒）"}<input type="number" min="10" max="600" required value={form.timeout_s}
               onChange={e => setForm({ ...form, timeout_s: Number(e.target.value) })} /></label>
+            <label>响应接收方式<select value={String(form.streaming)} onChange={e => setForm({ ...form, streaming: e.target.value === "true" })}>
+              <option value="false">非流式（兼容旧配置）</option><option value="true">流式（适合长推理）</option>
+            </select></label>
+            {form.streaming ? <>
+              <label>连接超时（秒）<input type="number" min="1" max="120" required value={form.connect_timeout_s}
+                onChange={e => setForm({ ...form, connect_timeout_s: Number(e.target.value) })} /></label>
+              <label>无生成进度超时（秒）<input type="number" min="10" max="600" required value={form.stream_idle_timeout_s}
+                onChange={e => setForm({ ...form, stream_idle_timeout_s: Number(e.target.value) })} /></label>
+              <label>单次调用总时长上限（秒）<input type="number" min="30" max="3600" required value={form.stream_total_timeout_s}
+                onChange={e => setForm({ ...form, stream_total_timeout_s: Number(e.target.value) })} /></label>
+            </> : null}
             <label>并发数<input type="number" min="1" max="16" required value={form.concurrency}
               onChange={e => setForm({ ...form, concurrency: Number(e.target.value) })} /></label>
             <label>输出 Token 上限（0 为服务商决定）<input type="number" min="0" max="200000" required value={form.max_tokens}

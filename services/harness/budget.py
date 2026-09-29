@@ -61,6 +61,14 @@ class RunBudget:
             if self.reason:
                 raise BudgetStop(self.reason)
 
+    def check_inflight(self):
+        # A reserved call may finish even when it used the last available call slot.
+        with self.lock:
+            cap = self.config.max_run_seconds
+            if cap > 0 and self.clock() - self.started >= cap:
+                self.reason = "总时间预算耗尽"
+                raise BudgetStop(self.reason)
+
     def reserve(self):
         with self.lock:
             self.check()
@@ -97,8 +105,9 @@ class RunBudget:
 
 
 class BudgetClient:
-    def __init__(self, client, budget, check):
+    def __init__(self, client, budget, check, on_progress=None):
         self.client, self.budget, self.check = client, budget, check
+        self.on_progress = on_progress
 
     def __getattr__(self, name):
         return getattr(self.client, name)
@@ -107,8 +116,12 @@ class BudgetClient:
         self.check("model-call")
         self.budget.reserve()
         try:
-            response = self.client.complete(system, user)
-        except Exception:
+            from services.ai.client import ChatClient
+            if isinstance(self.client, ChatClient):
+                response = self.client.complete(system, user, check=self.check, on_progress=self.on_progress)
+            else:
+                response = self.client.complete(system, user)
+        except BaseException:
             self.budget.account(None)
             raise
         self.budget.account(response)

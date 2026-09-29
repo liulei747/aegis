@@ -191,3 +191,14 @@ test("agent 名单来自出现过的事件，不靠硬编码", () => {
     ["discovery", "validation"],
   );
 });
+
+
+test("流式进度不增加工具步数，结束状态仍以 agent_end 为准", () => {
+  const rows = agentRows([
+    event(1, "agent_start", { run_id: "r", agent: "recon" }),
+    event(2, "model_progress", { run_id: "r", status: "reasoning", elapsed_ms: 240000, content_chars: 0, idle_ms: 500 }),
+  ]);
+  assert.equal(rows[0]!.state, "running");
+  assert.equal(rows[0]!.steps, 0);
+  assert.match(rows[0]!.progress ?? "", /推理中.*240 秒/);
+});

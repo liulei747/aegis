@@ -16,7 +16,8 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 from aegis_core.config import AIConfig, Settings
 
 _FIELDS = frozenset({"enabled", "base_url", "model", "timeout_s", "concurrency",
-                     "temperature", "max_tokens", "max_contexts"})
+                     "temperature", "max_tokens", "max_contexts", "streaming",
+                     "connect_timeout_s", "stream_idle_timeout_s", "stream_total_timeout_s"})
 
 
 class AISettingsUpdate(BaseModel):
@@ -24,6 +25,10 @@ class AISettingsUpdate(BaseModel):
     base_url: str | None = None
     model: str | None = None
     timeout_s: float | None = Field(default=None, ge=10, le=600)
+    streaming: bool | None = None
+    connect_timeout_s: float | None = Field(default=None, ge=1, le=120)
+    stream_idle_timeout_s: float | None = Field(default=None, ge=10, le=600)
+    stream_total_timeout_s: float | None = Field(default=None, ge=30, le=3600)
     concurrency: int | None = Field(default=None, ge=1, le=16)
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, ge=0, le=200_000)
@@ -72,6 +77,10 @@ def ai_view(settings: Settings) -> dict:
         "base_url": config.base_url,
         "model": config.model,
         "timeout_s": config.timeout_s,
+        "streaming": config.streaming,
+        "connect_timeout_s": config.connect_timeout_s,
+        "stream_idle_timeout_s": config.stream_idle_timeout_s,
+        "stream_total_timeout_s": config.stream_total_timeout_s,
         "concurrency": config.concurrency,
         "temperature": config.temperature,
         "max_tokens": config.max_tokens,

@@ -127,6 +127,10 @@ class ChatClient:
         temperature: float = 0.0,
         timeout_s: float = 180.0,
         max_tokens: int = 0,
+        streaming: bool = False,
+        connect_timeout_s: float = 30.0,
+        stream_idle_timeout_s: float = 180.0,
+        stream_total_timeout_s: float = 900.0,
         transport: Transport = urllib_transport,
     ) -> None:
         if not base_url.strip():
@@ -144,12 +148,16 @@ class ChatClient:
         #: behaviour: the provider's default applies, and the harness cannot say what it is.
         self.max_tokens = max_tokens
         self._transport = transport
+        self.streaming = streaming
+        self.connect_timeout_s = connect_timeout_s
+        self.stream_idle_timeout_s = stream_idle_timeout_s
+        self.stream_total_timeout_s = stream_total_timeout_s
 
     @property
     def url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
-    def complete(self, system: str, user: str) -> ChatResult:
+    def complete(self, system: str, user: str, *, on_progress=None, check=None) -> ChatResult:
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": self.temperature,
@@ -160,7 +168,16 @@ class ChatClient:
         }
         if self.max_tokens > 0:
             payload["max_tokens"] = self.max_tokens
-        body = self._transport(self.url, payload, self.api_key, self.timeout_s)
+        transport = self._transport
+        if self.streaming and transport is urllib_transport:
+            from services.ai.streaming import StreamingChatTransport
+            transport = StreamingChatTransport(
+                connect_timeout_s=self.connect_timeout_s,
+                idle_timeout_s=self.stream_idle_timeout_s,
+                total_timeout_s=self.stream_total_timeout_s,
+                on_progress=on_progress, check=check,
+            )
+        body = transport(self.url, payload, self.api_key, self.timeout_s)
         choices = body.get("choices") or []
         if not choices:
             raise AIError(f"no choices in the response: {json.dumps(body)[:400]}")

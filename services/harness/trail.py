@@ -48,6 +48,7 @@ EVENT_KINDS: tuple[str, ...] = (
     "stage",  # a coordinator stage started or finished
     "agent_start",  # one agent run began (which agent, which scope, which task)
     "agent_step",  # one turn: thought + tool call + arguments + tool result
+    "model_progress",  # counters only; never raw model reasoning
     "agent_end",  # one agent run finished, with its stop reason and step count
     "candidate",  # a discovery result was appended to the ledger
     "verdict",  # a candidate got its decision

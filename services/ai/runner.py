@@ -66,6 +66,10 @@ def client_from(config: AIConfig, *, transport=None) -> ChatClient:
         temperature=config.temperature,
         timeout_s=config.timeout_s,
         max_tokens=config.max_tokens,
+        streaming=config.streaming,
+        connect_timeout_s=config.connect_timeout_s,
+        stream_idle_timeout_s=config.stream_idle_timeout_s,
+        stream_total_timeout_s=config.stream_total_timeout_s,
         **extra,
     )
 
@@ -96,8 +100,9 @@ def call_with_retries(client: ChatClient, context_id: str | None, system: str, u
                 duration_ms=(time.monotonic() - attempt_started) * 1000,
                 prompt_chars=len(system) + len(user),
                 error=f"{type(exc).__name__}: {exc}",
+                stream_metadata=getattr(exc, "metadata", None),
             )
-            if isinstance(exc, AIUnavailable) and attempt < MAX_ATTEMPTS:
+            if isinstance(exc, AIUnavailable) and attempt < MAX_ATTEMPTS and getattr(exc, "retryable", True):
                 log.warning("ai: call for %s failed (%s); retrying", context_id, exc)
                 time.sleep(min(2.0 * attempt, 8.0))
                 continue
@@ -123,6 +128,7 @@ def call_with_retries(client: ChatClient, context_id: str | None, system: str, u
         answer_chars=len(result.text or ""),
         usage=result.usage,
         finish_reason=finish_reason(result),
+        stream_metadata=result.raw.get("stream_metadata"),
     )
     verdict, error, missing = parse_verdict(result.text)
     return AICall(

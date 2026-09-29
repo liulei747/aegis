@@ -184,6 +184,13 @@ export interface AuditEvent {
   at: string;
   kind: AuditEventKind;
   run_id?: string;
+  status?: string;
+  request_id?: string;
+  elapsed_ms?: number;
+  idle_ms?: number;
+  content_chars?: number;
+  reasoning_chars?: number;
+  failure_code?: string;
   /** 阶段事件：prep / security_inventory / recon / threat_model / plan / discovery / validation / attack_path / findings / close。 */
   stage?: string;
   state?: string;
@@ -241,6 +248,7 @@ export interface AuditEvent {
 
 export type AuditEventKind =
   | "work_item"
+  | "model_progress"
   | "stage"
   | "agent_start"
   | "agent_step"
@@ -331,6 +339,7 @@ export interface AITrafficEntry {
   answer_chars: number;
   prompt_tokens: number | null;
   completion_tokens: number | null;
+  stream?: { request_id?: string; provider_request_id?: string | null; first_event_ms?: number | null; first_content_ms?: number | null; failure_code?: string; reasoning_chars?: number; };
   finish_reason?: string | null;
   cached_tokens: number | null;
   error: string | null;
@@ -674,6 +683,10 @@ export interface LLMConfig {
   base_url: string;
   model: string;
   timeout_s: number;
+  streaming: boolean;
+  connect_timeout_s: number;
+  stream_idle_timeout_s: number;
+  stream_total_timeout_s: number;
   concurrency: number;
   temperature: number;
   max_tokens: number;

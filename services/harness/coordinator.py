@@ -832,7 +832,10 @@ class HarnessCoordinator:
             raise CanceledAbort(stage="ai", resource="harness_stage_boundary",
                                 detail=f"harness stage: {stage}")
         if not self.config.dry_run:
-            self.budget.check()
+            if stage == "model-stream":
+                self.budget.check_inflight()
+            else:
+                self.budget.check()
 
     def _on_step(self, run: AgentRun, step) -> None:
         """One turn of one agent, as an event. This is the agent's side of the conversation."""
@@ -919,7 +922,10 @@ class HarnessCoordinator:
                 self.check_abort(f"{agent}:{scope_id}")
                 client = kwargs.get("client")
                 if client is not None:
-                    kwargs["client"] = BudgetClient(client, self.budget, self.check_abort)
+                    kwargs["client"] = BudgetClient(client, self.budget, self.check_abort,
+                        on_progress=lambda progress: self.trail.emit(
+                            "model_progress", agent=agent, scope=scope_id,
+                            run_id=kwargs.get("run_id") or f"{agent}:{scope_id}", **progress))
                 outcome = agents.run(on_step=self._on_step, **kwargs)
         except BaseException as exc:
             active = getattr(self._current, "active_run", None)

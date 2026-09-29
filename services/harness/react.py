@@ -632,8 +632,9 @@ def _complete_with_retries(
                 client=client, caller=caller, attempt=attempt, ok=False,
                 duration_ms=(time.monotonic() - started) * 1000,
                 prompt_chars=len(system) + len(user), error=f"{type(exc).__name__}: {exc}",
+                stream_metadata=getattr(exc, "metadata", None),
             )
-            if attempt >= MAX_CLIENT_ATTEMPTS:
+            if attempt >= MAX_CLIENT_ATTEMPTS or not getattr(exc, "retryable", True):
                 raise
             time.sleep(min(1.5 * attempt, 8.0))
             continue
@@ -644,20 +645,29 @@ def _complete_with_retries(
                 client=client, caller=caller, attempt=attempt, ok=False,
                 duration_ms=(time.monotonic() - started) * 1000,
                 prompt_chars=len(system) + len(user), error=f"{type(exc).__name__}: {exc}",
+                stream_metadata=getattr(exc, "metadata", None),
             )
+            raise
+        except BaseException as exc:
+            _record_call(client=client, caller=caller, attempt=attempt, ok=False,
+                         duration_ms=(time.monotonic() - started) * 1000,
+                         prompt_chars=len(system) + len(user),
+                         error=f"{type(exc).__name__}: {exc}",
+                         stream_metadata=getattr(exc, "metadata", None))
             raise
         _record_call(
             client=client, caller=caller, attempt=attempt, ok=True,
             duration_ms=(time.monotonic() - started) * 1000,
             prompt_chars=len(system) + len(user), answer_chars=len(result.text or ""),
             usage=getattr(result, "usage", None), finish_reason=finish_reason(result),
+            stream_metadata=getattr(result, "raw", {}).get("stream_metadata"),
         )
         return result
 
 
 def _record_call(*, client, caller: str, attempt: int, ok: bool, duration_ms: float,
                  prompt_chars: int, answer_chars: int = 0, usage=None, error: str | None = None,
-                 finish_reason: str | None = None):
+                 finish_reason: str | None = None, stream_metadata: dict | None = None):
     """Write one row of model traffic. Never raises -- see `services.ai.traffic`."""
     from services.ai import traffic
 
@@ -673,6 +683,7 @@ def _record_call(*, client, caller: str, attempt: int, ok: bool, duration_ms: fl
         answer_chars=answer_chars,
         usage=usage,
         finish_reason=finish_reason,
+        stream_metadata=stream_metadata,
         error=error,
     )
 

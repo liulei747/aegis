@@ -125,7 +125,13 @@ function ModelTrafficPanel({ needle, onlyProblems }: { needle: string; onlyProbl
                 <td className="num">{formatCount(entry.prompt_tokens ?? 0)}</td>
                 <td className="num">{formatCount(entry.completion_tokens ?? 0)}</td>
                 <td className="num">{formatCount(entry.cached_tokens ?? 0)}</td>
-                <td className="note">{entry.finish_reason || "—"}</td>
+                <td className="note">{entry.finish_reason || "—"}{entry.stream ? <details><summary>流式诊断</summary>
+                  <div>首事件：{entry.stream.first_event_ms == null ? "未收到" : formatDurationMs(entry.stream.first_event_ms)}</div>
+                  <div>正文开始：{entry.stream.first_content_ms == null ? "未收到" : formatDurationMs(entry.stream.first_content_ms)}</div>
+                  <div>失败类型：{entry.stream.failure_code ?? "—"}</div>
+                  <div>请求：{entry.stream.request_id ?? "—"}</div>
+                  <div>服务商请求：{entry.stream.provider_request_id ?? "未提供"}</div>
+                </details> : null}</td>
                 <td className={entry.ok ? "ok" : "error"}>{entry.ok ? "成功" : entry.error ?? "失败"}</td>
               </tr>
             ))}

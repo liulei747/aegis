@@ -57,6 +57,10 @@ class AIConfig(BaseModel):
     api_key: SecretStr | None = None
     model: str = ""
     timeout_s: float = Field(default=180.0, gt=0)
+    streaming: bool = False
+    connect_timeout_s: float = Field(default=30.0, ge=1, le=120)
+    stream_idle_timeout_s: float = Field(default=180.0, ge=10, le=600)
+    stream_total_timeout_s: float = Field(default=900.0, ge=30, le=3600)
     #: Calls in flight at once. Defaults to 1 because that is the setting the measurements
     #: support: behind a gateway with a ~60s ceiling, six concurrent calls returned 3 usable
     #: answers and six sequential calls returned 6. Raising it is a deliberate choice to trade

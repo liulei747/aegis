@@ -640,7 +640,7 @@ function RunView({ jobId, onBack, onRestart }: { jobId: string; onBack: () => vo
                   <code>{row.agent}</code>
                 </td>
                 <td className="note">{row.scope}</td>
-                <td>{RUN_STATE_LABEL[row.state] ?? row.state}</td>
+                <td>{RUN_STATE_LABEL[row.state] ?? row.state}{row.progress ? <div className="muted">{row.progress}</div> : null}</td>
                 <td className="num">{formatCount(row.steps)}</td>
                 <td className="num">{formatCount(row.toolCalls)}</td>
                 <td className="note">{row.stopReason ?? "—"}</td>

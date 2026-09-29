@@ -90,6 +90,7 @@ def record(
     finish_reason: str | None = None,
     error: str | None = None,
     path: Path | None = None,
+    stream_metadata: dict | None = None,
 ) -> dict | None:
     """Append one model round trip. Returns the row, or None if recording failed.
 
@@ -115,6 +116,10 @@ def record(
         "finish_reason": _clip(finish_reason, 80) if finish_reason else None,
         "error": _clip(error) if error else None,
     }
+    if stream_metadata:
+        allowed = {"request_id", "provider_request_id", "status", "failure_code", "events",
+                   "content_chars", "reasoning_chars", "first_event_ms", "first_content_ms", "elapsed_ms", "idle_ms"}
+        row["stream"] = {k: v for k, v in stream_metadata.items() if k in allowed}
     target = path or traffic_path()
     try:
         with _lock:

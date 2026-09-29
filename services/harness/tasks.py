@@ -31,6 +31,18 @@ def explain_failure(error: str, stop_reason: str) -> str:
     """
     detail = (error or "").strip()
     lowered = detail.lower()
+    stream_reasons = {
+        "first_event_timeout": "模型未在首事件等待上限内返回数据",
+        "idle_timeout": "模型流已建立，但持续没有有效生成进度",
+        "total_timeout": "模型调用达到总时长上限，任务需缩小范围或调整预算",
+        "stream_incomplete": "模型流提前结束，半截回答未被采用",
+        "stream_disconnected": "模型流连接中断，半截回答未被采用",
+        "stream_unsupported": "接口未返回流式协议，请检查网关或显式选择非流式",
+        "empty_answer": "模型流结束但没有正式回答，可能输出预算被推理耗尽",
+    }
+    for code, explanation in stream_reasons.items():
+        if code in lowered:
+            return f"{explanation}。具体错误：{detail}"
     if "unexpected_eof_while_reading" in lowered or "ssl" in lowered and "eof" in lowered:
         return f"模型服务的 HTTPS/TLS 连接被提前关闭；本任务可重试。具体错误：{detail}"
     if "aiunavailable" in lowered or "model call failed" in lowered:

@@ -92,6 +92,7 @@ export const EVENT_LABEL: Readonly<Record<string, string>> = {
   work_item: "任务更新",
   stage: "阶段",
   agent_start: "开始",
+  model_progress: "模型进度",
   agent_step: "对话",
   agent_end: "结束",
   candidate: "候选",
@@ -146,6 +147,7 @@ export interface AgentRow {
   state: "running" | "finished" | "budget" | "error" | "unknown";
   steps: number;
   toolCalls: number;
+  progress?: string;
   stopReason: string | null;
   startedSeq: number;
   lastSeq: number;
@@ -180,7 +182,12 @@ export function agentRows(events: AuditEvent[]): AgentRow[] {
     const row = runs.get(runId);
     if (!row) continue; // 一个没有 start 的 step：轨迹被截断过，不猜它的归属
     row.lastSeq = event.seq;
+    if (event.kind === "model_progress") {
+      const labels: Record<string, string> = { waiting: "等待响应", reasoning: "推理中", responding: "生成回答", completed: "回答接收完成", failed: "请求失败", cancelled: "已取消", stopped: "已停止" };
+      row.progress = `${labels[event.status ?? ""] ?? event.status ?? "模型调用"} · ${Math.round((event.elapsed_ms ?? 0) / 1000)} 秒 · 正文 ${event.content_chars ?? 0} 字符 · 距生成活动 ${Math.round((event.idle_ms ?? 0) / 1000)} 秒${event.failure_code ? ` · ${event.failure_code}` : ""}`;
+    }
     if (event.kind === "agent_step") {
+      if (event.tool) row.progress = `工具执行完成：${event.tool}`;
       row.steps += 1;
       if (event.tool) row.toolCalls += 1;
     }
