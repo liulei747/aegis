@@ -78,6 +78,14 @@ class AIConfig(BaseModel):
     #: `HarnessConfig.claim_batch_size`: 8192 covers one claim, 16384 covers up to four.
     #: `max_tokens = 0` restores "let the provider decide" for a gateway that rejects the key.
     max_tokens: int = Field(default=16384, ge=0, le=200_000)
+    #: Use the protocol's **native tools/tool_calls** instead of the harness's own JSON-in-text
+    #: protocol. Verified against `glm-5.3-flash` on the configured gateway (2026-09-29):
+    #: `finish_reason="tool_calls"`, a `tool_call_id` round trip via `role:"tool"`, both honoured.
+    #: Off by default because the ReAct loop still runs the text protocol; the native loop exists
+    #: (`react.run_agent_native`) and is exercised by tests, but the default path stays the one the
+    #: whole test suite pins. Native tools are not implemented over streaming yet — asking for both
+    #: raises at the adapter.
+    native_tools: bool = False
     #: Cap on contexts analysed in one run, so a 200-context bundle cannot quietly become 200
     #: paid calls. Whoever raises it is choosing to spend.
     max_contexts: int = Field(default=25, ge=1)

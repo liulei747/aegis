@@ -36,18 +36,26 @@
 
 验收：209 项后端相关测试通过；新增本地真实 socket 关闭及预算边界后，34 项相关测试再次通过。前端 92 项通过、1 项实时网关快照检查跳过，类型检查和生产构建通过；Ruff 通过。这里的持续流超时测试使用缩短的测试时间，不声称本轮重跑了 180 秒以上付费模型请求。
 
-尚未部署 Docker、未做浏览器视觉复验，也未对当前网关进行本轮付费实测。第二至第五批尚未完成，不能把第一批视为整套 Harness 改造完成。
+已于 2026-09-29 提交（`a7f7ebd`）并部署 worker/gateway/frontend（部署前无运行中审计，健康检查通过）。浏览器视觉复验与付费实测仍未做；第二至第五批尚未完成，不能把第一批视为整套 Harness 改造完成。
 
 ## 第二批：工具调用和结构化结果
 
-- [ ] 在模型适配层支持原生 tools/tool_calls，以 tool_call_id 关联调用和结果；先验证当前 GLM/网关实际支持情况。
-- [ ] 为不支持该协议的接口保留显式 legacy 模式，不把格式错误自动当成“不支持”并切换。
-- [ ] 校验完整参数和角色工具白名单后再执行；流式参数未完整到齐前不执行工具。
-- [ ] 保留 read/grep/record/board/dataflow 的现有权限和证据规则；所有有效读取继续计入真实覆盖台账。
-- [ ] 将最终业务结果校验与工具调用解析分开，减少一次大 JSON 同时承担多个职责。
-- [ ] 只对明确可安全并行的工具开放并行；黑板写入等操作保持受控顺序和幂等。
+- [x] 在模型适配层支持原生 tools/tool_calls，以 tool_call_id 关联调用和结果；已实测当前 GLM/网关：`finish_reason="tool_calls"`、`role:"tool"` + `tool_call_id` 往返均被正确处理（`var/probe_native_tools.py`，2026-09-29）。
+- [x] 为不支持该协议的接口保留显式 legacy 模式：`AIConfig.native_tools` 默认关闭；`run_agent` 按客户端能力分发到 `run_agent_native` 或原文本循环，两条路径并存而非自动切换。
+- [x] 校验完整参数和角色工具白名单后再执行：native 循环里参数必须为合法 JSON 对象、工具必须在 allow-list 内，拒绝原因作为该次调用的结果回传给模型；流式与 native 组合在适配层直接拒绝（流式 tool_calls 增量累积属后续批次）。
+- [x] 保留 read/grep/record/board/dataflow 的现有权限和证据规则：native 循环复用同一 `_invoke`、同一 allow-list、同一步骤记录，所有读取继续计入覆盖台账。
+- [x] 将最终业务结果校验与工具调用解析分开：native 循环里 `message.tool_calls` 是结构化解析，`content` 才走 `_parse_turn` 的 final 契约，二者不再挤同一段文本。
+- [ ] 只对明确可安全并行的工具开放并行；黑板写入等操作保持受控顺序和幂等。（当前 native 循环按序执行，尚未开放任何并行）
 - [ ] 前端将工具参数错误、工具执行失败与模型请求失败分别显示，携带具体字段和原因。
-- [ ] 验收：缺参、多工具调用、错误 tool_call_id、重复调用、工具超时与部分失败均有明确处理；旧审计结果可读。
+- [ ] 验收：缺参、多工具调用、错误 tool_call_id、重复调用、工具超时与部分失败均有明确处理；旧审计结果可读。（已覆盖缺参/白名单外工具/多调用顺序；tool_call_id 错配、重复调用、超时分类待补）
+
+### 第二批交付记录（2026-09-29）
+
+- 适配层：`ChatClient.complete_messages(messages, tools=…)`，`ChatResult.tool_calls`（`NativeToolCall(call_id, name, arguments)`），malformed 条目跳过并记日志；`AIConfig.native_tools`（默认 false）→ `ChatClient.native_tools` → `runner.client_from` 传递。
+- 执行层：`react.run_agent_native` —— messages 数组式 transcript（每步 = assistant.tool_calls + role:"tool" 结果，seeded 步骤同样映射），`_parse_turn` 仍裁决 final；`_truncated` 抢救语义与文本协议一致；预算/流量经 `BudgetClient.complete_messages` 同口径记账。
+- 组合约束：native_tools + streaming 在适配层显式拒绝（AIError），不静默丢任一侧。
+- 测试：`tests/test_native_tools.py` 4 项（工具往返与按 id 回填、白名单外拒绝、final 契约不变、流式组合拒绝）；全量后端 782 passed（1 个既有 scan-cancel 环境竞态）。
+- 默认关闭。打开方式：`AEGIS_AI__NATIVE_TOOLS=true`（或设置页后续接入）。尚未做真实审计对照；前端错误分类显示与验收清单剩余项是第二批收尾。
 
 ## 第三批：上下文与预算
 

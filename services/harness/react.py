@@ -404,6 +404,20 @@ def run_agent(
         run.finished_at = _now()
         return run
 
+    # The native tool-calls protocol (batch 2 of HARNESS_RUNTIME_TODO) is a **separate loop**:
+    # `run_agent_native` owns the messages-array transcript (`role:"tool"` follow-ups keyed by
+    # `tool_call_id`) and shares the stage contract through `_parse_turn`. Dispatch here, after
+    # `record`/`finish` exist, and not at the callers, so every stage gets it for free once the
+    # deployment turns the flag on. It carries the same `max_parse_attempts` budget.
+    if getattr(client, "native_tools", False) and hasattr(client, "complete_messages"):
+        return run_agent_native(
+            agent=agent, scope_id=scope_id, system=system, task=task,
+            tools=tools, context=context, client=client, max_steps=max_steps,
+            run_id=run.run_id, output_schema=output_schema,
+            initial_steps=initial_steps, record=record, finish=finish,
+            allowed=allowed, max_parse_attempts=max_parse_attempts,
+        )
+
     def finish_or_spend_salvage(reason: str) -> AgentRun:
         """End the run -- with the truncated `final` if one was held, and say that it was.
 
@@ -1061,3 +1075,232 @@ def used_tool(run: AgentRun, tool: ToolName) -> bool:
 
 def steps_used(run: AgentRun) -> int:
     return len(run.steps)
+
+
+# ─────────────────────── the native tool-calls loop (batch 2)
+
+
+def _to_openai_tools(allowed: list[str]) -> list[dict]:
+    """The callable tools as OpenAI function schemas, for `run_agent_native`'s request."""
+    try:
+        _, _, _, _, schemas = tool_layer()
+    except ToolLayerUnavailable as exc:
+        log.warning("react: native loop without tool schemas (%s)", exc)
+        return []
+    wanted = set(allowed)
+    out = []
+    for schema in schemas():
+        name = _name(schema.get("name") or (schema.get("function") or {}).get("name"))
+        if name in wanted:
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": schema.get("description", ""),
+                    "parameters": schema.get("parameters") or {"type": "object", "properties": {}},
+                },
+            })
+    return out
+
+
+def _native_messages(
+    task: str, system: str, steps: list[AgentStep], allowed: list[str]
+) -> list[dict[str, Any]]:
+    """The run's transcript as a native messages array.
+
+    Every executed step becomes an assistant turn carrying its `tool_calls` plus the matching
+    `role:"tool"` result keyed by `tool_call_id` — the protocol's own way of saying "you called
+    this, here is what came back". Seeded steps (a forced `dataflow_verify`, a scope prefetch)
+    map the same way, which is what lets a native run start from harness-provided facts.
+    Steps without a call (finals, model failures, protocol mistakes) are dropped: a final is
+    re-derived from the last tool answer, and a failure has nothing the model can act on.
+    """
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": task},
+    ]
+    for step in steps:
+        call, result = step.call, step.result
+        if call is None or result is None or result.ok is not True:
+            continue
+        name = _name(call.tool)
+        if name not in allowed:
+            continue
+        call_id = f"call_{step.index:04d}"
+        messages.append({
+            "role": "assistant",
+            "content": step.thought or None,
+            "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": {"name": name, "arguments": json.dumps(call.arguments or {}, ensure_ascii=False)},
+            }],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": (result.summary or "")[:6000],
+        })
+    return messages
+
+
+def run_agent_native(
+    *,
+    agent: str,
+    scope_id: str,
+    system: str,
+    task: str,
+    tools: list[ToolName],
+    context: Any,
+    client: Any,
+    max_steps: int,
+    run_id: str,
+    output_schema: dict | None,
+    initial_steps: list[AgentStep] | None,
+    record: Callable[[AgentStep], None],
+    finish: Callable[..., AgentRun],
+    allowed: list[str],
+    max_parse_attempts: int,
+) -> AgentRun:
+    """The ReAct loop over the **native** tools/tool_calls protocol.
+
+    Same contract as `run_agent`: one `AgentRun` whatever the model did, `_parse_turn` deciding
+    the stage's final answer, the same allow-list and the same `_invoke`. What differs is the
+    transport: tool calls arrive as structured `message.tool_calls` (no JSON-in-text parsing,
+    no per-turn transcript re-rendering), and each result is fed back as `role:"tool"` keyed
+    by the `tool_call_id` the model emitted. The tool schemas still go to the model — through
+    the request's `tools` field rather than the prompt.
+
+    Not implemented over streaming: `complete_messages` refuses that combination at the adapter,
+    rather than silently dropping either the tools or the stream.
+    """
+    allowed_set = set(allowed)
+    tool_schemas = _to_openai_tools(allowed)
+    messages = _native_messages(task, system, list(initial_steps or []), allowed)
+    parse_errors = 0
+    pending: dict[str, Any] | None = None
+    stop_reason = "budget"
+
+    for index in range(1, max_steps + 1):
+        try:
+            result = client.complete_messages(messages, tools=tool_schemas)
+        except (AIUnavailable, AIError) as exc:
+            # Same rule as the text loop: a model failure is a recorded result, never a lost run.
+            record(AgentStep(
+                index=index,
+                thought=f"model call failed: {type(exc).__name__}: {exc}",
+            ))
+            if pending is not None:
+                return _native_finish_with_salvage(record, finish, pending, index)
+            return finish("error")
+        if result.tool_calls:
+            executed: list[tuple[Any, ToolResult]] = []
+            for position, call in enumerate(result.tool_calls):
+                native_call = None
+                if call.name not in allowed_set:
+                    outcome = ToolResult(
+                        tool=None, ok=False,
+                        summary=f"未知工具：{call.name}",
+                        error=f"未知工具 {call.name}；可用工具：{', '.join(allowed)}",
+                    )
+                else:
+                    try:
+                        arguments = json.loads(call.arguments) if call.arguments.strip() else {}
+                    except json.JSONDecodeError as exc:
+                        outcome = ToolResult(
+                            tool=None, ok=False,
+                            summary=f"参数不是合法 JSON：{exc}",
+                            error=f"工具 {call.name} 的参数解析失败：{exc}",
+                        )
+                    else:
+                        if not isinstance(arguments, dict):
+                            outcome = ToolResult(
+                                tool=None, ok=False,
+                                summary="参数必须是 JSON 对象",
+                                error=f"工具 {call.name} 的参数必须是对象，不是 {type(arguments).__name__}",
+                            )
+                        else:
+                            native_call = ToolCall(
+                                tool=ToolName(call.name), arguments=arguments, reason=""
+                            )
+                            outcome = _invoke(context, native_call)
+                record(AgentStep(
+                    index=index,
+                    thought=f"native tool call {position + 1}/{len(result.tool_calls)}: {call.name}",
+                    call=native_call, result=outcome,
+                ))
+                executed.append((call, outcome))
+            for call, outcome in executed:
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call.call_id, "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": (outcome.summary or outcome.error or "")[:6000],
+                })
+            continue
+
+        answer = result.text or ""
+        payload, parse_error, _salvage = _parse_turn(
+            answer, output_schema=output_schema, output_limited=truncated(result)
+        )
+        if payload is None:
+            parse_errors += 1
+            record(AgentStep(index=index, thought=answer.strip()[:1600]))
+            if parse_errors >= max_parse_attempts:
+                if pending is not None:
+                    return finish("finished", pending)
+                return finish("error")
+            messages.append({"role": "assistant", "content": answer.strip()[:2000]})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Your last answer could not be used: {parse_error}\n"
+                    "Answer again with one JSON object matching the schema."
+                ),
+            })
+            continue
+        parse_errors = 0
+        thought = str(payload.get("thought") or "")
+        final = payload.get("final")
+        if not isinstance(final, dict):
+            parse_errors += 1
+            record(AgentStep(index=index, thought=thought))
+            if parse_errors >= max_parse_attempts:
+                if pending is not None:
+                    return finish("finished", pending)
+                return finish("error")
+            messages.append({"role": "assistant", "content": thought})
+            messages.append({
+                "role": "user",
+                "content": "`final` must be a JSON object. Answer again with one JSON object.",
+            })
+            continue
+        if payload.get("_truncated"):
+            # Same hold-and-retry as the text protocol: keep the salvage, ask for a shorter
+            # answer, and only spend it when the run would otherwise end with nothing.
+            if pending is None:
+                pending = final
+            messages.append({"role": "assistant", "content": thought})
+            messages.append({
+                "role": "user",
+                "content": "Your answer was cut off. Answer again, shorter: each field one line.",
+            })
+            continue
+        record(AgentStep(index=index, thought=thought))
+        return finish("finished", final)
+
+    if pending is not None:
+        record(AgentStep(index=max_steps + 1, thought="（改用输出上限截断时抢救出的 `final`）"))
+        return finish("finished", pending)
+    return finish(stop_reason)
+
+
+def _native_finish_with_salvage(record, finish, pending, index):
+    record(AgentStep(index=index, thought="（改用输出上限截断时抢救出的 `final`）"))
+    return finish("finished", pending)

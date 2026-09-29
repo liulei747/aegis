@@ -34,6 +34,20 @@ class ChatResult:
     model: str
     usage: TokenUsage | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    #: Native `tool_calls` the model asked for, in order. Empty unless the request carried `tools`
+    #: and the model chose to call one; `text` is then usually empty or a short preamble. Parsing and
+    #: *executing* them is the caller's job — the adapter's contract stops at "what the model asked".
+    tool_calls: tuple[NativeToolCall, ...] = ()
+
+
+@dataclass(frozen=True)
+class NativeToolCall:
+    """One native tool call the model emitted: `id` is what the follow-up `role:"tool"` message
+    must carry, `arguments` is the raw JSON string the model wrote (not yet validated)."""
+
+    call_id: str
+    name: str
+    arguments: str
 
 
 #: The provider's words for "generation stopped because it ran out of output tokens". Names differ by
@@ -115,6 +129,29 @@ def _usage_from(body: dict) -> TokenUsage | None:
     )
 
 
+def _tool_calls_from(message: dict) -> tuple[NativeToolCall, ...]:
+    """The model's native tool calls, in order. Malformed entries are skipped and logged —
+    a call without an id cannot be answered with `role:"tool"`, and answering *some other*
+    id would attach the wrong result to the wrong request."""
+    out: list[NativeToolCall] = []
+    for raw in message.get("tool_calls") or []:
+        if not isinstance(raw, dict):
+            continue
+        call_id = str(raw.get("id") or "")
+        function = raw.get("function") or {}
+        name = str(function.get("name") or "")
+        if not call_id or not name:
+            log.warning("ai: dropping a malformed tool call (id=%r name=%r)", call_id, name)
+            continue
+        arguments = function.get("arguments")
+        out.append(NativeToolCall(
+            call_id=call_id,
+            name=name,
+            arguments=arguments if isinstance(arguments, str) else json.dumps(arguments or {}),
+        ))
+    return tuple(out)
+
+
 class ChatClient:
     """Calls an OpenAI-compatible chat endpoint. One instance per configured model."""
 
@@ -131,6 +168,7 @@ class ChatClient:
         connect_timeout_s: float = 30.0,
         stream_idle_timeout_s: float = 180.0,
         stream_total_timeout_s: float = 900.0,
+        native_tools: bool = False,
         transport: Transport = urllib_transport,
     ) -> None:
         if not base_url.strip():
@@ -152,22 +190,60 @@ class ChatClient:
         self.connect_timeout_s = connect_timeout_s
         self.stream_idle_timeout_s = stream_idle_timeout_s
         self.stream_total_timeout_s = stream_total_timeout_s
+        #: Deployment intent for the native tools/tool_calls protocol. The adapter can always speak
+        #: it (`complete_messages` with `tools`); this flag is what the harness loop reads to decide
+        #: which protocol a run uses.
+        self.native_tools = native_tools
 
     @property
     def url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
     def complete(self, system: str, user: str, *, on_progress=None, check=None) -> ChatResult:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "messages": [
+        return self.complete_messages(
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            on_progress=on_progress,
+            check=check,
+        )
+
+    def complete_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        on_progress=None,
+        check=None,
+    ) -> ChatResult:
+        """One round trip over an explicit message list — the native tool-calls path.
+
+        `messages` is sent as given: the caller owns the transcript shape, including
+        `role:"tool"` messages that answer earlier `tool_calls` (each must carry the
+        `tool_call_id` the model emitted). `tools` is a list of OpenAI function schemas;
+        when present the request carries `tools` + `tool_choice:"auto"` and the response's
+        `message.tool_calls` are parsed into `ChatResult.tool_calls`.
+
+        Not implemented over streaming yet: streaming accumulates content deltas, and
+        tool-call deltas need their own accumulator (batch 3). Asking for both raises
+        rather than silently dropping one side of the request.
+        """
+        if tools and self.streaming:
+            raise AIError(
+                "native tools 尚不支持流式接收：请关闭 streaming 或 native tools 之一"
+                "（流式下的 tool_calls 增量累积属于后续批次）"
+            )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": messages,
         }
         if self.max_tokens > 0:
             payload["max_tokens"] = self.max_tokens
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         transport = self._transport
         if self.streaming and transport is urllib_transport:
             from services.ai.streaming import StreamingChatTransport
@@ -190,4 +266,5 @@ class ChatClient:
             model=str(body.get("model") or self.model),
             usage=_usage_from(body),
             raw=body,
+            tool_calls=_tool_calls_from(message),
         )

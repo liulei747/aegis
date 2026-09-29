@@ -126,3 +126,22 @@ class BudgetClient:
             raise
         self.budget.account(response)
         return response
+
+    def complete_messages(self, messages, *, tools=None):
+        """The native tool-calls path, with the same check/reserve/account semantics as
+        `complete` — a native run that bypassed the budget would be an unaccounted spend."""
+        self.check("model-call")
+        self.budget.reserve()
+        try:
+            from services.ai.client import ChatClient
+            if isinstance(self.client, ChatClient):
+                response = self.client.complete_messages(
+                    messages, tools=tools, check=self.check, on_progress=self.on_progress
+                )
+            else:
+                response = self.client.complete_messages(messages, tools=tools)
+        except BaseException:
+            self.budget.account(None)
+            raise
+        self.budget.account(response)
+        return response
