@@ -23,8 +23,8 @@ function Section({ title, values }: { title: string; values: Record<string, unkn
 }
 
 function editable(config: LLMConfig): LLMConfigUpdate {
-  const { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts, streaming, connect_timeout_s, stream_idle_timeout_s, stream_total_timeout_s } = config;
-  return { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts, streaming: streaming ?? false, connect_timeout_s: connect_timeout_s ?? 30, stream_idle_timeout_s: stream_idle_timeout_s ?? 180, stream_total_timeout_s: stream_total_timeout_s ?? 900 };
+  const { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts, streaming, native_tools, context_input_tokens, agent_max_model_calls, agent_max_model_tokens, connect_timeout_s, stream_idle_timeout_s, stream_total_timeout_s } = config;
+  return { enabled, base_url, model, timeout_s, concurrency, temperature, max_tokens, max_contexts, streaming: streaming ?? false, native_tools: native_tools ?? false, context_input_tokens: context_input_tokens ?? 0, agent_max_model_calls: agent_max_model_calls ?? 0, agent_max_model_tokens: agent_max_model_tokens ?? 0, connect_timeout_s: connect_timeout_s ?? 30, stream_idle_timeout_s: stream_idle_timeout_s ?? 180, stream_total_timeout_s: stream_total_timeout_s ?? 900 };
 }
 
 export function SettingsScreen() {
@@ -108,6 +108,15 @@ export function SettingsScreen() {
             <label>响应接收方式<select value={String(form.streaming)} onChange={e => setForm({ ...form, streaming: e.target.value === "true" })}>
               <option value="false">非流式（兼容旧配置）</option><option value="true">流式（适合长推理）</option>
             </select></label>
+            <label>Agent 工具调用协议<select value={String(form.native_tools)} onChange={e => setForm({ ...form, native_tools: e.target.value === "true" })}>
+              <option value="false">文本 JSON（兼容旧任务）</option><option value="true">原生工具调用</option>
+            </select></label>
+            <label>Agent 输入上下文预算（估算 Token；0 为关闭）<input type="number" min="0" max="500000" required value={form.context_input_tokens}
+              onChange={e => setForm({ ...form, context_input_tokens: Number(e.target.value) })} /></label>
+            <label>单个 Agent 模型调用上限（0 为关闭）<input type="number" min="0" max="1000" required value={form.agent_max_model_calls}
+              onChange={e => setForm({ ...form, agent_max_model_calls: Number(e.target.value) })} /></label>
+            <label>单个 Agent Token 上限（服务商用量；0 为关闭）<input type="number" min="0" max="10000000" required value={form.agent_max_model_tokens}
+              onChange={e => setForm({ ...form, agent_max_model_tokens: Number(e.target.value) })} /></label>
             {form.streaming ? <>
               <label>连接超时（秒）<input type="number" min="1" max="120" required value={form.connect_timeout_s}
                 onChange={e => setForm({ ...form, connect_timeout_s: Number(e.target.value) })} /></label>

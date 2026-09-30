@@ -27,8 +27,10 @@ stop and a parse failure deterministically.
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Protocol
@@ -44,8 +46,14 @@ from aegis_contracts.harness import (
 from aegis_core.logging import get_logger
 from services.ai.client import AIError, AIUnavailable, finish_reason, truncated
 from services.ai.parse import extract_json_object
+from services.harness import context as context_mod
+from services.harness.budget import AgentBudgetStop, BudgetStop
 
 log = get_logger(__name__)
+
+
+class ContextBudgetExceeded(AIError):
+    """A local input-budget refusal; no model request was sent."""
 
 #: Consecutive unparseable answers tolerated before the run stops with `error`. Three rather than
 #: one because a model that wraps its JSON in prose or forgets a brace is worth correcting; more
@@ -207,6 +215,17 @@ def _invoke(context, call: ToolCall) -> ToolResult:
         )
 
 
+_PARALLEL_READ_TOOLS = frozenset({ToolName.READ, ToolName.GREP, ToolName.LIST_FILES})
+
+
+def _invoke_batch(context: Any, calls: list[ToolCall]) -> list[ToolResult]:
+    """Run only independent, read-only calls together; preserve model order in results."""
+    if len(calls) < 2 or any(call.tool not in _PARALLEL_READ_TOOLS for call in calls):
+        return [_invoke(context, call) for call in calls]
+    with ThreadPoolExecutor(max_workers=min(4, len(calls))) as pool:
+        return list(pool.map(lambda call: _invoke(context, call), calls))
+
+
 # ─────────────────────────────────────────────────────────── prompt rendering
 
 
@@ -280,12 +299,55 @@ def _render_step(step: AgentStep) -> str:
     return "\n".join(lines)
 
 
-def render_user_message(task: str, steps: list[AgentStep], *, note: str = "") -> str:
+def _estimated_tokens(text: str) -> int:
+    """Conservative tokenizer-free estimate; the source is UTF-8 bytes divided by two."""
+    return math.ceil(len(text.encode("utf-8")) / 2)
+
+
+def _compact_step(step: AgentStep) -> str:
+    """Keep provenance, call arguments and recorded facts; omit older bulky observations.
+
+    Kept for callers that want a per-step reference line; `render_user_message` now folds the
+    older steps into one `context.ContextSummary` instead, which groups reads by file.
+    """
+    if step.call is not None and step.call.tool is ToolName.RECORD:
+        return _render_step(step)
+    lines = [f"Turn {step.index} archived observation (original held in AgentRun; re-read source if needed)."]
+    if step.call is not None:
+        args = step.call.arguments or {}
+        kept = {key: args[key] for key in ("path", "offset", "limit", "pattern", "include", "file", "line")
+                if key in args}
+        lines.append(f"Tool {_name(step.call.tool)}: {json.dumps(kept, ensure_ascii=False)[:400]}")
+    if step.result is not None:
+        data = step.result.data or {}
+        location = {key: data[key] for key in ("path", "offset", "returned_lines", "total_lines",
+                                                "next_offset", "total_matched", "count") if key in data}
+        lines.append(f"Result ok={step.result.ok}, truncated={step.result.truncated}, "
+                     f"location={json.dumps(location, ensure_ascii=False)[:300]}")
+        if not step.result.ok:
+            lines.append(f"Error: {(step.result.error or '')[:300]}")
+    return "\n".join(lines)
+
+
+#: How many of the newest steps a compacted request keeps verbatim. Two: the model must be able to
+#: act on the read it just made (one), and on the one before it when the two were a pair (a `grep`
+#: followed by the `read` of its hit). Three would keep a whole batch of reads and defeat the point.
+KEEP_RECENT_STEPS = 2
+
+
+def render_user_message(task: str, steps: list[AgentStep], *, note: str = "",
+                        system: str = "", max_input_tokens: int = 0,
+                        on_context: Callable[[dict[str, Any]], None] | None = None) -> str:
     """The user turn: the task, then everything that has happened so far.
 
     The whole transcript is re-sent rather than relying on server-side conversation state: the
     client is a single stateless round trip by design, and re-rendering means the loop cannot
     drift from what ``AgentRun.steps`` records.
+
+    When `max_input_tokens` is positive and the full rendering exceeds it, the older steps are
+    folded into a `context.ContextSummary` (file windows, match counts, failures -- figures the
+    tools produced, never prose about the code) and the newest `KEEP_RECENT_STEPS` steps plus every
+    `record` step stay verbatim. `AgentRun.steps` is untouched; only this request changes.
     """
     parts = [f"TASK\n{task.strip()}"]
     if note:
@@ -293,7 +355,43 @@ def render_user_message(task: str, steps: list[AgentStep], *, note: str = "") ->
     if steps:
         parts.append("TRANSCRIPT SO FAR\n" + "\n".join(_render_step(step) for step in steps))
     parts.append("Answer with one JSON object, as instructed.")
-    return "\n\n".join(parts)
+    full = "\n\n".join(parts)
+    before_tokens = _estimated_tokens(system + full)
+    if max_input_tokens <= 0 or before_tokens <= max_input_tokens:
+        return full
+    # The original AgentRun remains intact. Only this request's older observations are replaced.
+    # Leave the newest steps complete so the model can act on its latest reads.
+    older, recent = steps[:-KEEP_RECENT_STEPS], steps[-KEEP_RECENT_STEPS:]
+    folded = [step for step in older if not (step.call is not None and step.call.tool is ToolName.RECORD)]
+    kept_records = [step for step in older if step.call is not None and step.call.tool is ToolName.RECORD]
+    summary = context_mod.summarize_steps(folded, ref_of=lambda step: f"turn {step.index}")
+    compact = [f"TASK\n{task.strip()}"]
+    if note:
+        compact.append(note.strip())
+    compact.append(
+        "CONTEXT COMPACTED: older observations are summarised below; original steps remain "
+        "in AgentRun and the run's step archive. Token estimate source: ceil(UTF-8 bytes / 2)."
+    )
+    compact.append(summary.render())
+    if kept_records:
+        compact.append("RECORDED FACTS (kept verbatim)\n" + "\n".join(_render_step(step) for step in kept_records))
+    compact.append("RECENT TRANSCRIPT\n" + "\n".join(_render_step(step) for step in recent))
+    compact.append("Answer with one JSON object, as instructed.")
+    reduced = "\n\n".join(compact)
+    after_tokens = _estimated_tokens(system + reduced)
+    if on_context is not None:
+        on_context({"state": "compacted" if after_tokens <= max_input_tokens else "rejected",
+                    "protocol": "text", "before_tokens": before_tokens,
+                    "after_tokens": after_tokens, "budget_tokens": max_input_tokens,
+                    "estimate_source": "ceil(UTF-8 bytes / 2)",
+                    "archived_steps": [step.index for step in folded],
+                    **summary.as_event()})
+    if after_tokens > max_input_tokens:
+        raise ContextBudgetExceeded(
+            f"input context exceeds configured {max_input_tokens} estimated tokens "
+            "after preserving task, recent evidence and recorded facts "
+            "(estimate: ceil(UTF-8 bytes / 2))")
+    return reduced
 
 
 #: How many turns before the end the loop starts telling the model to wrap up. Two, because one is not
@@ -342,6 +440,7 @@ def run_agent(
     max_parse_attempts: int = MAX_PARSE_ATTEMPTS,
     initial_steps: list[AgentStep] | None = None,
     on_step: Callable[[AgentRun, AgentStep], None] | None = None,
+    on_context: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentRun:
     """Run one agent to a final answer, a budget stop, or an honest error.
 
@@ -385,6 +484,14 @@ def run_agent(
         except Exception as exc:  # noqa: BLE001 - a broken observer must not kill the run
             log.warning("react: on_step observer failed (%s: %s)", type(exc).__name__, exc)
 
+    def context_event(info: dict[str, Any]) -> None:
+        if on_context is None:
+            return
+        try:
+            on_context(info)
+        except Exception as exc:  # A broken observer must not alter model decisions.
+            log.warning("react: on_context observer failed (%s: %s)", type(exc).__name__, exc)
+
     if initial_steps:
         for step in initial_steps:
             record(step)
@@ -416,6 +523,7 @@ def run_agent(
             run_id=run.run_id, output_schema=output_schema,
             initial_steps=initial_steps, record=record, finish=finish,
             allowed=allowed, max_parse_attempts=max_parse_attempts,
+            on_context=context_event,
         )
 
     def finish_or_spend_salvage(reason: str) -> AgentRun:
@@ -449,22 +557,31 @@ def run_agent(
     pending: dict[str, Any] | None = None
     pending_output_limited = False
     for index in range(1, max_steps + 1):
-        user = render_user_message(
-            task,
-            run.steps,
-            # The wrap-up reminder rides with whatever the previous turn needed to be told; both are
-            # things the model cannot work out from the transcript (a parse error it has not seen, and
-            # how many turns the *harness* has left).
-            note="\n".join(part for part in (
-                note,
-                "FORMAT RECOVERY: Use one short tool call per answer, or a concise complete final JSON. "
-                "Do not repeat previous calls." if compact_mode else "",
-                wrap_up_note(index, max_steps),
-            ) if part),
-        )
-        note = ""
         try:
+            user = render_user_message(
+                task, run.steps,
+                # The wrap-up reminder rides with the previous turn's correction.
+                note="\n".join(part for part in (
+                    note,
+                    "FORMAT RECOVERY: Use one short tool call per answer, or a concise complete final JSON. "
+                    "Do not repeat previous calls." if compact_mode else "",
+                    wrap_up_note(index, max_steps),
+                ) if part),
+                system=system,
+                max_input_tokens=getattr(client, "context_input_tokens", 0),
+                on_context=context_event,
+            )
+            note = ""
             result = _complete_with_retries(client, system, user, caller=f"{agent}:{scope_id}")
+        except ContextBudgetExceeded as exc:
+            record(AgentStep(index=index, thought=f"context budget exceeded: {exc}"))
+            return finish("error")
+        except AgentBudgetStop as exc:
+            # This run's own cap, not the audit's: keep what was produced, say why it stopped, and
+            # let the coordinator carry on with the next agent. The audit-wide `BudgetStop` is a
+            # `BaseException` that deliberately passes through untouched.
+            record(AgentStep(index=index, thought=f"agent budget exhausted: {exc}"))
+            return finish_or_spend_salvage("budget")
         except (AIUnavailable, AIError) as exc:
             # A model failure is a recorded result, never a lost run: the transcript keeps
             # whatever was already collected, and `stop_reason` says the stage did not finish.
@@ -496,20 +613,29 @@ def run_agent(
                 thought=f"格式修复 {format_repairs}/2（finish_reason={stop or '未提供'}）："
                         f"{parse_error}；原文片段：{answer.strip()[:1400]}",
             ))
-            repair_user = render_user_message(
-                task, run.steps,
-                note=(
-                    "Your last answer was invalid JSON. Correct its format now without repeating "
-                    "investigation. Return exactly one short JSON object: one tool call or a "
-                    "complete final. Keep text fields concise."
-                ),
-            )
             try:
+                repair_user = render_user_message(
+                    task, run.steps,
+                    note=(
+                        "Your last answer was invalid JSON. Correct its format now without repeating "
+                        "investigation. Return exactly one short JSON object: one tool call or a "
+                        "complete final. Keep text fields concise."
+                    ),
+                    system=system,
+                    max_input_tokens=getattr(client, "context_input_tokens", 0),
+                    on_context=context_event,
+                )
                 repaired_result = _complete_with_retries(
                     client, system, repair_user, caller=f"{agent}:{scope_id}"
                 )
+            except ContextBudgetExceeded as exc:
+                record(AgentStep(index=index, thought=f"context budget exceeded: {exc}"))
+                return finish("error")
             except (AIUnavailable, AIError):
                 pass  # The normal loop still has the original error and its retry path.
+            except AgentBudgetStop as exc:
+                record(AgentStep(index=index, thought=f"agent budget exhausted: {exc}"))
+                return finish_or_spend_salvage("budget")
             else:
                 result = repaired_result
                 answer = result.text or ""
@@ -599,6 +725,7 @@ def run_agent(
         # in the record: the transcript a reviewer reads, the coverage ledger that counts `read`
         # windows, and the tool-usage accounting are all identical to what the model would have
         # produced one call per turn.
+        prepared: list[tuple[str, ToolCall | None, ToolResult | None]] = []
         for entry in batch:
             raw_tool = _name(entry.get("tool"))
             arguments = entry.get("arguments")
@@ -611,7 +738,14 @@ def run_agent(
                 log.info("react: %s/%s refused tool %r", agent, scope_id, raw_tool)
             else:
                 call = ToolCall(tool=ToolName(raw_tool), arguments=arguments, reason=call_reason)
-                result = _invoke(context, call)
+                result = None
+            prepared.append((call_reason, call, result))
+        if all(call is not None for _, call, _ in prepared):
+            outcomes = _invoke_batch(context, [call for _, call, _ in prepared if call is not None])
+        else:
+            outcomes = [result if result is not None else _invoke(context, call)
+                        for _, call, result in prepared]
+        for (call_reason, call, _), result in zip(prepared, outcomes, strict=True):
             record(AgentStep(index=index, thought=call_reason, call=call, result=result))
 
     # The loop ran out of turns with work still possible. Whatever was produced is kept, and the
@@ -635,6 +769,7 @@ def _complete_with_retries(
     identity. Recording inside `ChatClient` instead would have produced a log that could not say
     which agent was talking.
     """
+    prompt_estimate = _estimated_tokens(system + user)
     attempt = 0
     while True:
         attempt += 1
@@ -646,11 +781,14 @@ def _complete_with_retries(
                 client=client, caller=caller, attempt=attempt, ok=False,
                 duration_ms=(time.monotonic() - started) * 1000,
                 prompt_chars=len(system) + len(user), error=f"{type(exc).__name__}: {exc}",
+                prompt_token_estimate=prompt_estimate,
                 stream_metadata=getattr(exc, "metadata", None),
             )
             if attempt >= MAX_CLIENT_ATTEMPTS or not getattr(exc, "retryable", True):
                 raise
-            time.sleep(min(1.5 * attempt, 8.0))
+            delay = min(1.5 * attempt, 8.0)
+            _notify_retry(client, attempt, exc, delay)
+            time.sleep(delay)
             continue
         except AIError as exc:
             # Not retryable, but still a call that happened and cost time: a log that only holds
@@ -659,13 +797,17 @@ def _complete_with_retries(
                 client=client, caller=caller, attempt=attempt, ok=False,
                 duration_ms=(time.monotonic() - started) * 1000,
                 prompt_chars=len(system) + len(user), error=f"{type(exc).__name__}: {exc}",
+                prompt_token_estimate=prompt_estimate,
                 stream_metadata=getattr(exc, "metadata", None),
             )
             raise
         except BaseException as exc:
+            if isinstance(exc, BudgetStop):
+                raise  # No request was sent: BudgetClient refused the reservation.
             _record_call(client=client, caller=caller, attempt=attempt, ok=False,
                          duration_ms=(time.monotonic() - started) * 1000,
                          prompt_chars=len(system) + len(user),
+                         prompt_token_estimate=prompt_estimate,
                          error=f"{type(exc).__name__}: {exc}",
                          stream_metadata=getattr(exc, "metadata", None))
             raise
@@ -673,15 +815,86 @@ def _complete_with_retries(
             client=client, caller=caller, attempt=attempt, ok=True,
             duration_ms=(time.monotonic() - started) * 1000,
             prompt_chars=len(system) + len(user), answer_chars=len(result.text or ""),
+            prompt_token_estimate=prompt_estimate,
             usage=getattr(result, "usage", None), finish_reason=finish_reason(result),
             stream_metadata=getattr(result, "raw", {}).get("stream_metadata"),
         )
         return result
 
 
+def _complete_messages_with_retries(client, messages: list[dict[str, Any]],
+                                    tools: list[dict[str, Any]], *, caller: str = ""):
+    """Native tool protocol with the same bounded retry and traffic accounting as text turns.
+
+    A model response is complete before any tool is executed, so replaying a transient failed
+    request cannot replay a tool. BudgetClient reserves and accounts every attempt separately.
+    """
+    prompt_serialized = json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False)
+    prompt_chars = len(prompt_serialized)
+    prompt_estimate = _estimated_tokens(prompt_serialized)
+    attempt = 0
+    while True:
+        attempt += 1
+        started = time.monotonic()
+        try:
+            result = client.complete_messages(messages, tools=tools)
+        except AIUnavailable as exc:
+            _record_call(
+                client=client, caller=caller, attempt=attempt, ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                prompt_chars=prompt_chars, error=f"{type(exc).__name__}: {exc}",
+                prompt_token_estimate=prompt_estimate,
+                stream_metadata=getattr(exc, "metadata", None),
+            )
+            if attempt >= MAX_CLIENT_ATTEMPTS or not getattr(exc, "retryable", True):
+                raise
+            delay = min(1.5 * attempt, 8.0)
+            _notify_retry(client, attempt, exc, delay)
+            time.sleep(delay)
+            continue
+        except BaseException as exc:
+            if isinstance(exc, BudgetStop):
+                raise  # No request was sent: BudgetClient refused the reservation.
+            _record_call(
+                client=client, caller=caller, attempt=attempt, ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                prompt_chars=prompt_chars, error=f"{type(exc).__name__}: {exc}",
+                prompt_token_estimate=prompt_estimate,
+                stream_metadata=getattr(exc, "metadata", None),
+            )
+            raise
+        _record_call(
+            client=client, caller=caller, attempt=attempt, ok=True,
+            duration_ms=(time.monotonic() - started) * 1000,
+            prompt_chars=prompt_chars,
+            prompt_token_estimate=prompt_estimate,
+            answer_chars=len(result.text or "") + sum(len(call.arguments) for call in result.tool_calls),
+            usage=getattr(result, "usage", None), finish_reason=finish_reason(result),
+            stream_metadata=getattr(result, "raw", {}).get("stream_metadata"),
+        )
+        return result
+
+
+def _notify_retry(client: Any, attempt: int, error: AIUnavailable, delay_s: float) -> None:
+    """Expose a bounded retry to the audit trail without recording prompt or answer text."""
+    notify = getattr(client, "on_progress", None)
+    if notify is not None:
+        try:
+            notify({
+                "status": "retrying", "attempt": attempt + 1,
+                "max_attempts": MAX_CLIENT_ATTEMPTS,
+                "retry_delay_s": delay_s,
+                "failure_code": type(error).__name__,
+                "failure_reason": str(error)[:500],
+            })
+        except Exception:  # telemetry must not turn a retryable failure into an agent failure
+            log.warning("react: retry progress callback failed", exc_info=True)
+
+
 def _record_call(*, client, caller: str, attempt: int, ok: bool, duration_ms: float,
                  prompt_chars: int, answer_chars: int = 0, usage=None, error: str | None = None,
-                 finish_reason: str | None = None, stream_metadata: dict | None = None):
+                 finish_reason: str | None = None, stream_metadata: dict | None = None,
+                 prompt_token_estimate: int | None = None):
     """Write one row of model traffic. Never raises -- see `services.ai.traffic`."""
     from services.ai import traffic
 
@@ -694,6 +907,7 @@ def _record_call(*, client, caller: str, attempt: int, ok: bool, duration_ms: fl
         ok=ok,
         duration_ms=duration_ms,
         prompt_chars=prompt_chars,
+        prompt_token_estimate=prompt_token_estimate,
         answer_chars=answer_chars,
         usage=usage,
         finish_reason=finish_reason,
@@ -1143,6 +1357,97 @@ def _native_messages(
     return messages
 
 
+def _native_context_messages(messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                             max_input_tokens: int,
+                             on_context: Callable[[dict[str, Any]], None] | None = None,
+                             steps_by_call_id: dict[str, AgentStep] | None = None,
+                             ) -> list[dict[str, Any]]:
+    """Bound a native request while preserving every assistant/tool_call_id pairing.
+
+    Older `role:"tool"` replies are reduced to a one-line receipt (so the protocol's pairing
+    holds) and the evidence they carried is folded into one `context.ContextSummary` appended to
+    the task message -- the same summary the text protocol builds, keyed by `tool_call_id` instead
+    of turn number. `steps_by_call_id` supplies the `AgentStep`s (with their structured
+    `ToolResult.data`) the summary is derived from; a call with no step falls back to its
+    arguments alone.
+    """
+    if max_input_tokens <= 0:
+        return messages
+
+    def size(value: list[dict[str, Any]]) -> int:
+        return _estimated_tokens(json.dumps({"messages": value, "tools": tools}, ensure_ascii=False))
+
+    before_tokens = size(messages)
+    if before_tokens <= max_input_tokens:
+        return messages
+    reduced = [dict(message) for message in messages]
+    calls = {
+        call["id"]: call["function"]
+        for message in reduced if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    tool_positions = [index for index, message in enumerate(reduced)
+                      if message.get("role") == "tool"]
+    # Keep the newest results verbatim. Old assistant declarations and tool replies stay paired.
+    archived_call_ids: list[str] = []
+    folded: list[tuple[str, AgentStep]] = []
+    for index in tool_positions[:-KEEP_RECENT_STEPS]:
+        message = reduced[index]
+        call_id = str(message.get("tool_call_id"))
+        function = calls.get(call_id, {})
+        name = function.get("name", "unknown")
+        if name == "record":
+            continue  # Confirmed facts must remain visible, not only their receipt.
+        archived_call_ids.append(call_id)
+        step = (steps_by_call_id or {}).get(call_id)
+        if step is None or step.call is None:
+            # No structured step for this call (a step the model addressed to an unknown tool, or
+            # a transcript rebuilt without them): synthesise enough for the summary's argument line.
+            try:
+                args = json.loads(function.get("arguments", "{}"))
+            except (ValueError, TypeError):
+                args = {}
+            try:
+                tool_name = ToolName(name)
+            except ValueError:
+                tool_name = None
+            if tool_name is not None and isinstance(args, dict):
+                step = AgentStep(index=0, thought="", call=ToolCall(tool=tool_name, arguments=args),
+                                 result=ToolResult(tool=tool_name, ok=True,
+                                                   summary=str(message.get("content") or "")))
+        if step is not None:
+            folded.append((call_id, step))
+        message["content"] = (
+            f"[archived: {name} result for {call_id}; see EARLIER OBSERVATIONS in the task message]"
+        )
+    call_id_of = {id(step): call_id for call_id, step in folded}
+    summary = context_mod.summarize_steps(
+        [step for _, step in folded],
+        ref_of=lambda step: call_id_of.get(id(step), f"turn {step.index}"),
+    )
+    if archived_call_ids and len(reduced) > 1 and reduced[1].get("role") == "user":
+        reduced[1]["content"] = (
+            f"{reduced[1].get('content') or ''}\n\n"
+            "CONTEXT COMPACTED: older tool results are summarised below; originals remain in "
+            "AgentRun and the run's step archive. Token estimate source: ceil(UTF-8 bytes / 2).\n\n"
+            + summary.render()
+        )
+    after_tokens = size(reduced)
+    if on_context is not None:
+        on_context({"state": "compacted" if after_tokens <= max_input_tokens else "rejected",
+                    "protocol": "native", "before_tokens": before_tokens,
+                    "after_tokens": after_tokens, "budget_tokens": max_input_tokens,
+                    "estimate_source": "ceil(UTF-8 bytes / 2)",
+                    "archived_call_ids": archived_call_ids,
+                    **summary.as_event()})
+    if after_tokens > max_input_tokens:
+        raise ContextBudgetExceeded(
+            f"native input context exceeds configured {max_input_tokens} estimated tokens "
+            "after preserving task, tool-call links, recent evidence and recorded facts "
+            "(estimate: ceil(UTF-8 bytes / 2))")
+    return reduced
+
+
 def run_agent_native(
     *,
     agent: str,
@@ -1160,6 +1465,7 @@ def run_agent_native(
     finish: Callable[..., AgentRun],
     allowed: list[str],
     max_parse_attempts: int,
+    on_context: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentRun:
     """The ReAct loop over the **native** tools/tool_calls protocol.
 
@@ -1170,8 +1476,7 @@ def run_agent_native(
     by the `tool_call_id` the model emitted. The tool schemas still go to the model — through
     the request's `tools` field rather than the prompt.
 
-    Not implemented over streaming: `complete_messages` refuses that combination at the adapter,
-    rather than silently dropping either the tools or the stream.
+    Streaming and native tool calls share the same validated response contract.
     """
     allowed_set = set(allowed)
     tool_schemas = _to_openai_tools(allowed)
@@ -1179,10 +1484,38 @@ def run_agent_native(
     parse_errors = 0
     pending: dict[str, Any] | None = None
     stop_reason = "budget"
+    seen_call_ids: set[str] = {
+        str(call["id"])
+        for message in messages if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    #: The structured step behind every `tool_call_id` in `messages`, seeded ones included. This is
+    #: what the compaction summary is derived from: `ToolResult.data` holds the line windows and
+    #: match counts, and the `role:"tool"` message only holds the prose.
+    steps_by_call_id: dict[str, AgentStep] = {
+        f"call_{step.index:04d}": step for step in (initial_steps or [])
+        if step.call is not None and step.result is not None and step.result.ok
+    }
+    repeated_records: dict[tuple[str, str], ToolResult] = {}
 
     for index in range(1, max_steps + 1):
+        reminder = wrap_up_note(index, max_steps)
+        if reminder:
+            messages.append({"role": "user", "content": reminder})
         try:
-            result = client.complete_messages(messages, tools=tool_schemas)
+            request_messages = _native_context_messages(
+                messages, tool_schemas, getattr(client, "context_input_tokens", 0), on_context,
+                steps_by_call_id=steps_by_call_id)
+            result = _complete_messages_with_retries(
+                client, request_messages, tool_schemas, caller=f"{agent}:{scope_id}")
+        except ContextBudgetExceeded as exc:
+            record(AgentStep(index=index, thought=f"context budget exceeded: {exc}"))
+            return finish("error")
+        except AgentBudgetStop as exc:
+            record(AgentStep(index=index, thought=f"agent budget exhausted: {exc}"))
+            if pending is not None:
+                return _native_finish_with_salvage(record, finish, pending, index)
+            return finish("budget")
         except (AIUnavailable, AIError) as exc:
             # Same rule as the text loop: a model failure is a recorded result, never a lost run.
             record(AgentStep(
@@ -1193,10 +1526,44 @@ def run_agent_native(
                 return _native_finish_with_salvage(record, finish, pending, index)
             return finish("error")
         if result.tool_calls:
+            if len(result.tool_calls) > MAX_CALLS_PER_TURN:
+                record(AgentStep(index=index, thought=(
+                    f"model call failed: {len(result.tool_calls)} tool calls exceed "
+                    f"the {MAX_CALLS_PER_TURN} call limit")))
+                return finish("error")
+            call_ids = [call.call_id for call in result.tool_calls]
+            if len(set(call_ids)) != len(call_ids) or any(call_id in seen_call_ids for call_id in call_ids):
+                record(AgentStep(index=index, thought="model call failed: repeated tool_call_id"))
+                return finish("error")
+            if truncated(result):
+                record(AgentStep(index=index, thought="model call failed: truncated tool calls"))
+                return finish("error")
+            seen_call_ids.update(call.call_id for call in result.tool_calls)
             executed: list[tuple[Any, ToolResult]] = []
+            parallel_calls: list[ToolCall] = []
+            for candidate in result.tool_calls:
+                if candidate.name not in allowed_set:
+                    break
+                try:
+                    arguments = json.loads(candidate.arguments) if candidate.arguments.strip() else {}
+                except json.JSONDecodeError:
+                    break
+                if not isinstance(arguments, dict):
+                    break
+                prepared_call = ToolCall(tool=ToolName(candidate.name), arguments=arguments, reason="")
+                if prepared_call.tool not in _PARALLEL_READ_TOOLS:
+                    break
+                parallel_calls.append(prepared_call)
+            parallel_results = (
+                _invoke_batch(context, parallel_calls)
+                if len(parallel_calls) == len(result.tool_calls) else None
+            )
             for position, call in enumerate(result.tool_calls):
                 native_call = None
-                if call.name not in allowed_set:
+                if parallel_results is not None:
+                    native_call = parallel_calls[position]
+                    outcome = parallel_results[position]
+                elif call.name not in allowed_set:
                     outcome = ToolResult(
                         tool=None, ok=False,
                         summary=f"未知工具：{call.name}",
@@ -1222,22 +1589,30 @@ def run_agent_native(
                             native_call = ToolCall(
                                 tool=ToolName(call.name), arguments=arguments, reason=""
                             )
-                            outcome = _invoke(context, native_call)
-                record(AgentStep(
+                            key = (call.name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+                            if call.name == "record" and key in repeated_records:
+                                outcome = repeated_records[key]
+                            else:
+                                outcome = _invoke(context, native_call)
+                                if call.name == "record" and outcome.ok:
+                                    repeated_records[key] = outcome
+                step = AgentStep(
                     index=index,
                     thought=f"native tool call {position + 1}/{len(result.tool_calls)}: {call.name}",
                     call=native_call, result=outcome,
-                ))
+                )
+                record(step)
+                steps_by_call_id[call.call_id] = step
                 executed.append((call, outcome))
-            for call, outcome in executed:
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
+            messages.append({
+                "role": "assistant",
+                "content": result.text or None,
+                "tool_calls": [{
                         "id": call.call_id, "type": "function",
                         "function": {"name": call.name, "arguments": call.arguments},
-                    }],
-                })
+                    } for call, _ in executed],
+            })
+            for call, outcome in executed:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.call_id,

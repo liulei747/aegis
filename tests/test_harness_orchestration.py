@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +40,7 @@ from aegis_contracts.harness import (
     ToolResult,
     VerdictKind,
     WorkItem,
+    WorkItemKind,
     WorkItemState,
 )
 from aegis_core.cancel import CanceledAbort
@@ -48,6 +51,65 @@ from services.harness import coordinator as coordinator_mod
 from services.harness.cli import EXIT_NOT_CONFIGURED, main
 from services.harness.coordinator import HarnessConfig, HarnessCoordinator, _severity
 from services.harness.react import run_agent
+
+
+def test_themed_discovery_waits_for_its_coverage_read_without_blocking_other_work(tmp_path, monkeypatch):
+    coordinator = HarnessCoordinator(
+        workspace=tmp_path, context=object(), client=object(),
+        config=HarnessConfig(concurrency=2, max_scopes_per_round=3),
+    )
+    coverage_id = "scope-coverage-0"
+    theme_id = "scope-theme"
+    coordinator._scope_files = {coverage_id: ["a.py"], theme_id: ["a.py"]}
+    bb.add_work(coordinator.blackboard, [
+        WorkItem(work_id=f"W-{coverage_id}", scope_id=coverage_id, title="coverage",
+                 rationale="all files", kind=WorkItemKind.FILE_REVIEW, files=["a.py"]),
+        WorkItem(work_id=f"W-{theme_id}", scope_id=theme_id, title="theme",
+                 rationale="risk", kind=WorkItemKind.INVESTIGATION, files=["a.py"], priority=1),
+    ])
+    coverage_done = threading.Event()
+    started = []
+
+    def run_fake(**kwargs):
+        scope = kwargs["scope_id"]
+        started.append(scope)
+        if scope == coverage_id:
+            time.sleep(0.05)
+            coverage_done.set()
+        else:
+            assert coverage_done.is_set(), "theme started before its coverage group finished"
+        return agents.AgentOutcome(
+            run=AgentRun(run_id=f"discovery:{scope}:r0", agent=agents.DISCOVERY,
+                         scope_id=scope, stop_reason="finished"), parsed=[],
+        )
+
+    monkeypatch.setattr(coordinator, "_agent", run_fake)
+    coordinator._discover([theme_id, coverage_id], round_index=0)
+    assert started == [coverage_id, theme_id]
+
+
+def test_record_is_not_acknowledged_until_blackboard_commit_succeeds(tmp_path, monkeypatch):
+    coordinator = HarnessCoordinator(workspace=tmp_path, client=object())
+    original_save = bb.save
+    attempts = []
+
+    def fail_once(board, run_dir):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("disk full")
+        return original_save(board, run_dir)
+
+    monkeypatch.setattr(bb, "save", fail_once)
+    record = {"kind": "note", "text": "reviewed entry", "scope": "workspace"}
+    first = coordinator._record(record)
+    assert first["recorded"] is False
+    assert "落盘失败" in first["reason"]
+    second = coordinator._record(record)
+    assert second["recorded"] is True
+    assert len(attempts) == 2
+    persisted = bb.load(coordinator.run_dir)
+    assert persisted is not None and persisted.project is not None
+    assert persisted.project.notes == ["[workspace] reviewed entry"]
 
 # ─────────────────────────────────────────────────────────── fakes
 
@@ -1094,8 +1156,19 @@ def test_the_round_bound_stops_the_closure_loop(tmp_path: Path) -> None:
     for round_tag, scanned in by_round.items():
         assert len(scanned) == len(set(scanned)), f"round {round_tag} scanned a scope twice"
         assert set(scanned) <= set(planned)
-    priorities = {w.scope_id: w.priority for w in board.work if w.kind.value in {"file_review", "investigation"}}
-    assert by_round["0"] == sorted(planned, key=priorities.get), "round 0 dispatches every scope in priority order"
+    assert set(by_round["0"]) == set(planned), "round 0 still dispatches every planned scope"
+    # A thematic scope starts after the coverage group for its source files so its first run can
+    # reuse complete reads. Priority still orders topics that have no unresolved file dependency.
+    opening_order = {scope: index for index, scope in enumerate(by_round["0"])}
+    for work in board.work:
+        if work.kind.value != "investigation" or work.scope_id not in opening_order:
+            continue
+        owned = set(coordinator._scope_files.get(work.scope_id) or [])
+        for other in board.work:
+            if other.kind.value != "file_review" or other.scope_id not in opening_order:
+                continue
+            if owned & set(coordinator._scope_files.get(other.scope_id) or []):
+                assert opening_order[other.scope_id] < opening_order[work.scope_id]
     # Every later round re-dispatches exactly what the previous closure left INSUFFICIENT. With a
     # fake tool layer that never returns a `read`, that is *every* scope which owns files -- the
     # service scope because it keeps finding new sites, and the web-route and config scopes because

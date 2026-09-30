@@ -48,8 +48,8 @@ def test_a_read_timeout_is_classified_as_unavailable_rather_than_escaping(monkey
 
     An escaping timeout is not a degraded call: the ReAct loop only catches `AIUnavailable` and
     `AIError`, so it ended the whole run. Measured on the Java benchmark, one hung request out of
-    roughly 170 killed a run with a bare traceback. As `AIUnavailable` it is retried by
-    `react._complete_with_retries`, and if it keeps failing it costs one agent instead of the run.
+    roughly 170 killed a run with a bare traceback. It is now classified as unavailable but
+    non-retryable: after waiting for a full answer, replaying the request may repeat its cost.
     """
     from services.ai.client import urllib_transport
 
@@ -57,8 +57,9 @@ def test_a_read_timeout_is_classified_as_unavailable_rather_than_escaping(monkey
         raise TimeoutError("The read operation timed out")
 
     monkeypatch.setattr("urllib.request.urlopen", hang)
-    with pytest.raises(AIUnavailable):
+    with pytest.raises(AIUnavailable) as caught:
         urllib_transport("http://example.invalid/v1/chat/completions", {}, "k", 2.0)
+    assert caught.value.retryable is False
 
 
 def make_bundle(root: Path) -> Path:

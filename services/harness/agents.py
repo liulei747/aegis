@@ -960,7 +960,10 @@ AGENTS: dict[str, AgentSpec] = {
         prompt=DISCOVERY_PROMPT + "\nPublish evidence, candidates and independent leads immediately with record. "
         "Record unfinished checks using kind=gap: unread/basic_check/relationship/tool_failure, "
         "with question,file,line,reason. Before finishing, resolve each known gap with state=resolved "
-        "and evidence_refs to recorded source facts, or retain its concrete breakpoint. "
+        "and evidence_refs to recorded source facts. If a check requires credentials, deployment state, "
+        "package versions, or other evidence outside this workspace, mark its gap state=blocked with "
+        "a specific reason and external check breakpoint; do not repeatedly retry it here. "
+        "Keep other unfinished gaps pending with a concrete breakpoint. "
         "Use board before key tracing and before finishing to read task updates. "
         "Evidence uses JSON {file,line,text,category: source_fact|hypothesis}; candidates use the final candidate fields. "
         "Leads use {to_scope,question,file,line,evidence_refs,why}. Follow cross-file relations needed for your "
@@ -1281,7 +1284,7 @@ def prefetch_scope_files(
     blackboard: Blackboard | None = None,
     from_disk: bool = False,
 ) -> tuple[list[AgentStep], list[str], list[str], list[str]]:
-    """Read a scope's files for a *re-dispatched* discovery run, reusing what the run already read.
+    """Seed a discovery run from complete earlier reads of its assigned files.
 
     The measurement that led here: 88 agent runs, 471 `read` calls, and the repository has six files.
     Every run read all of them -- `repo.py` was opened by 88 distinct runs. A re-dispatched discovery
@@ -1303,9 +1306,9 @@ def prefetch_scope_files(
     * **It is bounded, and it refuses rather than truncates.** A file is inlined only if it fits the
       remaining budget; anything larger is skipped and named, and the agent reads it itself. Handing
       over half a file while the ledger called it covered would be the worst outcome available here.
-    * **Only a re-dispatch, only this scope's files.** Round 0 keeps reading for itself (that is the
-      evidence the coverage rule is built on), and no agent is ever handed the whole repository --
-      files a scope does not own are not its business.
+    * **Only this scope's files.** Round 0 can reuse a coverage group's completed read of its
+      starting files; later rounds reuse earlier work in the same way. No agent is handed the whole
+      repository -- files a scope does not own are not its business.
     * **`budget = 0` switches it off**, so the cost can be measured against a run without it.
 
     **The default is blackboard-only.** A complete read this run already performed is the same bytes, so
@@ -1450,7 +1453,9 @@ def discovery_task(
     if blackboard.threats is not None:
         lines.append("Threat model (what matters here):\n" + _json(_dump(blackboard.threats)))
     seen = [
-        {"candidate_id": c.candidate_id, "title": c.title, "file": c.file, "line": c.line}
+        {"candidate_id": c.candidate_id, "title": c.title,
+         "vulnerability_type": c.vulnerability_type, "file": c.file, "line": c.line,
+         "entry_points": c.entry_points}
         for c in blackboard.candidates
         if c.scope_id == item.scope_id
     ]
@@ -1854,6 +1859,7 @@ def run(
     extra_system: str = "",
     initial_steps: list[AgentStep] | None = None,
     on_step: Callable[[AgentRun, AgentStep], None] | None = None,
+    on_context: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentOutcome:
     """Run one agent and parse its `final` into the agent's typed output.
 
@@ -1879,6 +1885,7 @@ def run(
         extra_system=extra_system,
         initial_steps=initial_steps,
         on_step=on_step,
+        on_context=on_context,
     )
     run_result.reused_files = _reused_files(initial_steps)
     parsed, error = parse_output(chosen.name, run_result, blackboard=blackboard, scope_id=scope_id)

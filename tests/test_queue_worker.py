@@ -71,6 +71,86 @@ def _entry(job, attempt: int = 1) -> dict:
     }
 
 
+def test_agent_budget_settings_override_environment_without_duplicate_fields(
+    job_store, job_stream, tmp_path, queue_settings, monkeypatch
+) -> None:
+    settings = _settings(tmp_path, queue_settings)
+    settings.ai.agent_max_model_calls = 7
+    settings.ai.agent_max_model_tokens = 1200
+    monkeypatch.setenv("AEGIS_HARNESS_AGENT_MAX_MODEL_CALLS", "3")
+    monkeypatch.setenv("AEGIS_HARNESS_AGENT_MAX_MODEL_TOKENS", "600")
+    config = _worker(job_store, job_stream, settings)._audit_config()
+    assert config.agent_max_model_calls == 7
+    assert config.agent_max_model_tokens == 1200
+
+
+def test_saved_agent_budget_reaches_new_audit_config(
+    job_store, job_stream, tmp_path, queue_settings
+) -> None:
+    from aegis_core.ai_runtime import AISettingsUpdate, save_ai
+
+    settings = _settings(tmp_path, queue_settings)
+    save_ai(settings, AISettingsUpdate(agent_max_model_calls=5, agent_max_model_tokens=900))
+    assert settings.ai.agent_max_model_calls == 0  # The worker's base settings are unchanged.
+    config = _worker(job_store, job_stream, settings)._audit_config()
+    assert config.agent_max_model_calls == 5
+    assert config.agent_max_model_tokens == 900
+
+
+def test_saved_zero_disables_environment_agent_budget(
+    job_store, job_stream, tmp_path, queue_settings, monkeypatch
+) -> None:
+    from aegis_core.ai_runtime import AISettingsUpdate, save_ai
+
+    settings = _settings(tmp_path, queue_settings)
+    monkeypatch.setenv("AEGIS_HARNESS_AGENT_MAX_MODEL_CALLS", "3")
+    monkeypatch.setenv("AEGIS_HARNESS_AGENT_MAX_MODEL_TOKENS", "600")
+    worker = _worker(job_store, job_stream, settings)
+    assert worker._audit_config().agent_max_model_calls == 3
+    save_ai(settings, AISettingsUpdate(agent_max_model_calls=0, agent_max_model_tokens=0))
+    config = worker._audit_config()
+    assert config.agent_max_model_calls == 0
+    assert config.agent_max_model_tokens == 0
+
+
+def test_blocked_job_keeps_heartbeating_until_it_finishes(
+    job_store, job_stream, tmp_path, workspace, queue_settings, monkeypatch
+) -> None:
+    settings = _settings(tmp_path, queue_settings)
+    job = _submit(job_store, workspace=workspace)[1]
+    worker = _worker(job_store, job_stream, settings)
+    worker._heartbeat_wait_s = 0.02
+    entered = threading.Event()
+    release = threading.Event()
+    heartbeat_count = 0
+    original_heartbeat = job_store.heartbeat
+
+    def count_heartbeat(*args, **kwargs):
+        nonlocal heartbeat_count
+        heartbeat_count += 1
+        return original_heartbeat(*args, **kwargs)
+
+    def blocked_run(_job, _teardown):
+        entered.set()
+        assert release.wait(2)
+        return JobResult(bundle_id="done")
+
+    monkeypatch.setattr(job_store, "heartbeat", count_heartbeat)
+    monkeypatch.setattr(worker, "_run", blocked_run)
+    thread = threading.Thread(target=worker.handle, args=(_entry(job),))
+    thread.start()
+    assert entered.wait(2)
+    try:
+        deadline = time.monotonic() + 1
+        while heartbeat_count < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert heartbeat_count >= 3, "the claim must refresh while _run is blocked"
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
 # --- the worker loop ---------------------------------------------------
 
 
@@ -448,6 +528,9 @@ def test_an_audit_job_runs_the_harness_under_the_shared_work_dir(
                 base={"run_id": self.run_id},
             )
             return self.trail
+
+        def close_evidence(self):
+            pass
 
         def run(self):
             self.run_dir.mkdir(parents=True, exist_ok=True)

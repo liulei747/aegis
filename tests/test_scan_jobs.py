@@ -260,8 +260,37 @@ def test_cancel_endpoint_stops_a_running_scan(client: TestClient, tmp_path: Path
         time.sleep(0.05)
     elapsed = time.monotonic() - started
 
-    assert client.get(f"/v1/scan/jobs/{job_id}").json()["state"] == "canceled"
+    final = client.get(f"/v1/scan/jobs/{job_id}").json()
+    assert final["state"] == "canceled", {
+        "cancel_response": cancelled.json(), "final": final,
+    }
     assert elapsed < 10.0, f"the cancel endpoint took {elapsed:.1f}s"
+
+
+def test_cancel_accepted_before_success_commit_discards_scan_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The scanner may return success just after the cancel event, before polling it again."""
+    from services.scan.runner import ScanOutcome
+
+    entered = threading.Event()
+
+    def finish_after_cancel(request):
+        entered.set()
+        assert request.cancel_event.wait(5)
+        return ScanOutcome(engine="fake-opengrep")
+
+    monkeypatch.setattr(jobs_module, "run_scan", finish_after_cancel)
+    job = ScanJob(job_id="S-race", request=ScanRequest(workspace=tmp_path, rule_config="auto"))
+    job.start()
+    assert entered.wait(5)
+    job.cancel()
+    job._thread.join(timeout=5)
+    assert job.state == CANCELED
+    assert job.outcome is not None and job.outcome.canceled
+    assert job.outcome.findings == []
+    assert job.outcome.scan_record is not None
+    assert job.outcome.scan_record.failure_mode == "scan_aborted"
 
 
 def test_unknown_scan_job_is_404(client: TestClient) -> None:

@@ -76,8 +76,10 @@ from aegis_core.cancel import CanceledAbort
 from aegis_core.logging import get_logger
 from services.harness import agents, coverage, report, survey
 from services.harness import blackboard as bb
+from services.harness import evidence as evidence_mod
 from services.harness import trail as trail_mod
-from services.harness.budget import BudgetClient, BudgetStop, RunBudget
+from services.harness.agent_runner import AgentRunner, AgentTask
+from services.harness.budget import AgentBudget, BudgetStop, RunBudget
 from services.harness.react import AgentRun, ToolLayerUnavailable
 from services.harness.tasks import TaskLedger
 
@@ -157,6 +159,13 @@ class HarnessConfig:
     max_cost_usd: float = 0
     input_usd_per_million: float = 0
     output_usd_per_million: float = 0
+    #: Per-agent-run caps, the middle layer between one request (`AIConfig.max_tokens`,
+    #: `context_input_tokens`) and the whole audit (`max_model_calls` / `max_model_tokens` above).
+    #: Every attempt, retries included, counts against both layers. Zero disables the layer; the
+    #: usage is still measured and written on `agent_end`. Off by default: `steps_per_agent`
+    #: already bounds turns, and a token cap that is right for one gateway is wrong for another.
+    agent_max_model_calls: int = 0
+    agent_max_model_tokens: int = 0
     #: Candidates recorded per scope. Bounds both the blackboard and the validation bill.
     candidates_per_scope: int = 5
     #: Turns per agent run. The hard budget the ReAct loop holds itself to.
@@ -281,6 +290,12 @@ class HarnessCoordinator:
         #: is left INSUFFICIENT instead of being paid for again -- see `max_scope_retries`. Reset to 0
         #: by any run that finishes, because the counter is about consecutive failure, not history.
         self._scope_failures: dict[str, int] = {}
+        #: Raw per-step evidence, written beside the trail from the same observer. `None` until a
+        #: trail is attached: a coordinator built for a test or a dry run has no run directory it
+        #: should be creating files in. See `services.harness.evidence`.
+        self._evidence: evidence_mod.StepArchive | None = None
+        self._evidence_warned: set[str] = set()
+        self._dirty_blackboard = False
         self.tasks = TaskLedger(self.blackboard, self.trail)
 
     # ── context ────────────────────────────────────────────────────────────
@@ -543,8 +558,16 @@ class HarnessCoordinator:
             changed = self.blackboard.revision > before
             revision = self.blackboard.revision
             agent = getattr(self._current, "agent", "")
-            if changed and agent == agents.DISCOVERY:
-                bb.save(self.blackboard, self.run_dir)
+            if changed or self._dirty_blackboard:
+                try:
+                    bb.save(self.blackboard, self.run_dir)
+                except Exception as exc:  # no success acknowledgement before durable commit
+                    self._dirty_blackboard = True
+                    return {
+                        "recorded": False,
+                        "reason": f"黑板落盘失败，稍后重试同一记录：{type(exc).__name__}: {exc}",
+                    }
+                self._dirty_blackboard = False
 
         if not changed:
             # A duplicate is not a failure, and saying so is what stops an agent from retrying it or
@@ -797,7 +820,17 @@ class HarnessCoordinator:
             base={"run_id": self.run_id, **(base or {})},
         )
         self.tasks.trail = self.trail
+        # The raw-step archive starts with the trail and for the same reason: attaching one is what
+        # "this run is being watched" means, and the archive is the unclipped half of that record.
+        if self._evidence is not None:
+            self._evidence.close()
+        self._evidence = evidence_mod.StepArchive(self.run_dir)
         return self.trail
+
+    def close_evidence(self) -> None:
+        """Release archive handles on normal completion, cancellation or fatal exit."""
+        if self._evidence is not None:
+            self._evidence.close()
 
     def _stage(self, name: str, fn) -> None:
         """Run one stage with its start/end events around it.
@@ -841,6 +874,17 @@ class HarnessCoordinator:
         """One turn of one agent, as an event. This is the agent's side of the conversation."""
         result = step.result
         self._current.active_run = run
+        if self._evidence is not None:
+            # Full record first, clipped event second: if the process dies between the two, the
+            # complete copy is the one on disk.
+            archived = self._evidence.record(run, step)
+            if not archived and run.run_id not in self._evidence_warned:
+                self._evidence_warned.add(run.run_id)
+                self.trail.emit(
+                    "error", where="evidence_archive", agent=run.agent, scope=run.scope_id,
+                    run_id=run.run_id,
+                    message="原始工具步骤未能写入证据归档；审计继续，但此 agent 的完整步骤可能无法回查",
+                )
         call = step.call
         arguments = {}
         if call is not None:
@@ -917,16 +961,25 @@ class HarnessCoordinator:
         self._current.active_run = None
         claim_ids = {cid for wid in work_ids for cid in self.tasks.get(wid).candidate_ids}
         versions = {c.candidate_id: c.evidence_version for c in self.blackboard.candidates if c.candidate_id in claim_ids}
+        agent_budget = AgentBudget(
+            max_model_calls=self.config.agent_max_model_calls,
+            max_model_tokens=self.config.agent_max_model_tokens,
+        )
         try:
             with self._model_slots:
                 self.check_abort(f"{agent}:{scope_id}")
-                client = kwargs.get("client")
-                if client is not None:
-                    kwargs["client"] = BudgetClient(client, self.budget, self.check_abort,
-                        on_progress=lambda progress: self.trail.emit(
-                            "model_progress", agent=agent, scope=scope_id,
-                            run_id=kwargs.get("run_id") or f"{agent}:{scope_id}", **progress))
-                outcome = agents.run(on_step=self._on_step, **kwargs)
+                runner = AgentRunner(
+                    run_budget=self.budget,
+                    check_abort=self.check_abort,
+                    on_step=self._on_step,
+                    on_progress=lambda progress: self.trail.emit(
+                        "model_progress", agent=agent, scope=scope_id,
+                        run_id=kwargs.get("run_id") or f"{agent}:{scope_id}", **progress),
+                    on_context=lambda info: self.trail.emit(
+                        "context_compaction", agent=agent, scope=scope_id,
+                        run_id=kwargs.get("run_id") or f"{agent}:{scope_id}", **info),
+                )
+                outcome = runner.run(AgentTask(**kwargs), agent_budget=agent_budget)
         except BaseException as exc:
             active = getattr(self._current, "active_run", None)
             if active is not None:
@@ -952,6 +1005,7 @@ class HarnessCoordinator:
                 steps=0,
                 parsed=False,
                 error=f"{type(exc).__name__}: {exc}",
+                usage=agent_budget.usage(),
             )
             raise
         finally:
@@ -984,7 +1038,17 @@ class HarnessCoordinator:
             # trail because it is the only place a reader can see the recovery working: the run looks
             # `finished` in every other record, and its lists may stop early.
             salvaged=outcome.run.salvaged,
+            reused_files=outcome.run.reused_files,
+            fresh_reads=sum(
+                1 for step in outcome.run.steps
+                if step.index > 0 and step.call is not None
+                and step.call.tool is ToolName.READ
+                and step.result is not None and step.result.ok
+            ),
             duration_ms=int((_now() - started).total_seconds() * 1000),
+            # What this run spent, per the same accounting the audit-wide budget uses (every
+            # attempt, retries included). `unknown_usage` counts responses without token figures.
+            usage=agent_budget.usage(),
         )
         self._check_model_availability(outcome.run)
         return outcome
@@ -1670,7 +1734,27 @@ class HarnessCoordinator:
             refs = payload.get("evidence_refs")
             facts = {r.record_id for r in self.blackboard.investigation_records
                      if r.category == "source_fact" and r.work_id == work.work_id}
-            if payload.get("state") != "resolved" or not isinstance(refs, list) or not refs or any(ref not in facts for ref in refs):
+            state = payload.get("state")
+            if state == "pending":
+                if refs is not None and (not isinstance(refs, list) or any(ref not in facts for ref in refs)):
+                    raise ValueError("更新缺口的证据必须来自本任务记录的源码事实")
+                if gap.state != "pending":
+                    raise ValueError("已结束的缺口不能重新置为待处理")
+                if payload.get("reason"):
+                    gap.reason = str(payload["reason"])
+                gap.evidence_refs = sorted(set(gap.evidence_refs) | set(refs or []))
+                self.tasks.update(owner.work_id, gaps=owner.gaps)
+                return f"缺口 {gap.gap_id} 仍待处理"
+            if state == "blocked":
+                reason = payload.get("reason")
+                if not isinstance(reason, str) or not reason.strip():
+                    raise ValueError("受阻缺口需要具体原因和外部检查断点")
+                if gap.state != "pending":
+                    raise ValueError("已结束的缺口不能重新置为受阻")
+                gap.state, gap.reason = "blocked", reason.strip()
+                self.tasks.update(owner.work_id, gaps=owner.gaps)
+                return f"缺口 {gap.gap_id} 已标记受阻"
+            if state != "resolved" or not isinstance(refs, list) or not refs or any(ref not in facts for ref in refs):
                 raise ValueError("解决已分配缺口需要本任务记录的源码事实证据")
             gap.state, gap.reason = "resolved", str(payload.get("reason") or "已补充源码检查")
             gap.evidence_refs = sorted(set(gap.evidence_refs) | set(refs))
@@ -1687,8 +1771,10 @@ class HarnessCoordinator:
         if not isinstance(refs, list) or any(not isinstance(ref, str) or ref not in facts for ref in refs):
             raise ValueError("缺口证据必须引用已记录的源码事实")
         state = payload.get("state", "pending")
-        if state not in {"pending", "resolved"} or (state == "resolved" and not refs):
+        if state not in {"pending", "resolved", "blocked"} or (state == "resolved" and not refs):
             raise ValueError("解决缺口需要源码事实证据")
+        if state == "blocked" and not str(payload.get("reason") or "").strip():
+            raise ValueError("受阻缺口需要具体原因和外部检查断点")
         identity = json.dumps([work.work_id, kind, file, line, " ".join(question.split()).casefold()])
         gap_id = "G-" + hashlib.sha256(identity.encode()).hexdigest()[:20]
         gap = next((g for g in work.gaps if g.gap_id == gap_id), None)
@@ -1798,7 +1884,9 @@ class HarnessCoordinator:
         the callers pass exactly the scopes they mean to spend on.
 
         Reuse happens in **every** round, round 0 included: a file another scope already read
-        completely is the same bytes, and re-fetching it costs a round trip per scope.
+        completely is the same bytes, and re-fetching it costs a round trip per scope. A thematic
+        task waits only for coverage groups that own its starting files; unrelated groups keep
+        running in parallel. This makes round-0 reuse deterministic for those files.
         """
         items = {
             item.scope_id: item for item in self.blackboard.work
@@ -1807,15 +1895,41 @@ class HarnessCoordinator:
         work = sorted([items[scope_id] for scope_id in scope_ids if scope_id in items], key=lambda item: item.priority)
         if not work:
             return {}
+        coverage_items = {item.scope_id: item for item in work if item.kind is WorkItemKind.FILE_REVIEW}
+        coverage_files = {scope: set(self._scope_files.get(scope) or []) for scope in coverage_items}
+        dependencies: dict[str, list[str]] = {}
+        ordered: list[WorkItem] = []
+        scheduled: set[str] = set()
+        for item in work:
+            if item.kind is WorkItemKind.FILE_REVIEW:
+                continue
+            wanted = set(self._scope_files.get(item.scope_id) or [])
+            deps = [scope for scope, files in coverage_files.items() if wanted & files]
+            dependencies[item.scope_id] = deps
+            for scope in deps:
+                if scope not in scheduled:
+                    ordered.append(coverage_items[scope])
+                    scheduled.add(scope)
+            ordered.append(item)
+            scheduled.add(item.scope_id)
+        for item in work:
+            if item.scope_id not in scheduled:
+                ordered.append(item)
+                scheduled.add(item.scope_id)
+        work = ordered
+        coverage_ready = {scope: threading.Event() for scope in coverage_items}
         new_by_scope: dict[str, int] = {}
         # Position plus round, so a scope re-dispatched for being INSUFFICIENT is approached from a
         # different perspective than the pass that failed to close it.
         positions = {item.scope_id: index for index, item in enumerate(work)}
 
         def one(item: WorkItem) -> None:
-            if item.state is WorkItemState.CANCELED:
-                return
             try:
+                for scope in dependencies.get(item.scope_id, []):
+                    while not coverage_ready[scope].wait(0.25):
+                        self.check_abort(f"discovery-dependency:{item.scope_id}")
+                if item.state is WorkItemState.CANCELED:
+                    return
                 _discover_one(item)
             except Exception:
                 # A run that raised (an unreachable gateway, a broken tool) never reached the
@@ -1825,6 +1939,9 @@ class HarnessCoordinator:
                     self._scope_failures.get(item.scope_id, 0) + 1
                 )
                 raise
+            finally:
+                if item.scope_id in coverage_ready:
+                    coverage_ready[item.scope_id].set()
 
         def _discover_one(item: WorkItem) -> None:
             with self._board_lock:
@@ -1942,7 +2059,6 @@ class HarnessCoordinator:
 
         batch_size = max(1, self.config.max_scopes_per_round)
         for offset in range(0, len(work), batch_size):
-            work[offset:] = sorted(work[offset:], key=lambda item: item.priority)
             self._bounded(work[offset:offset + batch_size], one, label="discovery")
         return new_by_scope
 
@@ -3155,6 +3271,8 @@ class HarnessCoordinator:
         if unavailable:
             notes.append(unavailable)
         report_path = report.write_report(self.blackboard, run_dir, notes=notes)
+        evidence_steps = self._evidence.written if self._evidence is not None else 0
+        self.close_evidence()
         # Last event, and the only one that is a *summary* rather than a happening: it carries the
         # counters a screen shows when the run is over, and `closed` so a reader polling the trail
         # can stop without also polling the job.
@@ -3168,6 +3286,7 @@ class HarnessCoordinator:
             fatal=fatal,
             counters=self.trail.counters(self.blackboard),
             execution_budget=self.blackboard.execution_budget,
+            evidence_steps=evidence_steps,
         )
         return HarnessResult(
             blackboard=self.blackboard,

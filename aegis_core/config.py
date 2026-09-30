@@ -81,11 +81,17 @@ class AIConfig(BaseModel):
     #: Use the protocol's **native tools/tool_calls** instead of the harness's own JSON-in-text
     #: protocol. Verified against `glm-5.3-flash` on the configured gateway (2026-09-29):
     #: `finish_reason="tool_calls"`, a `tool_call_id` round trip via `role:"tool"`, both honoured.
-    #: Off by default because the ReAct loop still runs the text protocol; the native loop exists
-    #: (`react.run_agent_native`) and is exercised by tests, but the default path stays the one the
-    #: whole test suite pins. Native tools are not implemented over streaming yet — asking for both
-    #: raises at the adapter.
+    #: Off by default; existing audits keep their text protocol until explicitly enabled.
+    #: The native loop supports streamed tool-call deltas in the model adapter.
     native_tools: bool = False
+    #: Optional estimated input-token ceiling for harness agent turns. Zero preserves the
+    #: historical transcript; a positive value compacts older observations before a request.
+    context_input_tokens: int = Field(default=0, ge=0, le=500_000)
+    #: Per-agent-run caps (batch 3: the layer between one request and the whole audit). Every
+    #: attempt counts, retries included; a run that hits its cap ends with `stop_reason=budget`
+    #: and the audit continues. Zero disables the cap; usage is reported on `agent_end` either way.
+    agent_max_model_calls: int = Field(default=0, ge=0, le=1000)
+    agent_max_model_tokens: int = Field(default=0, ge=0, le=10_000_000)
     #: Cap on contexts analysed in one run, so a 200-context bundle cannot quietly become 200
     #: paid calls. Whoever raises it is choosing to spend.
     max_contexts: int = Field(default=25, ge=1)

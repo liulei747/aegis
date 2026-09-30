@@ -100,6 +100,12 @@ class Worker:
         self._current_stage: str = JobStage.SCAN.value
         self._lock = threading.Lock()
         self._last_heartbeat = 0.0
+        # The claim may block inside a model request for minutes. Keep its lease and this
+        # worker's health key fresh independently of the consumer loop while a job runs.
+        self._heartbeat_wait_s = min(
+            settings.queue.heartbeat_interval_s,
+            settings.queue.visibility_timeout_s / 3,
+        )
         self._last_reap = 0.0
         self._poisoned = False
         self.reaper = Reaper(store, stream, settings, worker_id=self.worker_id)
@@ -180,6 +186,8 @@ class Worker:
         self._cancel_watch.clear()
 
         teardown = Teardown(reason="cancel")
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
         try:
             claimed = self.store.set_running(job_id, worker_id=self.worker_id, attempt=attempt)
             if claimed is None:
@@ -192,10 +200,19 @@ class Worker:
             # runs, so this snapshot is the only "it is scanning" the user can see. An AI job
             # has the same problem with its model calls, and the same answer.
             opening = first_stage(claimed.kind)
-            self._current_stage = opening.value
+            with self._lock:
+                self._current_stage = opening.value
             self.store.pin_stage(
                 job_id, opening, note="扫描中" if opening is JobStage.SCAN else opening.value
             )
+            self._maybe_heartbeat(force=True)
+            heartbeat_thread = threading.Thread(
+                target=self._heartbeat_until_stopped,
+                args=(heartbeat_stop,),
+                name=f"aegis-heartbeat-{job_id[:12]}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             teardown.begin()
 
             result = self._run(claimed, teardown)
@@ -216,6 +233,9 @@ class Worker:
                 recoverable=True,
             )
         finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=5)
             with self._lock:
                 self._current_job = None
             self._cancel_watch.clear()
@@ -413,7 +433,7 @@ class Worker:
         run_root = self.settings.work_dir / "audit"
         coordinator = HarnessCoordinator(
             workspace=workspace,
-            config=self._audit_config(request.audit_options, default_concurrency=default_ai.concurrency),
+            config=self._audit_config(request.audit_options, ai_config=default_ai),
             client=client,
             out_dir=run_root,
             run_id=job.job_id,
@@ -428,8 +448,9 @@ class Worker:
         try:
             result = coordinator.run()
         finally:
-            # Closed on every path, including a cancel: the trail is the only record a killed run
-            # leaves, so the handle must not be skipped by the exception that made it matter.
+            # Close both streams on every path, including cancellation and fatal exit. Each step
+            # has already been flushed, so the partial record remains readable after a crash.
+            coordinator.close_evidence()
             trail.close()
 
         run_dir = result.run_dir
@@ -497,7 +518,7 @@ class Worker:
             },
         )
 
-    def _audit_config(self, options=None, *, default_concurrency: int | None = None):
+    def _audit_config(self, options=None, *, ai_config=None):
         """The harness bounds for a queued audit.
 
         Model concurrency comes from settings unless this job overrides it. Other harness bounds
@@ -511,8 +532,11 @@ class Worker:
         candidates; file-overlap packing alone takes those 98 claims to ~44 runs, and every claim still
         gets its own verdict. It is off by default because it changes what a judging run is.
         """
+        from aegis_core.ai_runtime import effective_ai, saved_ai_fields
         from services.harness.budget import environment_limits
         from services.harness.coordinator import HarnessConfig
+
+        ai = ai_config or effective_ai(self.settings)
 
         raw = os.environ.get("AEGIS_HARNESS_CLAIM_BATCH_SIZE", "").strip()
         try:
@@ -522,11 +546,24 @@ class Worker:
                 "worker: AEGIS_HARNESS_CLAIM_BATCH_SIZE=%r is not an integer; using 1", raw
             )
             batch_size = 1
+        limits = environment_limits()
+        env_agent_calls = limits.pop("agent_max_model_calls", 0)
+        env_agent_tokens = limits.pop("agent_max_model_tokens", 0)
+        saved_fields = saved_ai_fields(self.settings)
+        # The per-agent-run caps come from the saved settings when the user set one; the
+        # AEGIS_HARNESS_AGENT_MAX_* environment caps fill in only when the field was never saved.
+        # A saved zero deliberately disables the cap, even if the environment has a default.
+        agent_calls = (ai.agent_max_model_calls if "agent_max_model_calls" in saved_fields
+                       else ai.agent_max_model_calls or env_agent_calls)
+        agent_tokens = (ai.agent_max_model_tokens if "agent_max_model_tokens" in saved_fields
+                        else ai.agent_max_model_tokens or env_agent_tokens)
         config = HarnessConfig(
             concurrency=max(1, options.concurrency if options and options.concurrency is not None
-                            else default_concurrency or self.settings.ai.concurrency),
+                            else ai.concurrency),
             claim_batch_size=max(1, batch_size),
-            **environment_limits(),
+            agent_max_model_calls=agent_calls,
+            agent_max_model_tokens=agent_tokens,
+            **limits,
         )
         if options and options.steps_per_agent is not None:
             config.steps_per_agent = options.steps_per_agent
@@ -712,13 +749,17 @@ class Worker:
     # ------------------------------------------------------------------
     # periodic work
     # ------------------------------------------------------------------
-    def _maybe_heartbeat(self) -> None:
+    def _heartbeat_until_stopped(self, stop: threading.Event) -> None:
+        while not stop.wait(max(0.01, self._heartbeat_wait_s)):
+            self._maybe_heartbeat(force=True)
+
+    def _maybe_heartbeat(self, *, force: bool = False) -> None:
         interval = self.settings.queue.heartbeat_interval_s
         now = time.monotonic()
-        if now - self._last_heartbeat < interval:
-            return
-        self._last_heartbeat = now
         with self._lock:
+            if not force and now - self._last_heartbeat < interval:
+                return
+            self._last_heartbeat = now
             job_id = self._current_job
             stage = _STAGES.get(self._current_stage)
         if job_id is not None:

@@ -73,6 +73,7 @@ class StreamingChatTransport:
         async def read():
             nonlocal last_activity
             content = []
+            tool_calls: dict[int, dict] = {}
             model = payload.get("model", "")
             usage = None
             finish = None
@@ -109,10 +110,25 @@ class StreamingChatTransport:
                         if value == "[DONE]":
                             if not finish:
                                 raise fail("stream_incomplete", "stream ended without finish_reason")
-                            if not content:
+                            if not content and not tool_calls:
                                 raise fail("empty_answer", f"no answer content; finish_reason={finish}")
+                            if bool(tool_calls) != (finish == "tool_calls"):
+                                raise fail("stream_protocol", "tool calls and finish_reason disagree")
+                            completed_calls = []
+                            for index in sorted(tool_calls):
+                                call = tool_calls[index]
+                                if not call["id"] or not call["name"]:
+                                    raise fail("stream_incomplete", f"tool call {index} has no id or name")
+                                completed_calls.append({
+                                    "id": call["id"], "type": "function",
+                                    "function": {"name": call["name"], "arguments": call["arguments"]},
+                                })
                             return {"model": model, "choices": [{"message": {"content": "".join(content)},
-                                    "finish_reason": finish}], "usage": usage}
+                                    "finish_reason": finish}], "usage": usage} if not completed_calls else {
+                                        "model": model, "choices": [{"message": {
+                                            "content": "".join(content), "tool_calls": completed_calls},
+                                            "finish_reason": finish}], "usage": usage,
+                                    }
                         try:
                             event = json.loads(value)
                             if not isinstance(event, dict):
@@ -141,6 +157,29 @@ class StreamingChatTransport:
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
                         if not isinstance(text, str) or not isinstance(reasoning, str):
                             raise fail("stream_protocol", "unsupported delta content type")
+                        tool_deltas = delta.get("tool_calls") or []
+                        if not isinstance(tool_deltas, list):
+                            raise fail("stream_protocol", "tool_calls delta is not a list")
+                        for part in tool_deltas:
+                            if not isinstance(part, dict) or type(part.get("index")) is not int:
+                                raise fail("stream_protocol", "tool call has no integer index")
+                            index = part["index"]
+                            if index < 0 or index >= 8:
+                                raise fail("stream_protocol", "too many tool calls in one response")
+                            call = tool_calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                            function = part.get("function") or {}
+                            if not isinstance(function, dict):
+                                raise fail("stream_protocol", "invalid tool function delta")
+                            for target, fragment in (("id", part.get("id")),
+                                                     ("name", function.get("name")),
+                                                     ("arguments", function.get("arguments"))):
+                                if fragment is not None:
+                                    if not isinstance(fragment, str):
+                                        raise fail("stream_protocol", "tool call fragment is not text")
+                                    call[target] += fragment
+                            if any(len(call[key]) > limit for key, limit in
+                                   (("id", 256), ("name", 256), ("arguments", 65_536))):
+                                raise fail("stream_protocol", "tool call exceeds size limit")
                         previous = state["status"]
                         if text:
                             content.append(text)
@@ -153,7 +192,7 @@ class StreamingChatTransport:
                         elif reasoning:
                             state["status"] = "reasoning"
                         state["reasoning_chars"] += len(reasoning)
-                        if text or reasoning or choice.get("finish_reason"):
+                        if text or reasoning or tool_deltas or choice.get("finish_reason"):
                             last_activity = now
                         finish = choice.get("finish_reason") or finish
                         if previous != state["status"]:

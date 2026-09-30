@@ -39,6 +39,7 @@ from aegis_core.logging import get_logger
 from app.api.deps import get_job_queue, get_settings
 from app.api.jobs import _queue_unavailable, submit
 from app.schemas.api import AuditRequest
+from services.harness import evidence as evidence_mod
 from services.harness import trail as trail_mod
 
 log = get_logger(__name__)
@@ -157,6 +158,11 @@ def archive_previous_attempt(job_id: str, attempt: int, settings: Settings) -> l
             trail.unlink()
     except OSError as exc:
         log.warning("无法删除上次尝试的 %s（作业 %s）：%s", TRAIL_ARTIFACT, job_id, exc)
+    marker = evidence_mod.evidence_dir(run_dir) / evidence_mod.SESSION_FILE
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("无法清除上次尝试的证据会话标记（作业 %s）：%s", job_id, exc)
     return archived
 
 
@@ -212,6 +218,34 @@ def audit_trail(
         "job_id": job_id,
         "trail": str(path),
         **page,
+    }
+
+
+@router.get("/v1/audit/{job_id}/evidence", response_model=None)
+def audit_evidence(
+    job_id: str,
+    run_id: str = Query(..., min_length=1, max_length=256),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(1, ge=1, le=10),
+    queue: tuple = Depends(get_job_queue),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Read a bounded page of original tool steps for one agent run."""
+    job = _known_job(job_id, queue)
+    run_dir = _run_dir(job_id, settings)
+    session_id = evidence_mod.current_session(run_dir)
+    if session_id:
+        steps = evidence_mod.read_run_steps(run_dir, run_id, session_id=session_id)
+    elif job.state.value in {"succeeded", "failed", "canceled"}:
+        steps = evidence_mod.read_run_steps(run_dir, run_id)
+    else:
+        steps = []
+    return {
+        "job_id": job_id,
+        "run_id": run_id,
+        "offset": offset,
+        "total": len(steps),
+        "steps": [step.model_dump(mode="json") for step in steps[offset:offset + limit]],
     }
 
 

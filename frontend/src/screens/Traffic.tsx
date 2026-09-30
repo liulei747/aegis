@@ -122,7 +122,11 @@ function ModelTrafficPanel({ needle, onlyProblems }: { needle: string; onlyProbl
                 <td className="note">{entry.model}</td>
                 <td className="num">{entry.attempt > 1 ? `第 ${entry.attempt} 次` : "—"}</td>
                 <td className="num">{formatDurationMs(entry.duration_ms)}</td>
-                <td className="num">{formatCount(entry.prompt_tokens ?? 0)}</td>
+                <td className="num" title={entry.prompt_tokens == null ?
+                  (entry.prompt_token_estimate_source ?? "服务商未返回输入 Token") : "服务商返回的实际输入 Token"}>
+                  {entry.prompt_tokens != null ? formatCount(entry.prompt_tokens)
+                    : entry.prompt_token_estimate != null ? `≈${formatCount(entry.prompt_token_estimate)}` : "—"}
+                </td>
                 <td className="num">{formatCount(entry.completion_tokens ?? 0)}</td>
                 <td className="num">{formatCount(entry.cached_tokens ?? 0)}</td>
                 <td className="note">{entry.finish_reason || "—"}{entry.stream ? <details><summary>流式诊断</summary>

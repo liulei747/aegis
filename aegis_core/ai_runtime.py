@@ -17,7 +17,9 @@ from aegis_core.config import AIConfig, Settings
 
 _FIELDS = frozenset({"enabled", "base_url", "model", "timeout_s", "concurrency",
                      "temperature", "max_tokens", "max_contexts", "streaming",
-                     "connect_timeout_s", "stream_idle_timeout_s", "stream_total_timeout_s"})
+                     "connect_timeout_s", "stream_idle_timeout_s", "stream_total_timeout_s",
+                     "native_tools", "context_input_tokens",
+                     "agent_max_model_calls", "agent_max_model_tokens"})
 
 
 class AISettingsUpdate(BaseModel):
@@ -26,6 +28,10 @@ class AISettingsUpdate(BaseModel):
     model: str | None = None
     timeout_s: float | None = Field(default=None, ge=10, le=600)
     streaming: bool | None = None
+    native_tools: bool | None = None
+    context_input_tokens: int | None = Field(default=None, ge=0, le=500_000)
+    agent_max_model_calls: int | None = Field(default=None, ge=0, le=1000)
+    agent_max_model_tokens: int | None = Field(default=None, ge=0, le=10_000_000)
     connect_timeout_s: float | None = Field(default=None, ge=1, le=120)
     stream_idle_timeout_s: float | None = Field(default=None, ge=10, le=600)
     stream_total_timeout_s: float | None = Field(default=None, ge=30, le=3600)
@@ -60,6 +66,11 @@ def _read(settings: Settings) -> dict:
     return value
 
 
+def saved_ai_fields(settings: Settings) -> frozenset[str]:
+    """Names explicitly saved by the local console, including zero-valued overrides."""
+    return frozenset(_read(settings)) & _FIELDS
+
+
 def effective_ai(settings: Settings) -> AIConfig:
     saved = _read(settings)
     values = settings.ai.model_dump(exclude={"api_key"})
@@ -78,6 +89,10 @@ def ai_view(settings: Settings) -> dict:
         "model": config.model,
         "timeout_s": config.timeout_s,
         "streaming": config.streaming,
+        "native_tools": config.native_tools,
+        "context_input_tokens": config.context_input_tokens,
+        "agent_max_model_calls": config.agent_max_model_calls,
+        "agent_max_model_tokens": config.agent_max_model_tokens,
         "connect_timeout_s": config.connect_timeout_s,
         "stream_idle_timeout_s": config.stream_idle_timeout_s,
         "stream_total_timeout_s": config.stream_total_timeout_s,

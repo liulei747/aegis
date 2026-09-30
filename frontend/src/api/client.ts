@@ -18,6 +18,7 @@ import type {
   AIReport,
   AITrafficReport,
   AuditReport,
+  AuditEvidence,
   AuditTrail,
   BundleDiff,
   BundleSummary,
@@ -210,6 +211,12 @@ export const api = {
     request<AuditTrail>(
       `/v1/audit/${encodeURIComponent(jobId)}/trail` +
         `?after_seq=${afterSeq}&limit=${limit}`,
+    ),
+
+  auditEvidence: (jobId: string, runId: string, offset = 0) =>
+    request<AuditEvidence>(
+      `/v1/audit/${encodeURIComponent(jobId)}/evidence` +
+        `?run_id=${encodeURIComponent(runId)}&offset=${offset}&limit=1`,
     ),
 
   /** 跑完之后的那份 markdown 报告；404 表示还没跑完。 */

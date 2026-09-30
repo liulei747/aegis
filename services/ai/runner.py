@@ -67,6 +67,7 @@ def client_from(config: AIConfig, *, transport=None) -> ChatClient:
         timeout_s=config.timeout_s,
         max_tokens=config.max_tokens,
         native_tools=config.native_tools,
+        context_input_tokens=config.context_input_tokens,
         streaming=config.streaming,
         connect_timeout_s=config.connect_timeout_s,
         stream_idle_timeout_s=config.stream_idle_timeout_s,

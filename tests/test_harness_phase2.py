@@ -52,10 +52,31 @@ def test_gap_is_persistent_idempotent_and_requires_evidence(tmp_path):
     assert len(work.gaps) == 1
     assert json.loads((co.run_dir / "blackboard.json").read_text(encoding="utf-8"))["work"][0]["gaps"]
     assert not record(co, "gap", gap_id=work.gaps[0].gap_id, state="resolved", evidence_refs=[])["recorded"]
+    assert record(co, "gap", gap_id=work.gaps[0].gap_id, state="pending",
+                  reason="Deployment settings are outside this workspace")["recorded"]
+    assert work.gaps[0].reason == "Deployment settings are outside this workspace"
     assert record(co, "gap", gap_id=work.gaps[0].gap_id, state="resolved", evidence_refs=[fact(co)])["recorded"]
     assert work.gaps[0].state == "resolved"
+    assert not record(co, "gap", gap_id=work.gaps[0].gap_id, state="pending",
+                      reason="Reopen without new task")["recorded"]
     assert gap(co)["recorded"]
     assert work.gaps[0].state == "resolved"
+
+
+def test_external_gap_can_be_blocked_without_repeated_discovery(tmp_path, monkeypatch):
+    co = make(tmp_path, max_gap_continuations=4)
+    assert gap(co, "tool_failure")["recorded"]
+    work = co.tasks.get("W-a")
+    gap_id = work.gaps[0].gap_id
+    assert not record(co, "gap", gap_id=gap_id, state="blocked")["recorded"]
+    assert record(co, "gap", gap_id=gap_id, state="blocked",
+                  reason="Package version exists only in deployment; inspect deployed lockfile")["recorded"]
+    assert work.gaps[0].state == "blocked"
+    calls = []
+    monkeypatch.setattr(co, "_discover", lambda scopes, **kw: calls.append(scopes))
+    co._continue_gaps()
+    assert calls == []
+    assert work.gaps[0].reason == "Package version exists only in deployment; inspect deployed lockfile"
 
 
 def test_relationship_gap_can_only_be_resolved_by_assigned_investigator(tmp_path, monkeypatch):

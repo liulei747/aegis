@@ -78,6 +78,36 @@ test("没有结束事件的 agent 是在跑，不是失败", () => {
   assert.equal(rows[1]?.parsed, false);
 });
 
+test("Agent 结束事件保留调用与 Token 预算用量", () => {
+  const usage = { model_calls: 3, tokens: 420, prompt_tokens: 300, completion_tokens: 120,
+    unknown_usage: 0, max_model_calls: 5, max_model_tokens: 1000, stop_reason: "" };
+  const rows = agentRows([
+    event(1, "agent_start", { run_id: "a", agent: "discovery", scope: "s" }),
+    event(2, "agent_end", { run_id: "a", stop_reason: "finished", usage }),
+  ]);
+  assert.deepEqual(rows[0]?.usage, usage);
+});
+
+test("agent 结束事件区分真实 read 和复用的旧证据", () => {
+  const rows = agentRows([
+    event(1, "agent_start", { run_id: "a", agent: "discovery", scope: "s" }),
+    event(2, "agent_end", { run_id: "a", stop_reason: "finished", fresh_reads: 2,
+      reused_files: ["src/A.java"] }),
+  ]);
+  assert.equal(rows[0]?.freshReads, 2);
+  assert.deepEqual(rows[0]?.reusedFiles, ["src/A.java"]);
+});
+
+test("临时模型故障显示下次重试次数和原因", () => {
+  const rows = agentRows([
+    event(1, "agent_start", { run_id: "a", agent: "recon", scope: "workspace" }),
+    event(2, "model_progress", { run_id: "a", status: "retrying", attempt: 2,
+      max_attempts: 4, retry_delay_s: 1.5, failure_reason: "temporary 503" }),
+  ]);
+  assert.match(rows[0]?.progress ?? "", /重试 2 \/ 4/);
+  assert.match(rows[0]?.progress ?? "", /temporary 503/);
+});
+
 test("每个停止原因映射到自己的状态，未知原因不假装成功", () => {
   const rows = agentRows([
     event(1, "agent_start", { run_id: "a", agent: "x", scope: "s" }),
@@ -112,6 +142,28 @@ test("对话流带着想法、工具、参数和结果", () => {
   assert.deepEqual(rows[0]?.arguments, { path: "ItemMapper.xml" });
   assert.equal(rows[0]?.summary, "第 1-40 行");
   assert.equal(rows[0]?.thought, "先看 mapper");
+});
+
+test("对话流区分模型、参数和工具执行失败", () => {
+  const rows = dialogue([
+    event(1, "agent_step", { thought: "model call failed: AIUnavailable: timed out" }),
+    event(2, "agent_step", { tool: "grep", ok: false, error: "pattern 必须是非空正则" }),
+    event(3, "agent_step", { tool: "read", ok: false, error: "读取磁盘失败" }),
+    event(4, "agent_step", { thought: "context budget exceeded: estimate too large" }),
+  ]);
+  assert.deepEqual(rows.map((row) => row.failureKind),
+    ["model", "tool_arguments", "tool_execution", "context_budget"]);
+});
+
+test("上下文压缩事件显示在 agent 进度中，不增加工具步数", () => {
+  const rows = agentRows([
+    event(1, "agent_start", { run_id: "r1", agent: "discovery", scope: "s1" }),
+    event(2, "context_compaction", { run_id: "r1", state: "compacted", before_tokens: 9000,
+      after_tokens: 4000, budget_tokens: 5000, archived_steps: [1, 2] }),
+  ]);
+  assert.match(rows[0]?.progress ?? "", /9000 → 4000/);
+  assert.equal(rows[0]?.steps, 0);
+  assert.equal(rows[0]?.toolCalls, 0);
 });
 
 test("过滤对话时同时报告总数和命中数", () => {

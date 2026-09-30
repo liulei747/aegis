@@ -47,9 +47,13 @@ export function taskStatusReason(task: AuditWorkItem, evidence: AuditEvent[]): s
   const modelFailure = [...evidence].reverse().find(event =>
     event.kind === "agent_step" && (event.thought ?? "").startsWith("model call failed:"),
   )?.thought ?? "";
+  const contextFailure = [...evidence].reverse().find(event =>
+    event.kind === "agent_step" && (event.thought ?? "").startsWith("context budget exceeded:"),
+  )?.thought ?? "";
   // Legacy runs stored a generic attempt error while the concrete provider failure
   // lived in the final turn.  Prefer that concrete turn over the placeholder.
-  const detail = modelFailure || attemptError;
+  const detail = contextFailure || modelFailure || attemptError;
+  if (contextFailure) return `输入上下文超过配置预算；可提高输入预算或缩小任务范围。具体错误：${detail}`;
   const lowered = detail.toLowerCase();
   if (lowered.includes("aiunavailable") || lowered.includes("model call failed")) {
     const transport = lowered.includes("unexpected_eof_while_reading") ||
@@ -93,6 +97,7 @@ export const EVENT_LABEL: Readonly<Record<string, string>> = {
   stage: "阶段",
   agent_start: "开始",
   model_progress: "模型进度",
+  context_compaction: "上下文压缩",
   agent_step: "对话",
   agent_end: "结束",
   candidate: "候选",
@@ -153,6 +158,9 @@ export interface AgentRow {
   lastSeq: number;
   parsed: boolean | null;
   error: string | null;
+  usage?: AuditEvent["usage"];
+  reusedFiles?: string[];
+  freshReads?: number;
 }
 
 /** 所有 agent 运行，按开始顺序。这一屏的主表：14 个 scope 各自在干什么。 */
@@ -183,8 +191,17 @@ export function agentRows(events: AuditEvent[]): AgentRow[] {
     if (!row) continue; // 一个没有 start 的 step：轨迹被截断过，不猜它的归属
     row.lastSeq = event.seq;
     if (event.kind === "model_progress") {
+      if (event.status === "retrying") {
+        row.progress = `模型请求重试 ${event.attempt ?? "?"} / ${event.max_attempts ?? "?"}，等待 ${event.retry_delay_s ?? 0} 秒；${event.failure_reason ?? event.failure_code ?? "临时故障"}`;
+        continue;
+      }
       const labels: Record<string, string> = { waiting: "等待响应", reasoning: "推理中", responding: "生成回答", completed: "回答接收完成", failed: "请求失败", cancelled: "已取消", stopped: "已停止" };
       row.progress = `${labels[event.status ?? ""] ?? event.status ?? "模型调用"} · ${Math.round((event.elapsed_ms ?? 0) / 1000)} 秒 · 正文 ${event.content_chars ?? 0} 字符 · 距生成活动 ${Math.round((event.idle_ms ?? 0) / 1000)} 秒${event.failure_code ? ` · ${event.failure_code}` : ""}`;
+    }
+    if (event.kind === "context_compaction") {
+      row.progress = event.state === "rejected"
+        ? `输入上下文超预算：压缩后约 ${event.after_tokens ?? 0} / ${event.budget_tokens ?? 0} Token`
+        : `已压缩旧观察：约 ${event.before_tokens ?? 0} → ${event.after_tokens ?? 0} Token`;
     }
     if (event.kind === "agent_step") {
       if (event.tool) row.progress = `工具执行完成：${event.tool}`;
@@ -194,6 +211,8 @@ export function agentRows(events: AuditEvent[]): AgentRow[] {
     if (event.kind === "agent_end") {
       const reason = event.stop_reason ?? "";
       row.stopReason = reason;
+      row.reusedFiles = event.reused_files;
+      row.freshReads = event.fresh_reads;
       row.state =
         reason === "finished"
           ? "finished"
@@ -205,6 +224,7 @@ export function agentRows(events: AuditEvent[]): AgentRow[] {
       if (typeof event.steps === "number") row.steps = event.steps;
       row.parsed = event.parsed ?? null;
       row.error = event.error ?? null;
+      row.usage = event.usage;
     }
   }
   return order.map((runId) => runs.get(runId)!);
@@ -223,6 +243,7 @@ export interface DialogueRow {
   ok: boolean | null;
   summary: string;
   error: string | null;
+  failureKind: "model" | "context_budget" | "tool_arguments" | "tool_execution" | null;
 }
 
 /**
@@ -235,6 +256,9 @@ export function dialogue(events: AuditEvent[]): DialogueRow[] {
   const rows: DialogueRow[] = [];
   for (const event of events) {
     if (event.kind !== "agent_step") continue;
+    const error = event.error ?? null;
+    const thought = event.thought ?? "";
+    const parameterFailure = !!error && /参数|缺少|必须|pattern|path|empty_text|unknown|未知工具/i.test(error);
     rows.push({
       seq: event.seq,
       at: event.at,
@@ -242,12 +266,16 @@ export function dialogue(events: AuditEvent[]): DialogueRow[] {
       scope: event.scope ?? "",
       runId: event.run_id ?? "",
       index: typeof event.index === "number" ? event.index : null,
-      thought: event.thought ?? "",
+      thought,
       tool: event.tool ?? null,
       arguments: event.arguments ?? {},
       ok: event.ok ?? null,
       summary: event.summary ?? "",
-      error: event.error ?? null,
+      error,
+      failureKind: thought.startsWith("context budget exceeded:") ? "context_budget"
+        : thought.startsWith("model call failed:") ? "model"
+        : parameterFailure ? "tool_arguments"
+        : error ? "tool_execution" : null,
     });
   }
   return rows;

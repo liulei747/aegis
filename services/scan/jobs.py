@@ -31,6 +31,7 @@ from typing import Any
 
 from aegis_core.logging import get_logger
 from services.scan.runner import ScanOutcome, ScanRequest, run_scan
+from services.scan.scanrecord import build_scan_record
 
 log = get_logger(__name__)
 
@@ -98,6 +99,28 @@ class ScanJob:
                 self.finished_at = datetime.now(timezone.utc)
             return
         with self._lock:
+            if self.cancel_event.is_set() and not outcome.canceled:
+                # The cancel was accepted while this job was still running, but the scanner
+                # completed before its next abort poll. Discard that result atomically with
+                # the state transition; a canceled job must not expose successful findings.
+                outcome = ScanOutcome(
+                    engine=outcome.engine,
+                    engine_version=outcome.engine_version,
+                    warnings=[*outcome.warnings, "扫描在取消请求后完成；结果已丢弃"],
+                    degraded=True,
+                    canceled=True,
+                    scan_record=build_scan_record(
+                        engine=outcome.engine,
+                        engine_version=outcome.engine_version,
+                        sarif_path=None,
+                        command=outcome.command,
+                        configured=bool(self.request.rule_config or self.request.rules),
+                        stderr=outcome.stderr_tail,
+                        findings=[],
+                        returncode=outcome.returncode,
+                        failure_mode="scan_aborted",
+                    ),
+                )
             self.outcome = outcome
             self.state = CANCELED if outcome.canceled else SUCCEEDED
             if outcome.canceled:

@@ -8,6 +8,7 @@ dist/
 .venv/
 venv/
 .pytest_cache/
+pytest-temp*/
 .ruff_cache/
 .mypy_cache/
 secaudit-scans/

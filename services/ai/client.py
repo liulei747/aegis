@@ -97,9 +97,11 @@ def urllib_transport(url: str, payload: dict, api_key: str, timeout_s: float) ->
         # `TimeoutError` since 3.10, and it is neither an `HTTPError` nor a `URLError`, so it used to
         # escape both handlers below -- and because the ReAct loop only catches `AIUnavailable` /
         # `AIError`, it killed the whole run instead of one call. Measured: a single hung request out
-        # of roughly 170 ended a benchmark run with a bare traceback. Classified as unavailable it is
-        # retried by `react._complete_with_retries`, and if it keeps failing it costs one agent.
-        raise AIUnavailable(f"{url} timed out after {timeout_s:.0f}s") from exc
+        # of roughly 170 ended a benchmark run with a bare traceback. The full response may
+        # already have been generated upstream, so do not resend this expensive request blindly.
+        failure = AIUnavailable(f"{url} timed out after {timeout_s:.0f}s")
+        failure.retryable = False
+        raise failure from exc
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:600]
         # 4xx is our fault (bad key, bad model, prompt too long); 5xx and 429 are worth another
@@ -130,24 +132,26 @@ def _usage_from(body: dict) -> TokenUsage | None:
 
 
 def _tool_calls_from(message: dict) -> tuple[NativeToolCall, ...]:
-    """The model's native tool calls, in order. Malformed entries are skipped and logged —
-    a call without an id cannot be answered with `role:"tool"`, and answering *some other*
-    id would attach the wrong result to the wrong request."""
+    """Validate all native calls before the harness may execute any of them."""
     out: list[NativeToolCall] = []
+    seen: set[str] = set()
     for raw in message.get("tool_calls") or []:
-        if not isinstance(raw, dict):
-            continue
-        call_id = str(raw.get("id") or "")
-        function = raw.get("function") or {}
-        name = str(function.get("name") or "")
-        if not call_id or not name:
-            log.warning("ai: dropping a malformed tool call (id=%r name=%r)", call_id, name)
-            continue
+        if not isinstance(raw, dict) or not isinstance(raw.get("function"), dict):
+            raise AIError("malformed native tool call: missing function")
+        function = raw["function"]
+        call_id, name = raw.get("id"), function.get("name")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            raise AIError("malformed native tool call: missing id or name")
+        if call_id in seen:
+            raise AIError("duplicate native tool_call_id in one response")
+        seen.add(call_id)
         arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            raise AIError("malformed native tool call: arguments must be text")
         out.append(NativeToolCall(
             call_id=call_id,
             name=name,
-            arguments=arguments if isinstance(arguments, str) else json.dumps(arguments or {}),
+            arguments=arguments,
         ))
     return tuple(out)
 
@@ -169,6 +173,7 @@ class ChatClient:
         stream_idle_timeout_s: float = 180.0,
         stream_total_timeout_s: float = 900.0,
         native_tools: bool = False,
+        context_input_tokens: int = 0,
         transport: Transport = urllib_transport,
     ) -> None:
         if not base_url.strip():
@@ -194,6 +199,7 @@ class ChatClient:
         #: it (`complete_messages` with `tools`); this flag is what the harness loop reads to decide
         #: which protocol a run uses.
         self.native_tools = native_tools
+        self.context_input_tokens = context_input_tokens
 
     @property
     def url(self) -> str:
@@ -225,15 +231,9 @@ class ChatClient:
         when present the request carries `tools` + `tool_choice:"auto"` and the response's
         `message.tool_calls` are parsed into `ChatResult.tool_calls`.
 
-        Not implemented over streaming yet: streaming accumulates content deltas, and
-        tool-call deltas need their own accumulator (batch 3). Asking for both raises
-        rather than silently dropping one side of the request.
+        Streaming accumulates tool-call fragments by index, then validates them before any
+        tool is executed. A disconnected partial stream is never surfaced as a tool request.
         """
-        if tools and self.streaming:
-            raise AIError(
-                "native tools 尚不支持流式接收：请关闭 streaming 或 native tools 之一"
-                "（流式下的 tool_calls 增量累积属于后续批次）"
-            )
         payload: dict[str, Any] = {
             "model": self.model,
             "temperature": self.temperature,

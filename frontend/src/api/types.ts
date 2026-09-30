@@ -191,6 +191,17 @@ export interface AuditEvent {
   content_chars?: number;
   reasoning_chars?: number;
   failure_code?: string;
+  failure_reason?: string;
+  attempt?: number;
+  max_attempts?: number;
+  retry_delay_s?: number;
+  protocol?: "text" | "native";
+  before_tokens?: number;
+  after_tokens?: number;
+  budget_tokens?: number;
+  estimate_source?: string;
+  archived_steps?: number[];
+  archived_call_ids?: string[];
   /** 阶段事件：prep / security_inventory / recon / threat_model / plan / discovery / validation / attack_path / findings / close。 */
   stage?: string;
   state?: string;
@@ -208,6 +219,18 @@ export interface AuditEvent {
   error?: string | null;
   tools?: string[];
   stop_reason?: string;
+  usage?: {
+    model_calls: number;
+    tokens: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    unknown_usage: number;
+    max_model_calls: number;
+    max_model_tokens: number;
+    stop_reason: string;
+  };
+  reused_files?: string[];
+  fresh_reads?: number;
   steps?: number;
   parsed?: boolean;
   /** candidate / verdict / attack_path / finding：账本上的东西。 */
@@ -249,6 +272,7 @@ export interface AuditEvent {
 export type AuditEventKind =
   | "work_item"
   | "model_progress"
+  | "context_compaction"
   | "stage"
   | "agent_start"
   | "agent_step"
@@ -309,6 +333,15 @@ export interface AuditTrail {
   exists: boolean;
 }
 
+export interface AuditEvidence {
+  job_id: string;
+  run_id: string;
+  offset: number;
+  total: number;
+  steps: { index: number; thought: string; call: { tool: string; arguments: Record<string, unknown> } | null;
+    result: { ok: boolean; summary: string; data: Record<string, unknown>; error: string | null; truncated: boolean } | null }[];
+}
+
 export interface AuditReport {
   job_id: string;
   run_dir: string;
@@ -336,6 +369,8 @@ export interface AITrafficEntry {
   duration_ms: number;
   /** 输入/输出的**字符数**，与下面的 token 不同：token 要 provider 报，字符数总是有。 */
   prompt_chars: number;
+  prompt_token_estimate?: number | null;
+  prompt_token_estimate_source?: string | null;
   answer_chars: number;
   prompt_tokens: number | null;
   completion_tokens: number | null;
@@ -684,6 +719,10 @@ export interface LLMConfig {
   model: string;
   timeout_s: number;
   streaming: boolean;
+  native_tools: boolean;
+  context_input_tokens: number;
+  agent_max_model_calls: number;
+  agent_max_model_tokens: number;
   connect_timeout_s: number;
   stream_idle_timeout_s: number;
   stream_total_timeout_s: number;

@@ -22,6 +22,7 @@ import { api, previousAttempt, type ApiError } from "../api/client.ts";
 import { loadAuditTuning, saveAuditTuning, type AuditTuning } from "../auditTuning.ts";
 import type {
   AuditEvent,
+  AuditEvidence,
   AuditReport,
   AuditTrail,
   BundleSummary,
@@ -392,7 +393,10 @@ function DialogueFeed({ events }: { events: AuditEvent[] }) {
               ) : (
                 <span className="muted"> → （本轮没有工具调用）</span>
               )}
-              {row.ok === false ? <span className="severity severity-high">工具被拒或失败</span> : null}
+              {row.failureKind ? <span className="severity severity-high">{{
+                model: "模型请求失败", context_budget: "输入上下文预算耗尽",
+                tool_arguments: "工具参数错误", tool_execution: "工具执行失败",
+              }[row.failureKind]}</span> : null}
             </div>
             {row.thought ? <div className="feed-thought">{row.thought}</div> : null}
             {Object.keys(row.arguments).length > 0 ? (
@@ -416,6 +420,21 @@ function RunView({ jobId, onBack, onRestart }: { jobId: string; onBack: () => vo
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<AuditReport | null>(null);
   const [reportError, setReportError] = useState<ApiError | null>(null);
+  const [evidence, setEvidence] = useState<AuditEvidence | null>(null);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
+  const [evidenceBusy, setEvidenceBusy] = useState(false);
+
+  const openEvidence = async (runId: string, offset = 0) => {
+    setEvidenceBusy(true);
+    setEvidenceError(null);
+    try {
+      setEvidence(await api.auditEvidence(jobId, runId, offset));
+    } catch (caught) {
+      setEvidenceError((caught as ApiError).detail ?? String(caught));
+    } finally {
+      setEvidenceBusy(false);
+    }
+  };
 
   const events = trail.events;
   const closed = isClosed(events);
@@ -478,11 +497,13 @@ function RunView({ jobId, onBack, onRestart }: { jobId: string; onBack: () => vo
 
   const stages = stageRows(events);
   const agents = agentRows(events);
+  const contextEvents = events.filter(event => event.kind === "context_compaction");
   const coverage = coverageRows(events);
   const candidates = candidateRows(events);
   const findings = findingRows(events);
   const runningCount = agents.filter((row) => row.state === "running").length;
   const resultWarnings = job.data?.result?.warnings ?? [];
+  const finalBudget = [...events].reverse().find((event) => event.kind === "summary")?.execution_budget;
   const closureNote = [...events]
     .reverse()
     .find((event) => event.kind === "summary")?.closure_note;
@@ -554,6 +575,10 @@ function RunView({ jobId, onBack, onRestart }: { jobId: string; onBack: () => vo
         <Stat label="确认" value={formatCount(counters.confirmed ?? 0)} />
         <Stat label="发现" value={formatCount(counters.findings ?? findings.length)} />
         <Stat label="agent run" value={formatCount(counters.agent_runs ?? agents.length)} />
+        {finalBudget && typeof finalBudget.model_calls === "number" ?
+          <Stat label="模型调用累计" value={formatCount(finalBudget.model_calls)} /> : null}
+        {finalBudget && typeof finalBudget.tokens === "number" ?
+          <Stat label="模型 Token 累计" value={formatCount(finalBudget.tokens)} /> : null}
         <Stat label="轮次" value={formatCount(counters.rounds ?? 0)} />
         <Stat label="scope" value={formatCount(counters.scopes ?? coverage.length)} />
         {/* 开场那对 agent（recon × 威胁建模）跑了几个来回，以及有没有留下没读的东西。
@@ -644,12 +669,39 @@ function RunView({ jobId, onBack, onRestart }: { jobId: string; onBack: () => vo
                 <td className="num">{formatCount(row.steps)}</td>
                 <td className="num">{formatCount(row.toolCalls)}</td>
                 <td className="note">{row.stopReason ?? "—"}</td>
-                <td className="note">{row.error ?? (row.parsed === false ? "没有产出可用结论" : "")}</td>
+                <td className="note">
+                  {row.error ?? (row.parsed === false ? "没有产出可用结论" : "")}
+                  {row.usage ? <div className="muted">模型调用 {row.usage.model_calls}{row.usage.max_model_calls ? ` / ${row.usage.max_model_calls}` : ""}；Token {formatCount(row.usage.tokens)}{row.usage.max_model_tokens ? ` / ${formatCount(row.usage.max_model_tokens)}` : ""}{row.usage.unknown_usage ? `；${row.usage.unknown_usage} 次未返回用量` : ""}</div> : null}
+                  {row.freshReads !== undefined ? <div className="muted">本次 read 成功 {row.freshReads} 次；复用旧证据 {row.reusedFiles?.length ?? 0} 个文件{row.reusedFiles?.length ? `（${row.reusedFiles.join("、")}）` : ""}</div> : null}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+
+      {contextEvents.length > 0 ? <>
+        <h2>上下文压缩</h2>
+        <p className="muted">这里显示发给模型的请求如何缩短。数字是 UTF-8 字节估算的 Token；黑板保留步骤台账，重复的大段读取正文可能被省略。</p>
+        <ol className="feed">
+          {contextEvents.map(event => <li key={event.seq} className={event.state === "rejected" ? "feed-item error" : "feed-item"}>
+            <div><code>{event.agent}</code> · {event.scope} · {event.protocol === "native" ? "原生工具" : "文本协议"}</div>
+            <div>{event.state === "rejected" ? "压缩后仍超预算" : "已压缩"}：约 {formatCount(event.before_tokens ?? 0)} → {formatCount(event.after_tokens ?? 0)} / {formatCount(event.budget_tokens ?? 0)} Token</div>
+            <div className="muted">估算方法：{event.estimate_source ?? "未记录"}；旧步骤 {event.archived_steps?.join(", ") || "—"}；旧调用 {event.archived_call_ids?.join(", ") || "—"}</div>
+            {event.run_id ? <button type="button" disabled={evidenceBusy} onClick={() => void openEvidence(event.run_id!, 0)}>查看原始步骤</button> : null}
+          </li>)}
+        </ol>
+        {evidenceError ? <Banner>{evidenceError}</Banner> : null}
+        {evidence ? <div className="card">
+          <div>原始证据：<code>{evidence.run_id}</code>，第 {evidence.total ? evidence.offset + 1 : 0} / {evidence.total} 步</div>
+          {evidence.steps.map((step, index) => <div key={`${step.index}-${index}`}>
+            <div>工具：{step.call?.tool ?? "无"}；{step.result?.ok === false ? "失败" : "完成"}</div>
+            <pre className="note">{JSON.stringify(step, null, 2)}</pre>
+          </div>)}
+          <button type="button" disabled={evidenceBusy || evidence.offset === 0} onClick={() => void openEvidence(evidence.run_id, evidence.offset - 1)}>上一步</button>
+          <button type="button" disabled={evidenceBusy || evidence.offset + 1 >= evidence.total} onClick={() => void openEvidence(evidence.run_id, evidence.offset + 1)}>下一步</button>
+        </div> : null}
+      </> : null}
 
       <h2>对话流</h2>
       <p className="muted">

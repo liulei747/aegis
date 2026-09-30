@@ -19,10 +19,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from aegis_contracts.harness import AgentRun, AgentStep, ToolCall, ToolName, ToolResult
 from aegis_contracts.jobs import FailureMode, JobKind, JobRequest, JobResult, JobState
 from aegis_core.config import get_settings
 from app.api import deps
 from app.main import create_app
+from services.harness import evidence as evidence_mod
 from services.harness import trail as trail_mod
 from services.queue.jobs import JobStore
 from services.queue.keys import QueueKeys
@@ -75,6 +77,29 @@ def _write_trail(settings, job_id: str, events: list[dict]) -> Path:
         for event in events:
             writer.emit(event.pop("kind"), **event)
     return path
+
+
+def test_raw_evidence_is_paged_and_bound_to_current_attempt(audit_client, workspace: Path) -> None:
+    job_id = _submit_audit(audit_client, workspace)
+    run_dir = get_settings().work_dir / "audit" / job_id
+    run = AgentRun(run_id="discovery:scope-a", agent="discovery", scope_id="scope-a")
+    with evidence_mod.StepArchive(run_dir) as archive:
+        for index in (1, 2):
+            archive.record(run, AgentStep(
+                index=index, call=ToolCall(tool=ToolName.READ, arguments={"path": "a.py"}),
+                result=ToolResult(tool=ToolName.READ, ok=True, summary="raw-" + "x" * 3000),
+            ))
+    response = audit_client.get(
+        f"/v1/audit/{job_id}/evidence", params={"run_id": run.run_id, "offset": 1}
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 2
+    assert response.json()["steps"][0]["index"] == 2
+    assert "x" * 3000 in response.json()["steps"][0]["result"]["summary"]
+    assert audit_client.get(f"/v1/audit/{job_id}/evidence", params={"run_id": run.run_id, "limit": 11}).status_code == 422
+    (evidence_mod.evidence_dir(run_dir) / evidence_mod.SESSION_FILE).unlink()
+    queued = audit_client.get(f"/v1/audit/{job_id}/evidence", params={"run_id": run.run_id})
+    assert queued.json()["steps"] == []
 
 
 def test_task_snapshots_are_available_before_agent_start(audit_client, workspace: Path) -> None:

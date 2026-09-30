@@ -67,6 +67,39 @@ def test_active_stream_outlives_first_event_timeout():
     assert result["stream_metadata"]["elapsed_ms"] > 80
 
 
+def test_streamed_tool_calls_are_reassembled_before_delivery():
+    def tool_event(index, *, call_id=None, name=None, arguments=None, finish=None):
+        part = {"index": index, "function": {}}
+        if call_id is not None:
+            part["id"] = call_id
+        if name is not None:
+            part["function"]["name"] = name
+        if arguments is not None:
+            part["function"]["arguments"] = arguments
+        return ("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [part]},
+                "finish_reason": finish}]}) + "\n\n").encode()
+
+    wire = b"".join([
+        tool_event(0, call_id="call_", name="re", arguments='{"pa'),
+        tool_event(1, call_id="call_b", name="grep", arguments='{"pattern":"x"}'),
+        tool_event(0, call_id="a", name="ad", arguments='th":"a.java"}', finish="tool_calls"),
+        b"data: [DONE]\n\n",
+    ])
+    result = call(transport(Chunks([wire[i:i+3] for i in range(0, len(wire), 3)])))
+    calls = result["choices"][0]["message"]["tool_calls"]
+    assert [(item["id"], item["function"]["name"]) for item in calls] == [
+        ("call_a", "read"), ("call_b", "grep")]
+    assert calls[0]["function"]["arguments"] == '{"path":"a.java"}'
+
+
+def test_incomplete_tool_call_stream_is_not_executable():
+    wire = (b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            b'"function":{"name":"read","arguments":"{}"}}]},'
+            b'"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n')
+    with pytest.raises(StreamFailure, match="stream_incomplete"):
+        call(transport(Chunks([wire])))
+
+
 @pytest.mark.parametrize("chunks,code", [
     ([event(content="partial")], "stream_incomplete"),
     ([event(reasoning="x", finish="length"), b"data: [DONE]\n\n"], "empty_answer"),
